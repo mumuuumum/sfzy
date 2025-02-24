@@ -10,6 +10,8 @@ finetuning_type: lora
 lora_rank: 4
 lora_target: all
 
+deepspeed: examples/deepspeed/ds_z3_config.json
+
 ### dataset
 dataset: sfzy_train
 dataset_dir: ./data
