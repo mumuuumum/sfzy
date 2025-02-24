@@ -1,6 +1,7 @@
 ### model
 # model_name_or_path: THUDM/glm-4-9b
 model_name_or_path: THUDM/chatglm3-6b
+quantization_bit: 4
 trust_remote_code: true
 
 ### method
@@ -11,21 +12,21 @@ finetuning_type: lora
 lora_rank: 4
 lora_target: all
 
-deepspeed: examples/deepspeed/ds_z3_config.json
+# deepspeed: examples/deepspeed/ds_z3_config.json
 # use_reentrant: true
 
 ### dataset
 dataset: sfzy_train
 dataset_dir: ./data
 val_size: 0.1
-template: glm4
+template: chatglm3
 cutoff_len: 4096
 max_samples: 15000
 overwrite_cache: true
 preprocessing_num_workers: 16
 
 ### output
-output_dir: saves/glm4-9b/lora/sft
+output_dir: saves/chatglm3-6b/lora/sft
 logging_steps: 10
 save_steps: 500
 plot_loss: true
