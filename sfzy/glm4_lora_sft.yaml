@@ -1,5 +1,6 @@
 ### model
-model_name_or_path: THUDM/glm-4-9b
+# model_name_or_path: THUDM/glm-4-9b
+model_name_or_path: THUDM/chatglm3-6b
 trust_remote_code: true
 
 ### method
