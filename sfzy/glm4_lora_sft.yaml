@@ -12,6 +12,7 @@ lora_rank: 4
 lora_target: all
 
 deepspeed: examples/deepspeed/ds_z3_config.json
+# use_reentrant: true
 
 ### dataset
 dataset: sfzy_train
