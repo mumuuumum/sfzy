@@ -5,7 +5,7 @@ quantization_bit: 4
 trust_remote_code: true
 
 ### resume
-resume_from_checkpoint: saves/chatglm3-6b/lora/sft/checkpoint-500
+resume_from_checkpoint: saves/chatglm3-6b/lora/sft/checkpoint-1000
 # resume_lora_training: true
 
 ### method

@@ -1,0 +1,21 @@
+{
+  "additional_special_tokens": [
+    {
+      "content": "<|user|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false
+    },
+    {
+      "content": "<|observation|>",
+      "lstrip": false,
+      "normalized": false,
+      "rstrip": false,
+      "single_word": false
+    }
+  ],
+  "eos_token": "</s>",
+  "pad_token": "<unk>",
+  "unk_token": "<unk>"
+}
