@@ -4,6 +4,10 @@ model_name_or_path: THUDM/chatglm3-6b
 quantization_bit: 4
 trust_remote_code: true
 
+### resume
+resume_from_checkpoint: saves/checkpoint-500
+resume_lora_training: true
+
 ### method
 stage: sft
 plot_loss: true
