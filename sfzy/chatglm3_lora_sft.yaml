@@ -6,7 +6,7 @@ trust_remote_code: true
 
 ### resume
 resume_from_checkpoint: saves/checkpoint-500
-resume_lora_training: true
+# resume_lora_training: true
 
 ### method
 stage: sft
