@@ -1,0 +1,9 @@
+model_name_or_path: THUDM/chatglm3-6b
+template: chatglm3
+adapter_name_or_path: saves/chatglm3-6b/lora/sft
+finetuning_type: lora
+
+infer_backend: huggingface
+
+dataset: sfzy_train
+dataset_dir: ./data
