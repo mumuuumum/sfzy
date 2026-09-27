@@ -25,6 +25,42 @@ import torch
 _STEP_PATTERN = re.compile(r"step_(\d+)\.pt$")
 
 
+def _align_state_dict_keys(state: Dict[str, Any], model: Any) -> Dict[str, Any]:
+    """让 checkpoint 的键名和当前模型的键名对上。
+
+    唯一要处理的差异是 DDP 的 `module.` 前缀：
+
+        DDP 存档        "module.transformer.layers.0....lora_A.weight"
+        单卡读回        "transformer.layers.0....lora_A.weight"
+
+    这个差异**不会报错**：`load_state_dict(strict=False)` 会把所有键都当成
+    "模型的、checkpoint 里没有的"参数，一个都不载入，然后静默返回。
+    于是你从 checkpoint 续训，实际上参数还是初始的 LoRA（全零 B 矩阵），
+    loss 曲线看着像"重新开始"，要几个小时后才会发现。
+    所以这里三种键名都试一遍（原样、去掉前缀、加上前缀）。
+    """
+    try:
+        model_keys = set(model.state_dict().keys())
+    except Exception:  # noqa: BLE001 —— 非 nn.Module 时不折腾
+        return state
+
+    if all(k in model_keys for k in state):
+        return state
+
+    stripped = {
+        (k[len("module."):] if k.startswith("module.") else k): v
+        for k, v in state.items()
+    }
+    if all(k in model_keys for k in stripped):
+        return stripped
+
+    prefixed = {"module." + k: v for k, v in state.items()}
+    if all(k in model_keys for k in prefixed):
+        return prefixed
+
+    return state
+
+
 def save_checkpoint(
     path: Union[str, Path],
     model: Any,
@@ -98,9 +134,20 @@ def load_checkpoint(
     payload = torch.load(path, map_location="cpu", weights_only=False)
 
     if model is not None and "model" in payload:
-        missing, unexpected = model.load_state_dict(payload["model"], strict=strict)
-        if missing and not strict:
-            pass  # 只存了可训练参数时，缺失冻结层权重是预期行为
+        saved = _align_state_dict_keys(payload["model"], model)
+        missing, unexpected = model.load_state_dict(saved, strict=strict)
+        # missing = 模型有、checkpoint 没有的键（只存 LoRA 时这是预期的）；
+        # 真正载入进去的键数 = checkpoint 里的键 − missing。
+        loaded = len(saved) - len(missing)
+        if saved and loaded == 0:
+            raise RuntimeError(
+                f"{path} 里的参数一个都没载入模型。\n"
+                "最常见的原因：checkpoint 是在 DDP 下存的（键名带 module. 前缀），"
+                "而现在用单进程加载（或反过来）。"
+                "如果确认前缀一致，就检查 LoRA 的 target_modules / r 是否和存档时相同 ——\n"
+                f"  checkpoint 里的键（前 3 个）：{list(saved)[:3]}\n"
+                f"  模型里的键（前 3 个）：{list(model.state_dict())[:3]}"
+            )
     if optimizer is not None and "optimizer" in payload:
         optimizer.load_state_dict(payload["optimizer"])
     if scaler is not None and "scaler" in payload:

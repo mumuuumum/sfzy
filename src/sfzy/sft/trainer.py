@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from itertools import islice
 import math
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Optional
 
 import torch
@@ -197,6 +198,21 @@ class SFTTrainer:
         self.warmup_ratio = sft_cfg.get("warmup_ratio", 0.0)
         self.min_lr_ratio = sft_cfg.get("min_lr_ratio", 0.0)
 
+        # 按「墙钟时间」存档，和 save_every_n_steps 是**或**的关系。
+        #
+        # 为什么步数之外还要有这一条：Kaggle 会话到点是被直接 kill 的，
+        # 没有"训练结束再存一次"的机会；而"9 小时能跑到第几步"取决于
+        # 每步耗时，每步耗时又取决于这个 batch 里判决书的长度
+        # （短的 300 字，长的 14000 字，p99 有 6700 字）。
+        # 用时间触发就不用预先算这个数，也不会因为漏算而丢掉最后两小时。
+        # 设为 null / 0 表示关闭，只按步数存档。
+        self.save_every_n_minutes = sft_cfg.get("save_every_n_minutes") or None
+
+        # 只用于日志的计时与计数（吞吐、峰值显存），不参与训练逻辑
+        self._run_start_time = time.monotonic()
+        self._last_save_time = self._run_start_time
+        self._samples_this_run = 0
+
         # 断点续训的起点。None 表示从头训练；字符串表示具体的 checkpoint 路径。
         # 刻意不支持"自动找最新"—— 见 resume() 的说明。
         self.resume_from: Optional[str] = sft_cfg.get("resume_from") or None
@@ -274,6 +290,14 @@ class SFTTrainer:
         #   2. dropout 全程关闭，正则化失效，模型更容易过拟合。
         self.model.train()
 
+        # 计时/计数起点。峰值显存特意在这里清零，日志里那一行才是
+        # "训练一步要多少显存"，而不是把加载模型、注入 LoRA 的一次性峰值算进去。
+        self._run_start_time = time.monotonic()
+        self._last_save_time = self._run_start_time
+        self._samples_this_run = 0
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+
         # DDP 下每条 rank 只处理 1/world_size 的数据，所以每条 rank 的优化步数
         # 也要除以 world_size —— 否则学习率调度会按「单卡的数据量」走，
         # 实际只走到 cosine 曲线的一半就结束了。
@@ -320,6 +344,9 @@ class SFTTrainer:
             accum_count = 0
             for batch_idx, batch in enumerate(loader_iter, start=skip):
                 accum_loss += self._forward_backward(batch) # loss用于记录，已经反向传播过了
+                # 只统计本进程真正处理过的样本数（分母是墙钟时间），
+                # 乘以 world_size 就是全局吞吐 —— 用来回答"9 小时能跑多少条"
+                self._samples_this_run += batch["input_ids"].size(0)
                 batches_this_epoch +=1
                 accum_count +=1
                 
@@ -337,9 +364,20 @@ class SFTTrainer:
                     
                     if self.state.step % self.log_every_n_steps == 0 and self.is_main_process:
                         avg_log_loss = log_loss_sum / log_step_count
+                        # 吞吐和峰值显存直接打在日志里：
+                        # 调 batch_size 靠它、算存档间隔靠它、估"这一轮能不能
+                        # 在单次会话内跑完"也靠它。事后补算是算不出来的。
+                        elapsed = time.monotonic() - self._run_start_time
+                        rate = (self._samples_this_run * self.world_size / elapsed
+                                if elapsed > 0 else 0.0)
+                        peak_gib = (
+                            torch.cuda.max_memory_allocated(self.device) / 2**30
+                            if self.device.type == "cuda" else 0.0
+                        )
                         logger.info(
                             f"epoch {epoch} | step {self.state.step}/{total_steps} | "
-                            f"loss {avg_log_loss:.4f} | lr {lr:.2e}"
+                            f"loss {avg_log_loss:.4f} | lr {lr:.2e} | "
+                            f"{rate:.2f} 样本/秒 | 峰值显存 {peak_gib:.2f} GiB"
                         )
                         record = {
                             "step": self.state.step,
@@ -355,7 +393,7 @@ class SFTTrainer:
                         log_step_count = 0
 
                     # ===== 保存 =====
-                    if self.state.step % self.save_every_n_steps == 0 and self.is_main_process:
+                    if self.is_main_process and self._should_save():
                         self.save()
                     
             
@@ -603,6 +641,27 @@ class SFTTrainer:
         return loss / samples_num
 
     # ------------------------------------------------------------------
+    def _should_save(self) -> bool:
+        """到存档点了吗？步数触发和时间触发是「或」的关系。
+
+        返回 True 的两种情形：
+
+            step % save_every_n_steps == 0        步数到了
+            距上次存档 >= save_every_n_minutes    墙钟时间到了
+
+        只在**优化步**（梯度累积的边界）上被调用，不会每处理一个 batch 就调一次，
+        所以"时间到了"最多晚一个优化步落盘。
+
+        计时器在每次 save() 里重置，因此时间触发不会被步数触发的存档打乱节奏：
+        谁先存，谁的计时器就归零。
+        """
+        if self.save_every_n_steps and self.state.step % self.save_every_n_steps == 0:
+            return True
+        if self.save_every_n_minutes:
+            return (time.monotonic() - self._last_save_time) >= self.save_every_n_minutes * 60
+        return False
+
+    # ------------------------------------------------------------------
     def save(self, tag: str = "last") -> Path:
         r"""保存 checkpoint。
 
@@ -666,7 +725,10 @@ class SFTTrainer:
             ckpt_dir=self.output_dir,
             keep_last_n=self.keep_last_n_checkpoints
         )
-        
+
+        # 计时器归零：下一次「时间到了」从这次存档重新计时
+        self._last_save_time = time.monotonic()
+
         return path
 
     # ------------------------------------------------------------------
