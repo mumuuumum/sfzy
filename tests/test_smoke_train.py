@@ -283,3 +283,81 @@ def test_断点续训从断点接着跑而不是重头来(tmp_path):
 
     assert second.epoch == 3
     assert second.step == 3, "应当只补跑第 2、3 轮，而不是把第 1 轮重跑一遍"
+
+
+# ---------------------------------------------------------------- 验证的节奏
+
+class CountingDataset:
+    """包一层，记录验证时**真的**取了下标几的样本。"""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.seen = []
+
+    def __len__(self):
+        return len(self.inner)
+
+    def __getitem__(self, index):
+        self.seen.append(index)
+        return self.inner[index]
+
+
+def test_周期验证按步触发而不是只在epoch末尾(tmp_path):
+    """一轮跑十几个小时 > 单次会话 9 小时，"只在 epoch 末尾验"等于永不验。
+
+    8 条样本 / batch 2 / accum 2 = 每轮 2 个优化步，3 轮 = 6 步。
+    epoch 末尾在 step 2、4、6；eval_every_n_steps=2 也落在 2、4、6 ——
+    这正是"周期验证和 epoch 末尾撞在同一步"的情形，去重后应该各只有一条。
+    """
+    trainer = make_trainer(tmp_path, num_epochs=3, eval_every_n_steps=2)
+    dev = SFTDataset(make_records(8))
+    state = trainer.train(SFTDataset(make_records(8)), dev)
+
+    dev_steps = [e["step"] for e in state.history if e["dev_loss"] is not None]
+    assert dev_steps == [2, 4, 6], f"验证的步号不对（撞车要能去重）：{dev_steps}"
+    assert state.best_dev_loss < float("inf"), "周期验证也该更新 best"
+
+
+def test_周期验证不落在epoch末尾时两处都要验(tmp_path):
+    """8 条样本 2 步/轮，epoch 末尾在 2、4、6；eval_every=3 落在 3、6。
+    并集是 2、3、4、6（6 撞车算一次）。"""
+    trainer = make_trainer(tmp_path, num_epochs=3, eval_every_n_steps=3)
+    state = trainer.train(SFTDataset(make_records(8)), SFTDataset(make_records(8)))
+
+    dev_steps = [e["step"] for e in state.history if e["dev_loss"] is not None]
+    assert dev_steps == [2, 3, 4, 6], f"验证的步号不对：{dev_steps}"
+
+
+def test_不配周期验证时就只在epoch末尾验(tmp_path):
+    """默认行为不能被这次改动动到：不配就老老实实只在 epoch 末尾验。"""
+    trainer = make_trainer(tmp_path, num_epochs=3, eval_every_n_steps=None)
+    state = trainer.train(SFTDataset(make_records(8)), SFTDataset(make_records(8)))
+
+    dev_steps = [e["step"] for e in state.history if e["dev_loss"] is not None]
+    assert dev_steps == [2, 4, 6], f"应该只有 epoch 末尾那几次：{dev_steps}"
+
+
+def test_验证只取max_samples条而且是等间隔取(tmp_path):
+    """取前 N 条会让 dev_loss 的含义随文件顺序漂移（切分是按案由分层的），
+    所以必须等间隔取 —— 这条测试锁住的就是这一点。
+
+    num_workers 必须设 0：否则 __getitem__ 跑在 DataLoader 的子进程里，
+    父进程的这个 seen 列表永远是空的（这是踩过的坑，测试会假通过）。
+    """
+    trainer = make_trainer(tmp_path, eval_max_samples=4, num_workers=0)
+    counted = CountingDataset(SFTDataset(make_records(12)))
+
+    trainer.evaluate(counted)
+
+    assert len(counted.seen) == 4, f"应当只走 4 条，实际 {len(counted.seen)}"
+    assert sorted(counted.seen) == [0, 3, 6, 9], f"应当是等间隔取：{sorted(counted.seen)}"
+    assert counted.seen != [0, 1, 2, 3], "不能退化成取前 N 条"
+
+
+def test_验证集不超过max_samples时全用(tmp_path):
+    trainer = make_trainer(tmp_path, eval_max_samples=100, num_workers=0)
+    counted = CountingDataset(SFTDataset(make_records(6)))
+
+    trainer.evaluate(counted)
+
+    assert sorted(counted.seen) == [0, 1, 2, 3, 4, 5]

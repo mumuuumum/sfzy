@@ -37,6 +37,14 @@ sft:
   keep_last_n_checkpoints: 3
   log_every_n_steps: 10
 
+  # ---- 验证 ----
+  # eval_every_n_steps: 每多少个**优化步**验一次；null = 只在 epoch 末尾验。
+  #   Kaggle 上一轮跑不完，所以 sft_kaggle.yaml 里改成了按步触发。
+  # eval_max_samples: 验证最多用多少条；null = 全量。
+  #   取样是等间隔取的，保住切分时按案由分层的分布。
+  eval_every_n_steps: null
+  eval_max_samples: null
+
   # 断点续训。只有两种模式，没有"自动找最新"：
   #
   #   null 或 ""   → 从头训练。即使 output_dir 里有 checkpoint 也不碰。

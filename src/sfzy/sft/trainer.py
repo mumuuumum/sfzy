@@ -38,7 +38,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader, DistributedSampler, Subset
 
 from sfzy.config import Config
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
@@ -207,6 +207,35 @@ class SFTTrainer:
         # 用时间触发就不用预先算这个数，也不会因为漏算而丢掉最后两小时。
         # 设为 null / 0 表示关闭，只按步数存档。
         self.save_every_n_minutes = sft_cfg.get("save_every_n_minutes") or None
+
+        # ---- 验证的节奏与成本 ----
+        #
+        # eval_every_n_steps：每隔多少个**优化步**验一次。
+        #   默认 null = 只在每个 epoch 末尾验一次（原来就有的行为）。
+        #
+        #   为什么 Kaggle 上必须按步数触发：一轮 10738 条要跑十几个小时，
+        #   而单次会话只有 9 小时 —— "epoch 末尾验一次"等于**这个会话里永远
+        #   不会发生**，best.pt 也就永远存不下。
+        #
+        #   代价可以自己算：一次验证 ≈ 样本数 × 每样本秒数，
+        #   而每个优化步 ≈ grad_accum_steps × 每样本秒数。
+        #   所以 eval_max_samples=200、log 间隔 15 步时，
+        #   一次验证约等于 13 个优化步的时间（约 6%）。
+        self.eval_every_n_steps = sft_cfg.get("eval_every_n_steps") or None
+
+        # eval_max_samples：验证时**最多**用多少条，null = 全量。
+        #   验证集 1340 条全跑一遍要十几分钟，而我们要的只是"train 还在降、
+        #   dev 有没有开始涨"这个趋势 —— 200 条足够，且每次成本固定。
+        #   取样是**等间隔**取的（不是取前 N 条），这样能保住切分时按案由
+        #   分层的分布，不会因为文件前 200 条恰好都是借款合同而失真。
+        self.eval_max_samples = sft_cfg.get("eval_max_samples") or None
+
+        # 上一次验证落在了第几步、结果是多少。
+        # 周期验证（step % eval_every_n_steps）和 epoch 末尾那次**可能落在同一步**：
+        # 不去重的话会在同一个 step 上把同一批样本验两遍 —— 结果一样、成本翻倍，
+        # 而且 history 里会出现两条一模一样的记录，画曲线时看着像"验了两次"。
+        self._last_eval_step: Optional[int] = None
+        self._last_dev_loss: Optional[float] = None
 
         # 只用于日志的计时与计数（吞吐、峰值显存），不参与训练逻辑
         self._run_start_time = time.monotonic()
@@ -395,6 +424,14 @@ class SFTTrainer:
                     # ===== 保存 =====
                     if self.is_main_process and self._should_save():
                         self.save()
+
+                    # ===== 周期验证 =====
+                    # 放在存档之后：这样 best.pt 和 step_xxxxxx.pt 的 step 号一致，
+                    # 事后对着 history 就能知道"最好的那一步"是不是已经存下来了。
+                    if (dev_dataset is not None
+                            and self.eval_every_n_steps
+                            and self.state.step % self.eval_every_n_steps == 0):
+                        self._run_eval(dev_dataset, epoch + 1)
                     
             
             # 尾部补救
@@ -436,34 +473,7 @@ class SFTTrainer:
             #   3. 写入 history，事后能判断"train 还在降但 dev 开始涨"
             #      的过拟合点。
             if dev_dataset is not None:
-                dev_loss = self.evaluate(dev_dataset)
-
-                if dev_loss < self.state.best_dev_loss:
-                    self.state.best_dev_loss = dev_loss
-                    if self.is_main_process:
-                        self.save(tag="best")
-
-                self.state.history.append({
-                    "step": self.state.step,
-                    "epoch": epoch + 1,
-                    "loss": None,
-                    "lr": None,
-                    "dev_loss": dev_loss,
-                })
-
-                if self.is_main_process:
-                    logger.info(
-                        "epoch %d | dev_loss %.4f | best %.4f",
-                        epoch + 1, dev_loss, self.state.best_dev_loss,
-                    )
-                    if self.tracker is not None:
-                        self.tracker.log(
-                            {
-                                "dev_loss": dev_loss,
-                                "best_dev_loss": self.state.best_dev_loss,
-                            },
-                            self.state.step,
-                        )
+                self._run_eval(dev_dataset, epoch + 1)
 
             steps_done_in_epoch = 0
         
@@ -583,8 +593,54 @@ class SFTTrainer:
         
         
     # ------------------------------------------------------------------
+    def _run_eval(self, dev_dataset: Any, epoch: int) -> float:
+        """跑一次验证，把结果送到该去的地方。返回 dev_loss。
+
+        **epoch 末尾**和**按步数触发的周期验证**走的是同一个函数。
+        分成两份写的话，"什么算新最好、什么时候存 best.pt"这套判定逻辑
+        会长出两份，而两份迟早会不一致 —— 那种 bug 表现为
+        "history 里 best 明明是第 40 步，但 best.pt 是第 80 步的"。
+
+        同一个 step 上重复调用直接返回上次的结果（见 __init__ 里的说明）。
+        """
+        if self._last_eval_step == self.state.step:
+            return self._last_dev_loss
+
+        dev_loss = self.evaluate(dev_dataset)
+        self._last_eval_step = self.state.step
+        self._last_dev_loss = dev_loss
+
+        if dev_loss < self.state.best_dev_loss:
+            self.state.best_dev_loss = dev_loss
+            if self.is_main_process:
+                self.save(tag="best")
+
+        self.state.history.append({
+            "step": self.state.step,
+            "epoch": epoch,
+            "loss": None,
+            "lr": None,
+            "dev_loss": dev_loss,
+        })
+
+        if self.is_main_process:
+            logger.info(
+                "step %d | epoch %d | dev_loss %.4f | best %.4f",
+                self.state.step, epoch, dev_loss, self.state.best_dev_loss,
+            )
+            if self.tracker is not None:
+                self.tracker.log(
+                    {
+                        "dev_loss": dev_loss,
+                        "best_dev_loss": self.state.best_dev_loss,
+                    },
+                    self.state.step,
+                )
+        return dev_loss
+
+    # ------------------------------------------------------------------
     @torch.no_grad()
-    def evaluate(self, dataset: Any) -> float:
+    def evaluate(self, dataset: Any, max_samples: Optional[int] = None) -> float:
         """在验证集上算平均 loss。
 
         ============================ 要写的步骤 ============================
@@ -616,7 +672,20 @@ class SFTTrainer:
         **@torch.no_grad() 装饰器 vs with 语句。**
         两者等价。装饰器写在函数上更不容易忘。但注意它只关掉梯度记录，
         **不会**自动切换 eval 模式——两件事都要做。
+
+        **max_samples 为什么是"等间隔取"而不是"取前 N 条"。**
+        验证集是按案由分层切出来的，直接 `records[:200]` 有可能把某一类案由
+        全取进来、另一类一条不取，dev_loss 的含义就漂了 —— 而且这种偏差
+        不会报错，只会让"这轮比上轮好"的判断失去意义。
+        等间隔取样（每 len/N 条取一条）能保住原来的分布。
         """
+        # 默认用配置里的上限；显式传参可以覆盖（测试用）
+        max_samples = max_samples if max_samples is not None else self.eval_max_samples
+        if max_samples and len(dataset) > max_samples:
+            stride = len(dataset) / max_samples
+            indices = [int(i * stride) for i in range(max_samples)]
+            dataset = Subset(dataset, indices)
+
         self.model.eval()
         loader = DataLoader(
             dataset=dataset,

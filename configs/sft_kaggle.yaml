@@ -36,8 +36,8 @@ sft:
   #     B=1, L=2000 → 1.8 GiB      B=2 → 3.6 GiB      B=4 → 7.2 GiB
   # 再加 5 GiB 静态权重和激活，B=4 在 15 GiB 卡上必然 OOM（长样本批更早）。
   # 结论：**不要再往上调**，要更大的等效 batch 就加 grad_accum_steps。
-  per_device_batch_size: 2
-  grad_accum_steps: 8          # 等效 batch = 2 × 8 × 2 卡 = 32
+  per_device_batch_size: 1
+  grad_accum_steps: 16          # 等效 batch = 2 × 8 × 2 卡 = 32
 
   # LoRA 的学习率带宽很窄（1e-4 ~ 3e-4），而且**不该按 batch 线性放大**：
   # 线性缩放律是全参数微调的经验，LoRA 的可训练参数少两个数量级，
@@ -64,7 +64,7 @@ sft:
   # 也就是说 8192 对训练集**几乎无损**，而 1536 会砍掉一半以上的文书
   # （判决书的"本院认为""判决如下"都在结尾，被砍掉的正是摘要最需要的部分）。
   # 不设更大的值也没意义：截断率已经接近 0。
-  max_length: 8192
+  max_length: 4096
 
   num_workers: 2               # Kaggle 上设大了会被 OOM killer 干掉
   pin_memory: true
@@ -73,17 +73,37 @@ sft:
   # Kaggle 的 9 小时是从 **notebook 启动**算的，不是从训练开始算的，
   # 所以要留出 clone / 装依赖 / 下模型的十几分钟。
   #
-  #   160 s/优化步 → 15 步 ≈ 40 分钟
-  #   9 小时会话 ≈ 190 步 → 约 12 个存档点，最多回退 40 分钟（≈15 步）
+  # per_device_batch_size=1 + grad_accum_steps=32 时，一个优化步是 32 个
+  # 微步，按 9.4 s/样本估约 300 s/步 —— **这个数只能从日志里的"样本/秒"读**，
+  # 别用这里的估算做最终判断。按 300 s/步算：
+  #
+  #   8 步 ≈ 40 分钟；9 小时会话 ≈ 108 步 → 约 13 个存档点
   #
   # 单个 checkpoint 只存可训练参数 + 优化器动量（约 90 MB，写盘几秒），
   # 所以 40 分钟一存不会成为 I/O 负担。
-  save_every_n_steps: 15
+  save_every_n_steps: 8
   # 墙钟兜底：不管跑到第几步，距上次存档 >= 45 分钟就存。
   # 它的意义是防止"训练比预估慢"时步数触发一直不落盘（两者是「或」的关系）。
+  # 实际上它才是主力：步长一变，"多少步等于 40 分钟"就跟着变。
   save_every_n_minutes: 45
-  keep_last_n_checkpoints: 3   # 90 分钟的冗余，best.pt 永远不被清理
-  log_every_n_steps: 10
+  keep_last_n_checkpoints: 3   # 2 小时的冗余，best.pt 永远不被清理
+
+  # 日志间隔。**这个值直接决定"你多久看不到任何输出"**：
+  #     日志间隔（秒）≈ log_every_n_steps × grad_accum_steps × 每样本秒数
+  # 设 10 的话就是 10 × 32 × 9.4 ≈ 50 分钟才打一行，看起来像卡死了。
+  # 每行只有一个数字串，设 2（≈10 分钟）完全负担得起。
+  log_every_n_steps: 2
+
+  # ---- 验证 ----
+  # 一轮要跑十几个小时 > 单次会话 9 小时，所以"epoch 末尾验一次"等于
+  # **这个会话里永远不会验**，best.pt 也就永远存不下来。
+  # 这里改成按优化步触发：15 步（≈75 分钟）一次，正好和 save_every_n_steps=8
+  # 的存档节奏错开，并且每次只花几分钟。
+  eval_every_n_steps: 15
+  # 1340 条验证集全跑一遍要十几分钟，而我们只要"train 还在降、dev 有没有涨"
+  # 这个趋势。等间隔取 200 条（不是取前 200 条 —— 那样可能整批都是同一种案由），
+  # 成本约等于 1 个优化步（≈7%）。
+  eval_max_samples: 200
 
   use_compile: false
   resume_from: null
