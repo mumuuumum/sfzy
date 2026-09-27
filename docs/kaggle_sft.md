@@ -155,11 +155,15 @@ for pkg in ("torch", "transformers", "accelerate", "bitsandbytes", "peft", "data
     except md.PackageNotFoundError:
         print(f"  {pkg:16s} ✗ 未安装")
 
-# 关键：把 HuggingFace 缓存放进 /kaggle/working，
-# 这样 Save Version 之后模型权重能跟着 notebook 输出一起留下来，
-# 下次会话挂载回来就不必重新下载 12GB
-os.environ["HF_HOME"] = "/kaggle/working/hf"
-print("HF_HOME =", os.environ["HF_HOME"])
+# 不要把 HF_HOME 设到 /kaggle/working！
+#
+# 我原来写的理由是"缓存跟着 Save Version 留下来，下次不用重下 12.5GB"，
+# 但实测 Kaggle 下载这个模型只要 **36 秒**（385 MB/s）。
+# 而 /kaggle/working 只有 20GB 的保存配额，塞 12.5GB 的模型缓存进去，
+# checkpoint 和日志就没多少空间了。
+#
+# 所以用默认缓存（/root/.cache/huggingface）更划算：每次会话重下，36 秒。
+print("HF_HOME =", os.environ.get("HF_HOME", "（未设置，用默认 /root/.cache）"))
 ```
 
 > **如果装完还是报同样的 ImportError**，说明当前内核里已经载入了旧版
