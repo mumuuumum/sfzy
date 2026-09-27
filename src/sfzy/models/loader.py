@@ -36,6 +36,7 @@ from sfzy.models.compat import (
     ensure_gradient_checkpointing,
     patch_pretrained_config,
     patch_tied_weights_keys,
+    patch_tp_plan_for_quantized_load,
     resolve_padding_side,
 )
 from peft import prepare_model_for_kbit_training
@@ -138,6 +139,11 @@ def load_model(
     # 远程代码的兼容性补丁集中放在 models/compat.py，这里只负责调用。
     # 具体踩过哪些坑、为什么这么修，都在那个文件里写了。
     patch_tied_weights_keys()
+    # 这个必须在 from_pretrained **之前**：新版 transformers 会在加载权重时
+    # 调 caching_allocator_warmup → get_total_byte_count，而它只在
+    # torch.distributed 已初始化（也就是 DDP）时才去读 model.tp_plan，
+    # ChatGLM3 没有这个属性 → len(None) 直接崩。
+    patch_tp_plan_for_quantized_load()
 
     config = AutoConfig.from_pretrained(
         model_name,

@@ -11,8 +11,10 @@ from __future__ import annotations
 from transformers import PreTrainedModel
 
 from sfzy.models.compat import (
+    ensure_tp_plan,
     patch_pretrained_config,
     patch_tied_weights_keys,
+    patch_tp_plan_for_quantized_load,
     resolve_padding_side,
 )
 
@@ -116,3 +118,101 @@ def test_padding_side_默认左():
 
 def test_padding_side_可被配置覆盖():
     assert resolve_padding_side({"padding_side": "right"}) == "right"
+
+
+# ------------------------------------------------------- 没有 TP plan 的模型
+#
+# 这一组对应"单进程能加载、一加 DDP 立刻崩"的那个坑：
+# 新版 transformers 的 get_total_byte_count 只在 **torch.distributed 已初始化** 时
+# 去读 model.tp_plan，ChatGLM3 没有这个属性 → len(None) 报 TypeError。
+
+class FakeModelWithoutTpPlan:
+    """模拟 ChatGLM3：属性存在但是 None（新版的默认值）。"""
+
+    def __init__(self):
+        self.all_tied_weights_keys = {}
+        self.tp_plan = None
+
+
+class FakeModelWithReadOnlyTpPlan:
+    """最坏情况：tp_plan 是只读 property，实例赋值会抛 AttributeError。"""
+
+    def __init__(self):
+        self._tp_plan = None
+
+    @property
+    def tp_plan(self):
+        return self._tp_plan
+
+
+def test_ensure_tp_plan_把None换成dict():
+    model = FakeModelWithoutTpPlan()
+    assert ensure_tp_plan(model) is True
+    assert model.tp_plan == {}
+
+
+def test_ensure_tp_plan_对只读property也能兜住():
+    model = FakeModelWithReadOnlyTpPlan()
+    assert ensure_tp_plan(model) is True
+    assert model.tp_plan == {}
+
+
+def test_ensure_tp_plan_已有计划时不覆盖():
+    class Model:
+        tp_plan = {"layers.0.fc1": "colwise"}
+
+    model = Model()
+    assert ensure_tp_plan(model) is True
+    assert model.tp_plan == {"layers.0.fc1": "colwise"}
+
+
+def test_补丁让没有tp_plan的模型能过显存预热(monkeypatch):
+    """重现新版 transformers 在 DDP 下的那一行，验证补丁真的能救活它。"""
+    import transformers.modeling_utils as modeling_utils
+
+    calls = []
+
+    def fake_get_total_byte_count(model, accelerator_device_map, hf_quantizer=None):
+        # 就是新版 modeling_utils.py 里那一行（去掉 is_initialized 判断，
+        # 直接走 DDP 分支）
+        tp_plan = model.tp_plan
+        calls.append(tp_plan)
+        return {"total": 0} if len(tp_plan) == 0 else {"total": 1}
+
+    monkeypatch.setattr(modeling_utils, "get_total_byte_count",
+                        fake_get_total_byte_count, raising=False)
+
+    model = FakeModelWithoutTpPlan()
+    # 补丁之前：复现线上那个 TypeError
+    try:
+        modeling_utils.get_total_byte_count(model, {"w": "cuda:0"}, None)
+    except TypeError as exc:
+        assert "NoneType" in str(exc)
+    else:  # pragma: no cover - 说明复现失败，测试本身有问题
+        raise AssertionError("应该复现出 len(None) 的 TypeError")
+
+    assert patch_tp_plan_for_quantized_load() is True
+    assert modeling_utils.get_total_byte_count(model, {"w": "cuda:0"}, None) == {"total": 0}
+    assert calls[-1] == {}, "补丁应该把 tp_plan 补成空计划"
+
+
+def test_补丁重复调用不会层层套娃(monkeypatch):
+    import transformers.modeling_utils as modeling_utils
+
+    monkeypatch.setattr(modeling_utils, "get_total_byte_count",
+                        lambda *a, **k: {}, raising=False)
+    assert patch_tp_plan_for_quantized_load() is True
+    inner = modeling_utils.get_total_byte_count
+    assert patch_tp_plan_for_quantized_load() is False
+    assert modeling_utils.get_total_byte_count is inner
+
+
+def test_老版transformers没有这个函数时补丁是空操作():
+    """本机 4.57.6 就没有 get_total_byte_count，patch 必须安静地返回 False。"""
+    import transformers.modeling_utils as modeling_utils
+
+    if hasattr(modeling_utils, "get_total_byte_count"):  # pragma: no cover
+        import pytest
+
+        pytest.skip("当前 transformers 有该函数，这个用例只在旧版上有意义")
+    assert patch_tp_plan_for_quantized_load() is False

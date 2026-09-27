@@ -110,4 +110,4 @@ lora:
   #
   # 注入是按「叶子名精确相等」匹配的（name.split(".")[-1] in target_modules），
   # 所以 "dense" 不会误伤 "dense_h_to_4h" / "dense_4h_to_h"。
-  target_modules: ["query_key_value", "dense"]
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]

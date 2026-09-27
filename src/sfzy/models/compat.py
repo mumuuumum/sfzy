@@ -9,14 +9,18 @@
   * 散在 loader.py 里会慢慢变成"没人知道为什么存在、删了又怕出事"的代码；
   * 每一条都能单独写测试（用假 config 验证回填逻辑，不需要真的加载模型）。
 
-这里集中三件事，对应实际踩过的三个坑：
+这里集中五件事，对应实际踩过的五个坑：
   1. 新版 transformers 移走的 generation 属性（max_length / use_cache ...）
   2. all_tied_weights_keys 缺失
   3. tokenizer 的 padding 方向
+  4. 梯度检查点在 ChatGLM3 上是空实现（见 ensure_gradient_checkpointing）
+  5. 没有 TP plan 的模型在新版 transformers 的加载路径里会崩（见
+     patch_tp_plan_for_quantized_load）
 """
 
 from __future__ import annotations
 
+import importlib
 from typing import Any, Dict, Optional
 
 from transformers import GenerationConfig, PreTrainedModel
@@ -50,6 +54,71 @@ def patch_tied_weights_keys() -> bool:
     if hasattr(PreTrainedModel, "all_tied_weights_keys"):
         return False
     PreTrainedModel.all_tied_weights_keys = {}
+    return True
+
+
+def ensure_tp_plan(model: Any) -> bool:
+    """确保 ``model.tp_plan`` 是个 dict（空 dict = 不做张量并行）。返回是否成功。
+
+    先试实例、再试它自己那一个类：属性可能是普通字段（实例赋值即可），
+    也可能是带 setter 的 property（4.57 / main 都是这样），
+    还可能是只读 property —— 那就在子类的类字典里放一个 {} 把它遮掉。
+    """
+    if getattr(model, "tp_plan", None) is not None:
+        return True
+    for target in (model, type(model)):
+        try:
+            setattr(target, "tp_plan", {})
+        except Exception:  # noqa: BLE001 —— 只读属性/奇怪元类，继续试下一个
+            continue
+        if getattr(model, "tp_plan", None) is not None:
+            return True
+    return False
+
+
+def patch_tp_plan_for_quantized_load() -> bool:
+    """让没有 TP plan 的模型能通过新版 transformers 的"显存预热"。返回是否真的打了补丁。
+
+    报错长这样（**只在 DDP 下必现，单进程跑不出来**）：
+
+        File ".../transformers/modeling_utils.py", line 4706, in get_total_byte_count
+            if len(tp_plan) > 0:
+        TypeError: object of type 'NoneType' has no len()
+
+    根因是 transformers 内部两段代码对"这个模型有没有张量并行计划"的假设不一致：
+
+        caching_allocator_warmup: 只在 device_map 不为 None 时调用（4-bit 量化必走）
+        get_total_byte_count:     tp_plan = model.tp_plan
+                                            if torch.distributed.is_initialized() else []
+
+    也就是说 **单进程时它走 `[]` 分支，压根不读 model.tp_plan；一旦进程组初始化了，
+    它就去读这个属性**。ChatGLM3 的远程代码没有 TP plan（它的 config 里没有
+    base_model_tp_plan），新版 transformers 又不给默认值，于是拿到 None。
+
+    这正好解释了"同一份配置、同一个模型，单进程能加载、一加 DDP 立刻挂"——
+    和训练逻辑无关，纯粹是加载路径分叉。
+
+    补丁打在 ``transformers.modeling_utils.get_total_byte_count`` 这个模块级函数上：
+    ``caching_allocator_warmup`` 是**运行时按全局名**查它的（不是 import 时就绑定），
+    所以替换模块属性就能生效。旧版 transformers 没有这个函数（本机 4.57.6 就没有），
+    patch 直接返回 False，零副作用。
+    """
+    try:
+        modeling_utils = importlib.import_module("transformers.modeling_utils")
+    except ImportError:  # pragma: no cover - transformers 一定装得上
+        return False
+
+    original = getattr(modeling_utils, "get_total_byte_count", None)
+    if original is None or getattr(original, "_sfzy_patched", False):
+        return False
+
+    def get_total_byte_count(model, accelerator_device_map, hf_quantizer=None):
+        ensure_tp_plan(model)
+        return original(model, accelerator_device_map, hf_quantizer)
+
+    # 打个标记，重复调用（每条 rank 都会调 load_model）时不会层层套娃
+    get_total_byte_count._sfzy_patched = True
+    modeling_utils.get_total_byte_count = get_total_byte_count
     return True
 
 

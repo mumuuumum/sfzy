@@ -201,8 +201,8 @@ print("HF_HOME =", os.environ.get("HF_HOME", "（未设置，用默认 /root/.ca
 
 ### 已知兼容性问题（实际踩过的，按出现顺序）
 
-这五个是我们真实遇到并修掉的。记在这里是为了换环境、换模型、重建
-notebook 时能快速定位 —— 不用再花五个来回重新发现一遍。
+这七个是我们真实遇到并修掉的。记在这里是为了换环境、换模型、重建
+notebook 时能快速定位 —— 不用再花七个来回重新发现一遍。
 
 | # | 报错 | 根因 | 修法 |
 |---|---|---|---|
@@ -212,9 +212,35 @@ notebook 时能快速定位 —— 不用再花五个来回重新发现一遍。
 | 4 | `AttributeError: 'list' object has no attribute 'keys'` | 上面那条的补丁填错了类型 —— 同一属性 transformers 内部两处要求不同，**必须填 dict** | 同上，默认值写成 `{}` |
 | 5 | `AssertionError` at `tokenization_chatglm.py:300 in _pad` | 它的 tokenizer 里写死了 `assert self.padding_side == "left"` | `models/compat.py::resolve_padding_side`，默认 left |
 | 6 | **训练时 OOM，但报错栈里全是 bitsandbytes** | **两个原因叠加**（见下） | `compat.py::ensure_gradient_checkpointing` + `trainer.train()` 开头的 `self.model.train()` |
+| 7 | `TypeError: object of type 'NoneType' has no len()`，位置在 `modeling_utils.py::get_total_byte_count` 的 `if len(tp_plan) > 0` | **只有 DDP 才会走到**：那一行是 `tp_plan = model.tp_plan if torch.distributed.is_initialized() else []`，单进程走 `[]`、压根不读属性；ChatGLM3 没有 TP plan，新版 transformers 又不给兜底默认值 | `models/compat.py::patch_tp_plan_for_quantized_load` |
 
 **这一组的共同特征是：根因全部在 ChatGLM3 的远程代码里，不在我们的代码里。**
 它们的代码停留在 2023 年，而 transformers 一直在演进。
+
+### 第 7 个坑：它只在 DDP 下出现
+
+**这是唯一一个"加了 DDP 才崩"的问题**，所以很容易被误判成 DDP 配置写错了
+（实际上日志里 `distributed: True, world_size: 2` 已经说明 DDP 起对了）。
+
+同一个模型、同一份 4-bit 配置：
+
+```
+单进程   !python scripts/train_sft.py ...            → 正常加载
+双进程   !python -m torch.distributed.run ...        → TypeError: len(None)
+```
+
+差别只在 `caching_allocator_warmup`（显存预热，`device_map` 不为 None 时必走，
+4-bit 量化必然触发）里的这一行：
+
+```python
+tp_plan = model.tp_plan if torch.distributed.is_initialized() else []
+```
+
+进程组初始化了 → 去读 `model.tp_plan` → ChatGLM3 没有这个属性 → `len(None)`。
+
+> 值得一提：崩的位置在 `all_tied_weights_keys.keys()` **之后**，说明第 3、4 个坑的
+> 补丁在这个环境里仍然有效 —— 这也是"补丁集中在 compat.py 里"的好处，
+> 一眼能看出哪几条还在生效。
 
 ### 第 6 个坑：两个原因叠加，而且一个在我们的代码里
 
