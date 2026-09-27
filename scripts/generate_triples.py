@@ -25,6 +25,7 @@ import json
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -62,13 +63,50 @@ def load_done_ids(path: Path) -> set[str]:
     return done
 
 
+def resolve_split_file(data_cfg, split: str, data_dir: Optional[str] = None) -> Path:
+    """按候选顺序找到该 split 的样本文件，返回第一个真实存在的。
+
+    项目里有**两套数据布局**，同一份代码要都能跑：
+
+      Kaggle（configs/data_kaggle.yaml）  data/splits/{train,val,test}.jsonl   全量、正式
+      本地（configs/data.yaml）           data/processed/{train,dev}.jsonl     200 条、图快
+
+    之前这里写的是"val 不存在就换成 data.dev_file"，而 data.yaml 里根本没有
+    dev_file 这个键 —— `.path_(..., "val.jsonl")` 取到的默认值和原名一模一样，
+    等于没回退，直接报 FileNotFoundError: data/processed/val.jsonl。
+    **默认值和替换目标同名**是这类回退逻辑的经典失效方式，所以改成候选列表：
+    全列出来、取第一个存在的，一个都不在就把试过的路径打出来。
+    """
+    if data_dir:
+        candidates = [resolve(data_dir) / f"{split}.jsonl"]
+    else:
+        processed = resolve(data_cfg.path_("data.processed_dir", "data/processed"))
+        candidates = [processed / f"{split}.jsonl"]
+        if split == "val":
+            candidates.append(processed / data_cfg.path_("data.dev_file", "dev.jsonl"))
+        if split == "train":
+            candidates.append(processed / data_cfg.path_("data.train_file", "train.jsonl"))
+        # tools/make_splits.py 的产物，本地调试也常用
+        candidates.append(resolve("data/splits") / f"{split}.jsonl")
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError(
+        f"找不到 split={split} 的样本文件，试过：\n  "
+        + "\n  ".join(str(c) for c in candidates)
+        + "\n本地冒烟加 --data-dir data/processed，跑全量切分用 --data-dir data/splits"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="生成 (原文, 参考摘要, 模型输出) 三元组")
     parser.add_argument("--config", default="configs/sft_kaggle.yaml")
     parser.add_argument("--adapter", default=None,
                         help="LoRA checkpoint 路径；不传则用未微调的底座（当基线用）")
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
-    parser.add_argument("--data-dir", default=None, help="覆盖配置里的 processed_dir")
+    parser.add_argument("--data-dir", default=None,
+                        help="覆盖数据目录：本地冒烟 data/processed，全量切分 data/splits")
     parser.add_argument("--out", default=None, help="默认 data/triples/sft_{split}.jsonl")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--prompt-style", default=None)
@@ -76,8 +114,6 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8,
                         help="批处理大小。实测 batch=8 相对 batch=1 有 5~6 倍加速；"
                              "6B 模型在 16GB 卡上建议从 4 起步，OOM 就往下调")
-    parser.add_argument("--max-records", type=int, default=None,
-                        help="调试用：只读前 N 条（和 --limit 的区别是不改文件顺序）")
     args = parser.parse_args()
 
     cfg = load_config(resolve(args.config))
@@ -90,11 +126,9 @@ def main() -> None:
         model_cfg = {**model_cfg, "model_name_or_path": str(local)}
 
     # ---- 数据 ----
-    data_dir = resolve(args.data_dir or data_cfg.path_("data.processed_dir", "data/splits"))
-    split_file = f"{args.split}.jsonl"
-    if args.split == "val" and not (data_dir / split_file).exists():
-        split_file = data_cfg.path_("data.dev_file", "val.jsonl")
-    records = load_records(str(data_dir / split_file))
+    split_path = resolve_split_file(data_cfg, args.split, args.data_dir)
+    logger.info("数据: %s", split_path)
+    records = load_records(str(split_path))
     if args.limit:
         records = records[: args.limit]
 
@@ -147,16 +181,17 @@ def main() -> None:
     generator = (
         summarize_records_batched(
             model, tokenizer, todo, prompt_style=style, batch_size=args.batch_size,
-            max_new_tokens=args.max_new_tokens, max_length=max_length, log_every=50,
+            max_new_tokens=args.max_new_tokens, max_length=max_length, log_every=0,
         )
         if args.batch_size > 1 else
         summarize_records(
             model, tokenizer, todo, prompt_style=style,
-            max_new_tokens=args.max_new_tokens, max_length=max_length, log_every=50,
+            max_new_tokens=args.max_new_tokens, max_length=max_length, log_every=0,
         )
     )
     logger.info("生成模式: %s", f"批处理 batch={args.batch_size}"
                 if args.batch_size > 1 else "顺序 batch=1")
+    out_lengths: list[int] = []          # 每条输出的字符数，用来报告长度分布
     with open(out_path, "a", encoding="utf-8") as f:
         for result in generator:
             record = by_id[result["id"]]
@@ -167,16 +202,26 @@ def main() -> None:
                 "output": result["summary"],
             }, ensure_ascii=False) + "\n")
             f.flush()
+            out_lengths.append(len(result["summary"]))
             count += 1
             if count % 20 == 0:
                 elapsed = time.time() - started
-                rate = count / elapsed
-                eta = (len(todo) - count) / rate / 60
+                # elapsed 理论上不会是 0，但除以它之前先算清楚：
+                # ZeroDivisionError 会让跑了几个小时的生成在最后一行日志上崩掉
+                rate = count / elapsed if elapsed > 0 else 0.0
+                eta = (len(todo) - count) / rate / 60 if rate > 0 else float("inf")
                 logger.info("进度 %d/%d | %.2f 条/秒 | 预计剩余 %.1f 分钟",
                             count, len(todo), rate, eta)
 
     elapsed = time.time() - started
-    logger.info("完成 %d 条，耗时 %.1f 分钟（%.2f 条/秒）", count, elapsed / 60, count / elapsed)
+    rate = count / elapsed if elapsed > 0 else 0.0
+    logger.info("完成 %d 条，耗时 %.1f 分钟（%.2f 条/秒）", count, elapsed / 60, rate)
+    if out_lengths:
+        # 平均输出长度是个很好的"生成是否正常"的体检项：
+        # 明显短于参考摘要（~290 字）说明模型在提前停，明显长说明停不下来。
+        logger.info("批大小 %d | 输出长度 平均 %.0f 字 / 最短 %d / 最长 %d",
+                    args.batch_size, sum(out_lengths) / len(out_lengths),
+                    min(out_lengths), max(out_lengths))
     logger.info("输出: %s", out_path)
 
 

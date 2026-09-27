@@ -148,8 +148,13 @@ def generate_batch(
 
     **为什么必须左 padding。** 因果语言模型自回归生成，只有左 padding 才能
     保证每个序列的真实内容都紧贴生成位置 —— 右 padding 会让位置编码和
-    注意力掩码错位，输出会莫名其妙地错乱。而 `load_tokenizer` 里设的是
-    `padding_side="right"`（批训练时希望 padding 在末尾），所以这里临时改。
+    注意力掩码错位，输出会莫名其妙地错乱。
+
+    这里**仍然显式设一次 left**（并在 finally 里还原），不依赖外部配置：
+    `load_tokenizer` 的默认值本来就是 left（ChatGLM3 的 tokenizer 更是写死了
+    `assert padding_side == "left"`），所以对当前两个模型它是空操作；
+    但 padding_side 是可以在 yaml 里改的，一旦有人改成 right，这条路径会
+    **静默**产出错乱的句子 —— 这类 bug 不报错，只是结果看着莫名其妙。
 
     **实测收益**（本地 3050 + Qwen2.5-0.5B，8 条 × 128 token）：
         batch=1 顺序   13.9 tok/s

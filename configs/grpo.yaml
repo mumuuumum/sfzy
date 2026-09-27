@@ -24,9 +24,35 @@ rl:
   log_every_n_steps: 10
   resume_from: null
 
-  # 规则奖励各项权重（rl/reward.py）
+  # ---- 规则奖励（rl/reward.py）----
+  #
+  # mode 是整个 RL 阶段的**单变量开关**：
+  #
+  #   gated —— 硬门控 + 加权（本项目的方案）
+  #            格式不达标直接 0 分，后面的 ROUGE / 事实覆盖都不再算。
+  #            它切断的是"格式烂一点、但 ROUGE 多拿分"这条可补偿路径。
+  #
+  #   flat  —— 全部加权求和（对照组）
+  #            门控项退化成正向项，各项之间可以互相补偿。
+  #
+  # 两种模式共用同一套分项计算（见 compute_reward），所以 A1/A2 的对比
+  # 只有一个变量：可补偿性。切换方式：
+  #     python scripts/train_grpo.py --config configs/grpo.yaml \
+  #         --override rl.reward.mode=flat
+  #
+  # 奖励的痛点来自对旧输出的实测：漏掉的数字里 98.5% 就写在原文里
+  # （是漏抄不是幻觉），漏事实的样本平均分比干净样本低 0.073，
+  # 而 ROUGE 对"漏一个金额"几乎不敏感 —— 所以主信号必须是事实覆盖。
   reward:
-    rouge_l: 0.5
-    statute_hit: 0.3     # 生成摘要中提及的法条 / 检索到的法条 的命中率
-    length: 0.1          # 长度偏离参考摘要的惩罚
-    format: 0.1          # 是否包含必备要素（案由、裁判结果等）
+    mode: gated
+    weights:
+      rouge_l: 0.5          # 和官方评测口径对齐
+      fact_coverage: 0.5    # ★ 主信号：参考摘要里的关键事实覆盖了多少
+      length: 0.1           # 只在 flat 模式下参与
+    fact_kinds: ["money", "date", "id"]
+    rouge_mode: jieba       # 中文必须分词后再算（见 eval/rouge.py）
+    gate:
+      min_chars: 60
+      length_ratio_range: [0.5, 1.5]   # 相对参考摘要的长度区间
+      forbidden_prefixes: ["以下是", "摘要：", "摘要:", "本摘要", "这是"]
+      require_result_marker: true      # 必须出现"判决如下/判令/驳回"等
