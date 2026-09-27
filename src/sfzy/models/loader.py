@@ -100,17 +100,21 @@ def load_tokenizer(model_cfg: Dict[str, Any]) -> Any:
     return tokenizer
 
 
-def load_model(model_cfg: Dict[str, Any], quant_config: Any = None,gradient_checkpointing=True) -> Any:
+def load_model(
+    model_cfg: Dict[str, Any],
+    quant_config: Any = None,
+    gradient_checkpointing: bool = True,
+    local_rank: int = -1,
+) -> Any:
     """加载模型。
 
-    要点：
-      * device_map：单卡小模型用 "auto" 或 "cuda"；本机 4GB 只能跑 0.5B。
-      * 量化模型必须先做 prepare_model_for_kbit_training 才能接 LoRA，
-        这一步放在 lora.inject_lora 之前（trainer 里调用），
-        还是放在这里？想清楚调用顺序，并注释说明。
-      * torch_dtype 从配置读，别硬编码。
+    local_rank >= 0 表示处于 DDP 环境（由 torchrun 注入），此时把整模型
+    **钉在本进程自己的卡上**。原因是 DDP 和 `device_map="auto"` 的语义相反：
 
-    提示：不要在这里做 model.half() 之类的强制转换，容易和量化配置打架。
+        device_map="auto"  →  模型并行，把模型**摊到多张卡**上（给推理用）
+        DDP                →  数据并行，**每张卡一份完整副本**，只跑不同数据
+
+    两者叠加会直接报错（每个进程只拿到一部分层，没法各自前向）。
     """
     model_name = model_cfg.get("model_name_or_path")
     if not model_name:
@@ -146,7 +150,7 @@ def load_model(model_cfg: Dict[str, Any], quant_config: Any = None,gradient_chec
         pretrained_model_name_or_path=model_name,
         config=config,
         quantization_config=quant_config,
-        device_map=model_cfg.get("device_map", "auto"),
+        device_map={"": local_rank} if local_rank >= 0 else model_cfg.get("device_map", "auto"),
         torch_dtype=torch_dtype,
         trust_remote_code=model_cfg.get("trust_remote_code", False),
     )

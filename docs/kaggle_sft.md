@@ -378,3 +378,71 @@ T4 是 Turing 架构，**不支持 bf16**。而 fp16 需要 GradScaler 配合
 **Q: 为什么 checkpoint 只存几十 MB？**
 LoRA 只保存可训练的 adapter（A/B 矩阵），不存整个 6B 底座。
 `checkpoint.py` 的 `only_trainable=True` 做的这件事。
+
+---
+
+## 双卡（DDP）训练
+
+单卡实测 10.4 秒/样本，全量训练集 10738 条要 **31 小时** —— 超过单次 10 小时，
+也超过每周 30 小时的配额。所以双卡不是"想更快"，是**必须做**。
+
+### 速度预期：接近 2×，但不是精确 2×
+
+LoRA 让 DDP 的效率很高：**需要 all-reduce 的梯度只有 3.9M 个参数 ≈ 15.6MB**，
+而 T4 之间走 PCIe 传 15MB 是大材小用，通信开销几乎可以忽略。
+
+损失的 10~30% 来自：数据加载的串行部分、每步的同步等待、以及一个 batch 里
+长短样本混杂导致的卡间负载不均。
+
+> 反过来说，**如果换成全参数微调，梯度是 12GB 量级，PCIe 就会变成瓶颈**，
+> 加速比会明显下降。LoRA 在这里帮了大忙。
+
+### 启动方式
+
+```python
+%cd /kaggle/working/sfzy-sft
+!python -m torch.distributed.run --nproc_per_node 2 --standalone \
+    scripts/train_sft.py --config configs/sft_kaggle.yaml \
+    --limit 200 --dev-limit 50 \
+    --override sft.num_epochs=1 \
+    --override sft.per_device_batch_size=2 \
+    --override sft.grad_accum_steps=4 \
+    --override sft.output_dir=outputs/smoke_ddp
+```
+
+用 `python -m torch.distributed.run` 而不是 `torchrun` 可执行文件 —— 后者不一定在 PATH 里。
+
+### batch 怎么配
+
+单卡 11GB/15GB 只剩 4GB 余量，直接加 batch 有风险。但 DDP 下每张卡只需要放
+一份完整的 4-bit 模型（3.5GB）+ 自己的激活，余量比单卡宽。
+
+```yaml
+per_device_batch_size: 2      # 每卡 2 条
+grad_accum_steps: 4           # 等效 batch = 2 × 4 × 2卡 = 16
+```
+
+**等效 batch 保持 16 不变**是有意的：超参（学习率）不用重调，单卡的 smoke
+结果还能当基线。有余量再把 `per_device_batch_size` 提到 4、`grad_accum_steps` 降到 2。
+
+### 代码上做了什么
+
+| 位置 | 改动 |
+|---|---|
+| `models/loader.py` | `load_model(..., local_rank=)` —— ≥0 时用 `device_map={"": local_rank}` 把整模型钉在本进程的卡上 |
+| `utils/distributed.py` | `wrap_model()` 封装 DDP；`init_distributed` 只在 NCCL 时才 `set_device` |
+| `sft/trainer.py` | `DistributedSampler` + `set_epoch`；`steps_per_epoch` 除以 `world_size` |
+| `scripts/train_sft.py` | 串起来：加载 → 注入 LoRA → **再**包 DDP |
+
+**三个容易错的点：**
+
+1. **DDP 必须在注入 LoRA 之后包。** 先包再注入的话，新加的模块不在 DDP 管辖内，
+   梯度不会同步，两张卡各训各的 —— 而且不报错。
+2. **`steps_per_epoch` 必须除以 `world_size`。** 不然学习率调度会按单卡的数据量走，
+   实际只走到 cosine 曲线的一半就结束了。同样不报错。
+3. **`device_ids` 要看模型在哪，而不是 CUDA 可不可用。** 机器有 GPU 但模型在 CPU
+   （DDP 的 CPU 测试就是这种情况）时会直接报错。
+
+第 2、3 条都是 `tests/test_ddp_smoke.py` 抓出来的 —— 它用 **CPU + gloo** 起两个
+进程，验证分片、梯度同步、步数折算。本机只有一张卡跑不了真双卡，但 DDP 的
+正确性和后端无关，gloo 就能验。

@@ -38,8 +38,10 @@ from sfzy.sft.trainer import SFTTrainer                  # noqa: E402
 from sfzy.utils.distributed import (                     # noqa: E402
     cleanup,
     describe_environment,
+    get_world_size,
     init_distributed,
     is_main_process,
+    wrap_model,
     pick_device,
 )
 from sfzy.utils.logging import get_logger                # noqa: E402
@@ -146,10 +148,12 @@ def main() -> None:
         model_cfg,
         quant_config=quant_config,
         gradient_checkpointing=sft_cfg.get("gradient_checkpointing", False),
+        local_rank=local_rank,          # >=0 时把整模型钉在本进程自己的卡上
     )
-    # device_map 为空时才手动搬运；device_map="auto" 已经由 accelerate 放好了，
+    # 只有「单进程 + 配置里没给 device_map」时才手动搬运。
+    # 其余情况（device_map="auto" 或 DDP）模型已经被 accelerate 放好了，
     # 再调 .to() 会直接报错。
-    if model_cfg.get("device_map") in (None, "", "none"):
+    if local_rank < 0 and model_cfg.get("device_map") in (None, "", "none"):
         model = model.to(device)
 
     replaced = inject_lora(
@@ -167,6 +171,13 @@ def main() -> None:
     mark_only_lora_trainable(model)
     logger.info("注入 LoRA: %d 层", replaced)
     logger.info("模型概况: %s", describe_model(model))
+
+    # DDP 包装必须在**注入 LoRA 之后**：先让每张卡都有完整的「底座 + LoRA」，
+    # 再包 DDP 做梯度同步。反过来包的话，新注入的模块不在 DDP 的管辖范围内，
+    # 梯度不会同步，两张卡会各训各的。
+    model = wrap_model(model, local_rank)
+    if local_rank >= 0:
+        logger.info("已包装 DistributedDataParallel（%d 卡）", get_world_size())
 
     # ---------------- 3. 数据 ----------------
     processed_dir = resolve(data_cfg.path_("data.processed_dir", "data/processed"))

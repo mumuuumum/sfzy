@@ -40,7 +40,14 @@ def init_distributed(backend: Optional[str] = None) -> int:
         if backend is None:
             backend = "nccl" if torch.cuda.is_available() else "gloo"
         dist.init_process_group(backend=backend)
-    if torch.cuda.is_available():
+
+    # **只有 NCCL（GPU）才需要绑定设备。**
+    # 早先这里写的是「只要 CUDA 可用就 set_device(local_rank)」，有两个问题：
+    #   1. 用 gloo 做 CPU 多进程时，rank=1 会去绑一张不存在的卡而失败；
+    #   2. 本机实测 `CUDA_VISIBLE_DEVICES=""` 会让 torch 在
+    #      cuda.is_available() 里 native 崩溃（free(): double free），
+    #      所以想「强制 CPU」不能靠清空这个环境变量。
+    if backend == "nccl" and torch.cuda.is_available():
         torch.cuda.set_device(local_rank)
     return local_rank
 
@@ -91,6 +98,40 @@ def pick_device(preferred: str = "auto") -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def wrap_model(model: Any, local_rank: int) -> Any:
+    """按需把模型包成 DistributedDataParallel。
+
+    抽成函数是为了让**脚本和测试走同一条代码路径** —— 早先这段逻辑
+    只写在 train_sft.py 里，结果 DDP 测试覆盖不到它，梯度没同步都测不出来。
+
+    local_rank < 0 表示单进程，原样返回。
+
+    两个容易踩的点：
+      * **必须在注入 LoRA 之后包**。先包再注入的话，新加的模块不在
+        DDP 的管辖范围内，梯度不会同步，两张卡会各训各的。
+      * `device_ids` 要看**模型在哪块设备上**，而不是"CUDA 可不可用"。
+        这两个在 DDP 测试里会分叉：机器有 GPU，但为了测 CPU 路径把模型放在
+        CPU 上 —— 这时传 device_ids=[rank] 会直接报
+            ValueError: device_ids ... only work with GPU modules or CPU modules,
+                        but got device_ids [0] ... module parameters {device('cpu')}
+        这个错误是 DDP 测试抓出来的，单卡跑永远碰不到。
+    """
+    if local_rank < 0:
+        return model
+
+    from torch.nn.parallel import DistributedDataParallel
+
+    on_cuda = next(model.parameters()).device.type == "cuda"
+    device_ids = [local_rank] if on_cuda else None
+    return DistributedDataParallel(
+        model,
+        device_ids=device_ids,
+        output_device=device_ids[0] if device_ids else None,
+        # LoRA 的参数每层都会用到，没有 unused 参数，关掉能省一点开销
+        find_unused_parameters=False,
+    )
 
 
 def describe_environment() -> dict:

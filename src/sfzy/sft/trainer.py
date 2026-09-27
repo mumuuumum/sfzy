@@ -37,11 +37,12 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 
 from sfzy.config import Config
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sfzy.sft.lr_scheduler import get_lr
+from sfzy.utils.distributed import get_world_size, is_distributed
 from sfzy.utils.logging import get_logger
 
 logger = get_logger("trainer")
@@ -200,6 +201,9 @@ class SFTTrainer:
         # 刻意不支持"自动找最新"—— 见 resume() 的说明。
         self.resume_from: Optional[str] = sft_cfg.get("resume_from") or None
 
+        # DDP 下每条 rank 只处理 1/world_size 的数据，步数计算要用到
+        self.world_size = get_world_size()
+
     # ------------------------------------------------------------------
     def train(self, train_dataset: Any, dev_dataset: Optional[Any] = None) -> TrainState:
         """主循环。
@@ -270,14 +274,28 @@ class SFTTrainer:
         #   2. dropout 全程关闭，正则化失效，模型更容易过拟合。
         self.model.train()
 
-        steps_per_epoch = math.ceil(len(train_dataset) / (self.batch_size * self.grad_accum_steps))
+        # DDP 下每条 rank 只处理 1/world_size 的数据，所以每条 rank 的优化步数
+        # 也要除以 world_size —— 否则学习率调度会按「单卡的数据量」走，
+        # 实际只走到 cosine 曲线的一半就结束了。
+        steps_per_epoch = math.ceil(
+            len(train_dataset) / (self.batch_size * self.grad_accum_steps * self.world_size)
+        )
         total_steps = steps_per_epoch * self.num_epochs
         start_epoch = self.state.epoch
         steps_done_in_epoch = self.state.step - start_epoch * steps_per_epoch
-        
+
+        # DDP 下用 DistributedSampler 把数据分给各个 rank。必须 set_epoch，
+        # 否则每个 epoch 的分片方式完全一样 —— 每轮都拿同一批数据，
+        # 而且两张卡之间也不会轮换。
+        sampler = None
+        if is_distributed():
+            sampler = DistributedSampler(train_dataset, shuffle=True, seed=self.seed)
+
         log_loss_sum = 0.0
         log_step_count = 0
         for epoch in range(start_epoch, self.num_epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             batches_to_skip = steps_done_in_epoch * self.grad_accum_steps
             skip = batches_to_skip if epoch == start_epoch else 0
             
@@ -286,7 +304,9 @@ class SFTTrainer:
             loader = DataLoader(
                 dataset=train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True, # each epoch diffs
+                # shuffle 与 sampler 互斥，同时给会直接报错
+                shuffle=sampler is None,
+                sampler=sampler,
                 collate_fn=self.collator,
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory,
