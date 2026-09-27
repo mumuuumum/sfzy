@@ -19,7 +19,7 @@ defaults: sft
 # bnb_4bit_compute_dtype 一致。
 
 model_config: configs/model_chatglm3_6b.yaml
-data_config: configs/data_kaggle.yaml
+data_config: configs/data_splits.yaml
 
 sft:
   output_dir: outputs/sft_chatglm3

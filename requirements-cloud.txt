@@ -1,0 +1,30 @@
+# AutoDL（2× RTX 4090）上的环境补充依赖
+# =====================================================================
+# 【重要】不要在这个文件里写 torch。
+#
+# AutoDL 的基础镜像已经自带和 CUDA 匹配的 torch。重装 torch 极易装成
+# 版本不匹配的 wheel —— 我们在本机就因为这个踩过一次：环境里的 torch
+# 是 cu130 编译的，而驱动只支持到 12.9，GPU 直接不可用。
+#
+# 【同样重要】不需要 bitsandbytes。
+#
+# 4090 的 24GB 显存装得下 6B 的 bf16 权重，走 bf16 + LoRA 就够，
+# 不需要 4-bit 量化。于是绕开了 bitsandbytes 的全部坑：
+#   * 4-bit 在 CPU 上不可用
+#   * bnb_4bit_compute_dtype 和 autocast 的 dtype 要对齐
+#   * 反量化的额外开销
+#
+# 安装方式：
+#     pip install -r requirements-cloud.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# =====================================================================
+
+# 上限 <5.0 是硬约束：ChatGLM3 的远程代码是 2023 年写的，
+# transformers 5.x 的接口变更让它大概率加载不了。
+# 具体哪个版本能跑，以 scripts/check_model.py 的验证结果为准。
+transformers>=4.40,<5.0
+
+accelerate>=0.30
+datasets>=2.18
+jieba>=0.42
+pyyaml>=6.0
+pytest>=8.0

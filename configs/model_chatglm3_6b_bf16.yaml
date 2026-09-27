@@ -1,0 +1,26 @@
+defaults: base
+
+# 2× RTX 4090 (24GB) 上的模型配置。
+#
+# 相对 Kaggle 的 T4 版本（model_chatglm3_6b.yaml），**只改了影响显存的部分**：
+#   load_in_4bit: true  → false   24GB 装得下 6B 的 bf16 权重，不需要量化
+#   bnb_4bit_* 三项     → 删掉   （不量化了，这些配置没有意义）
+#   torch_dtype: fp16   → bfloat16
+# 其余（模型名、trust_remote_code、max_length 的位置）结构不变。
+
+model:
+  model_name_or_path: models/chatglm3-6b
+  # ChatGLM3 自带建模代码，必须开启
+  trust_remote_code: true
+
+  # ---- 关键改动 ----
+  # 4090 是 Ada (sm_89)，原生支持 bf16；T4 是 Turing 不支持。
+  # 这一改顺带绕开了 fp16 + GradScaler 那一整类坑
+  # （未缩放就裁剪、fp16 主权重、Attempting to unscale FP16 gradients）。
+  # 代价是少了 4-bit 的显存节省，但 24GB 不需要省。
+  load_in_4bit: false
+  torch_dtype: bfloat16
+
+  # 不做 accelerate 分片，由 scripts/train_sft.py 手动 .to(device)
+  device_map: null
+  max_length: 2048
