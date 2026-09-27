@@ -1,0 +1,37 @@
+defaults: base
+
+rag:
+  corpus_dir: data/raw/laws
+  index_dir: data/index
+
+  # 语料筛选：null = 使用全部 12 个目录。
+  # 建议按"数据集中实际被引用的法律"来筛，而不是按现行法律的完整性。
+  # 参考 README 的引用统计：停用/ 是核心语料，民法典/ 引用次数为 0。
+  include_dirs: null
+
+  chunk:
+    max_chars: 512
+    overlap_chars: 64
+
+  bm25:
+    k1: 1.5
+    b: 0.75
+
+  dense:
+    model_name: BAAI/bge-small-zh-v1.5
+    batch_size: 64
+
+  fusion:
+    method: rrf
+    rrf_k: 60          # RRF 的平滑常数，论文取值 60
+    top_k_bm25: 50
+    top_k_dense: 50
+
+  rerank:
+    enabled: false     # 作为消融项，先不开启
+    model_name: BAAI/bge-reranker-base
+    top_k: 10
+
+  context:
+    top_k: 5           # 最终注入 prompt 的条文数
+    max_tokens: 512    # 检索内容的 token 预算，防止挤占原文

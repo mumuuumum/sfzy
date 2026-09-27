@@ -1,0 +1,9 @@
+defaults: data
+
+# Kaggle 上用 tools/make_splits.py 预先切好的三份数据。
+# 切分按案由分层，三集合的案由分布一致（见 tools/make_splits.py 的输出）。
+data:
+  processed_dir: data/splits
+  sample_size: null          # 线上不限量，用多少条由训练配置决定
+  train_file: train.jsonl
+  dev_file: val.jsonl        # 名字和本地不同，所以要显式指定

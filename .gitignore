@@ -1,0 +1,48 @@
+# ==================== Python ====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ==================== 数据集 ====================
+# CAIL2020 原始数据集：体积大（126MB）且不宜再分发，不入版本库。
+# 合并方式与来源说明见 README。
+data/raw/sfzy_cail.json
+data/raw/sfzy_big.json
+data/raw/sfzy_small.json
+# 切分产物：由 tools/make_splits.py 从 sfzy_cail.json 生成，可随时重建（105MB）
+data/splits/
+# 开发期小样本，由 tools/make_sample_data.py 生成
+data/raw/sample/
+data/raw/sample_test_input.jsonl
+# 2025-03 旧毕设的评测结果（111MB）—— 是分析用的参考数据，不是运行依赖。
+# 保留在本地即可，另找地方备份。
+data/old_res/
+# 规范化 / 切分产物一律不入库（正文里已经解释了各自的生成方式）
+# 用通配是为了覆盖 processed_2000 / processed_full 这类实验用的变体目录
+data/processed*/
+data/index*/
+
+# 说明：data/raw/laws/ 下的法条语料（约 25MB、1385 个 .md）是 RAG 知识库，
+#       属于项目资产，保留在版本库中。
+
+# ==================== 训练产物 ====================
+outputs/
+checkpoints/
+logs/
+wandb/
+
+# 下载到项目内的模型权重（由 tools/download_model.py 管理，体积大不入库）
+models/
+
+# ==================== 本地配置 ====================
+.env
+*.local.yaml

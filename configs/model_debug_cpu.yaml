@@ -1,0 +1,12 @@
+defaults: base
+
+# 纯 CPU 调试用的小模型配置。
+# 和 model_debug_small.yaml 的区别：fp32 权重（CPU 上 fp16 是软件模拟，慢得多）、
+# max_length 压到 256（CPU 的前向开销和序列长度近似线性）。
+model:
+  model_name_or_path: models/Qwen2.5-0.5B-Instruct
+  trust_remote_code: false
+  torch_dtype: float32
+  load_in_4bit: false
+  device_map: null
+  max_length: 256

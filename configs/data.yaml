@@ -1,0 +1,28 @@
+defaults: base
+
+data:
+  # 合并去重后的 CAIL2020 全量数据（13427 条）
+  raw_file: data/raw/sfzy_cail.json
+  processed_dir: data/processed
+
+  # 句子拼接方式。官方 text 是按句切分的，空串拼接可无损还原原文；
+  # 传 "\n" 可读性更好但会引入原文没有的字符。
+  joiner: ""
+
+  # 切分比例
+  splits:
+    train: 0.9
+    dev: 0.1
+
+  # 开发期采样条数：先用小子集跑通全流程，确认可行后再上全量。
+  # 设为 null 表示使用全量数据。
+  sample_size: 200
+
+  # prompt 模板风格，对应 data/prompts.py 里的三种构造方式
+  #   zeroshot   仅给原文
+  #   structured 附加文书结构提示（沿用 2025-03 的 Prompt-Engineering 工作）
+  #   rag        附加检索到的方法条与类案摘要
+  prompt_style: structured
+
+# 注：原文过长由 collator 阶段 tokenizer 的 max_length 截断处理，
+#     不在数据层做过滤。截断长度定义在 configs/model_*.yaml。

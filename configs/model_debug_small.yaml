@@ -1,0 +1,12 @@
+defaults: base
+
+# 本地调试用的小模型（已下载到项目目录内，由 tools/download_model.py 管理）。
+# 用途：在本机 4GB 的 3050 上把 dataset → collator → trainer → checkpoint
+# 整条链跑通，暴露出接线类 bug。不是为了拿好指标。
+model:
+  model_name_or_path: models/Qwen2.5-0.5B-Instruct
+  trust_remote_code: false
+  torch_dtype: float16      # 3050 支持 fp16，走 fp16 才能验证 GradScaler 那条路径
+  load_in_4bit: false       # 0.5B 用不着量化
+  device_map: null          # 不分片，由 scripts/train_sft.py 手动 .to(device)
+  max_length: 1024

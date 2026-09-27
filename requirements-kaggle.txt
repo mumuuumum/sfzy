@@ -1,0 +1,47 @@
+# Kaggle 环境补充依赖
+# =====================================================================
+# 前置说明（重要，先读完再动手）：
+#
+# 1. 不要重装 torch。
+#    Kaggle 镜像已自带 torch / transformers / datasets / accelerate / peft。
+#    镜像里的 torch 是按 Kaggle 的 CUDA 版本编译的，重装极易装成 CPU 版
+#    或版本不匹配的 wheel，会直接毁掉整个环境。
+#
+# 2. 硬件是 2× Tesla T4（Turing, sm_75），不支持 bf16。
+#    训练必须走 fp16 + GradScaler，不能照搬 A100/4090 上的 bf16 配置。
+#
+# 3. 4-bit（nf4）量化在 T4 上可用，因此 ChatGLM3-6B 的 QLoRA 方案可行。
+#
+# 4. Kaggle notebook 默认无外网，需要在右侧设置里手动开启 Internet；
+#    或者把模型权重预先上传成 Kaggle Dataset，挂载到只读的 /kaggle/input，
+#    后者在断网环境下更稳，也不占用每次会话的下载时间。
+#
+# 5. Kaggle 配额：每周约 30 GPU 小时、单次会话 9 小时（batch 运行 12 小时）。
+#    因此训练脚本必须支持断点续训，checkpoint 要落在可持久化的输出目录。
+#
+# 安装方式（notebook 内执行）：
+#     pip install -q -r requirements-kaggle.txt
+# =====================================================================
+
+# 4-bit 量化（QLoRA 的前提）
+#
+# 版本下限是 0.46.1 —— 更低的版本会被新版 transformers 拒绝：
+#     ImportError: Using `bitsandbytes` 4-bit quantization requires
+#                  bitsandbytes: `pip install -U bitsandbytes>=0.46.1`
+#
+# 另外 Kaggle 镜像**预装**了 bitsandbytes，所以安装时必须加 -U，
+# 否则 pip 会因为 "Requirement already satisfied" 跳过升级。
+bitsandbytes>=0.46.1
+
+# 稠密检索索引，CPU 版足够（检索不需要 GPU）
+faiss-cpu>=1.8
+
+# 加载 bge 等中文 embedding 模型
+sentence-transformers>=2.7
+
+# 中文分词：BM25 分句与 ROUGE 的 jieba 模式都要用
+jieba>=0.42
+
+# 注意：torch / transformers / datasets / accelerate / peft 由 Kaggle 镜像提供。
+#       如需固定版本，请先在 notebook 里执行 pip show 核对镜像实际版本，
+#       再决定是否 pin —— 不要凭本地版本猜测。

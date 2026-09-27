@@ -1,0 +1,6 @@
+defaults: data
+
+# 中等规模：2000 条。用来验证长跑稳定性（checkpoint 频率、prune、显存）。
+data:
+  processed_dir: data/processed_2000
+  sample_size: 2000

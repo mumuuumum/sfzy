@@ -1,0 +1,45 @@
+defaults: sft
+
+# 本机（RTX 3050 Laptop，4GB）跑通用的配置。
+#
+# 目的不是拿到好指标，而是把 dataset → collator → trainer → checkpoint
+# 整条链在**真实模型**上跑通，暴露出接线类 bug：模板 key 不匹配、
+# loss mask 写错、梯度累积边界、checkpoint 存读、日志与 tracker 接线。
+# 这些和模型大小无关，用 0.5B 跑一遍就能全部暴露。
+#
+# 用法：
+#   python scripts/train_sft.py --config configs/sft_local.yaml --limit 32
+
+model_config: configs/model_debug_small.yaml
+data_config: configs/data.yaml
+
+sft:
+  output_dir: outputs/sft_local
+  num_epochs: 2
+  per_device_batch_size: 2
+  # 等效 batch = 2 * 4 = 8。0.5B 在 4GB 卡上跑得动，主要靠它控制显存。
+  grad_accum_steps: 4
+  learning_rate: 2.0e-4
+
+  # 和 model_debug_small.yaml 的 torch_dtype 保持一致
+  dtype: float16
+  gradient_checkpointing: true
+
+  # WSL 下多进程 DataLoader 容易卡在 fork 上，本地先用 0（主进程加载）
+  num_workers: 0
+  pin_memory: true
+
+  save_every_n_steps: 10
+  keep_last_n_checkpoints: 3
+  log_every_n_steps: 2
+
+  # 从头训练。要续训就在这里写具体文件路径（不会自动找最新）
+  resume_from: null
+
+lora:
+  r: 8
+  alpha: 16
+  dropout: 0.05
+  # Qwen2.5 的注意力是分开的 q/k/v/o 投影；
+  # ChatGLM3 用的是融合的 query_key_value，两者不能混用
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

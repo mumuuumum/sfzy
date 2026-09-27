@@ -1,0 +1,33 @@
+{
+  // 固定解释器，避免 VSCode 自动挑到系统 python 导致 import 失败
+  "python.defaultInterpreterPath": "/home/yukino/anaconda3/envs/minimind/bin/python",
+
+  // src 布局：让 Pylance 能找到 sfzy 包（pytest 那边由 pyproject.toml 配置）
+  "python.analysis.extraPaths": ["src"],
+  "python.autoComplete.extraPaths": ["src"],
+
+  // 测试面板直接指向 tests/，点小三角就能单跑一个用例
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["tests"],
+  "python.testing.cwd": "${workspaceFolder}",
+
+  // DataLoader 的 worker 会让调试器断在子进程里，很干扰。
+  // 本地配置已经把 num_workers 设成 0，这里顺带限制自动重载。
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingImports": "warning"
+  },
+
+  // 大文件不该被编辑器索引
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "models/Qwen2.5-0.5B-Instruct": true
+  },
+  "search.exclude": {
+    "outputs": true,
+    "models": true,
+    "data/raw": true
+  },
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda"
+}

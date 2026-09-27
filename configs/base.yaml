@@ -1,0 +1,33 @@
+# 全局基础配置。其它配置文件通过 `defaults: base` 继承这里的默认值。
+seed: 42
+
+# 训练设备：auto | cpu | cuda | cuda:0
+# auto 表示有 CUDA 就用 GPU，否则回退 CPU。
+# 显式写 cpu 会被尊重（本地调试常故意用 CPU 排除 GPU 的不确定性）。
+# 多卡场景不要在配置里写卡号 —— 进程与设备的映射由 torchrun 和
+# CUDA_VISIBLE_DEVICES 决定，写死会破坏 DDP。
+device: auto
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  index_dir: data/index
+  outputs_dir: outputs
+  laws_dir: data/raw/laws
+
+logging:
+  level: INFO
+  log_every_n_steps: 10
+
+tracking:
+  # 实验跟踪后端：none | swanlab | wandb
+  # swanlab 的 API 与 wandb 兼容，国内直连快很多，所以两者共用同一段实现。
+  # 本地调试和跑测试时保持 none，不联网也不用登录。
+  backend: none
+  project: sfzy
+
+# 训练设备：auto | cpu | cuda | cuda:0
+# auto 表示有 CUDA 就用 GPU，否则回退 CPU。
+# 多卡场景下不要在这里写卡号 —— 进程与设备的映射由 torchrun 和
+# CUDA_VISIBLE_DEVICES 决定，配置里写死会破坏 DDP。
+# device: auto

@@ -1,0 +1,32 @@
+defaults: base
+
+model_config: configs/model_chatglm3_6b.yaml
+data_config: configs/data.yaml
+
+# 摘要任务没有天然的人类偏好对，但奖励是"可验证"的：
+# ROUGE 可算、法条引用可匹配、长度和格式可检查。
+# 因此规则奖励配 GRPO 比 DPO 更贴合这个任务。
+rl:
+  method: grpo
+  output_dir: outputs/grpo
+  group_size: 8          # 每个 prompt 采样几条来估计组内基线
+  num_epochs: 1
+  per_device_batch_size: 1
+  grad_accum_steps: 8
+  learning_rate: 1.0e-5
+  max_new_tokens: 256
+  temperature: 0.9
+  top_p: 0.95
+  kl_coef: 0.01
+  clip_ratio: 0.2
+  fp16: true
+  save_every_n_steps: 200
+  log_every_n_steps: 10
+  resume_from: null
+
+  # 规则奖励各项权重（rl/reward.py）
+  reward:
+    rouge_l: 0.5
+    statute_hit: 0.3     # 生成摘要中提及的法条 / 检索到的法条 的命中率
+    length: 0.1          # 长度偏离参考摘要的惩罚
+    format: 0.1          # 是否包含必备要素（案由、裁判结果等）

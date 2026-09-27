@@ -1,0 +1,6 @@
+defaults: data
+
+# 全量 13427 条。E5 用它验证"真实规模下会不会烂"。
+data:
+  processed_dir: data/processed_full
+  sample_size: null

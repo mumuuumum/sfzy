@@ -1,0 +1,38 @@
+defaults: base
+
+# 正式实验的底座模型（Kaggle 2x T4 上运行）
+model:
+  model_name_or_path: THUDM/chatglm3-6b
+  # ChatGLM3 自带建模代码，必须开启；这也是它比 Qwen 多踩坑的原因
+  trust_remote_code: true
+
+  # QLoRA：4-bit 量化加载，T4 的 16GB 显存才能放下 6B 模型
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  # T4 是 Turing 架构，不支持 bf16，只能用 float16
+  bnb_4bit_compute_dtype: float16
+
+  torch_dtype: float16
+  # 固定放卡 0，不要用 "auto"。
+  #
+  # "auto" 在 2×T4 上会把 6B 摊到两张卡做**模型并行**，两个后果：
+  #   1. 单进程推理要跨卡通信，比单卡更慢（模型本来就装得下一张卡）；
+  #   2. 卡 1 被占满，后面接 judge 模型（LLM-as-a-judge）就没地方放了。
+  # 固定卡 0 之后，卡 1 空着留给 judge，两者能真并行。
+  device_map:
+    "": 0
+  max_length: 2048
+
+  # 远程代码的 config 字段兜底。
+  #
+  # ChatGLM3 的 modeling_chatglm.py 读 config.max_length，但它的
+  # configuration_chatglm.py 只定义了 seq_length，config.json 里也没有
+  # max_length —— 直接加载会报
+  #     AttributeError: 'ChatGLMConfig' object has no attribute 'max_length'
+  # 这是官方仓库两处字段名不一致，不是我们传参错了。
+  #
+  # 逃生口：generation 相关的属性（max_length / use_cache 等）已经由
+  # models/compat.py::patch_pretrained_config 全量回填，一般不需要在这里配。
+  # 如果还有它读了、而回填覆盖不到的字段，在这里补字面值。
+  config_patches: {}

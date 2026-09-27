@@ -1,0 +1,91 @@
+{
+  // 本机用的是 conda 的 minimind 环境，不通过 VSCode 选解释器也没关系，
+  // 每个配置都显式指定了 python 路径，避免"选错解释器导致 import 失败"。
+  "version": "0.2.0",
+  "configurations": [
+    {
+      // 最常用的一个：4 条样本、2 个优化步，跑完大约 2 分钟。
+      // 调训练循环、collator、LoRA 相关的问题都从这里开始。
+      "name": "训练 · 最小复现（4 条样本）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/train_sft.py",
+      "args": ["--config", "configs/sft_local.yaml", "--limit", "4"],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTHONPATH": "${workspaceFolder}/src"
+      },
+      "justMyCode": true
+    },
+    {
+      // justMyCode=false 才能断进 transformers / torch 的内部实现。
+      // 例：想看 Qwen2DecoderLayer 到底有没有走 gradient checkpointing 分支，
+      // 断在 modeling_qwen2.py 里必须用这个配置。
+      "name": "训练 · 可断进 transformers 内部",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/train_sft.py",
+      "args": ["--config", "configs/sft_local.yaml", "--limit", "4"],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": {
+        "CUDA_VISIBLE_DEVICES": "0",
+        "PYTHONPATH": "${workspaceFolder}/src",
+        // CUDA 算子是异步执行的，报错位置常常指向后面好几行。
+        // 打开它强制同步，traceback 才指向真正出错的那一行。
+        // 代价是变慢，只在排查 CUDA 报错时开。
+        "CUDA_LAUNCH_BLOCKING": "1"
+      },
+      "justMyCode": false
+    },
+    {
+      // 只跑了 1 条样本、梯度累积设成 1，用来看清"单步"的全部中间量。
+      // 配合断点：看 collator 出来的 labels、看 loss 有没有 grad_fn。
+      "name": "训练 · 单条样本单步",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/train_sft.py",
+      "args": [
+        "--config", "configs/sft_local.yaml",
+        "--limit", "1",
+        "--override", "sft.grad_accum_steps=1",
+        "--override", "sft.num_epochs=1"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": { "CUDA_VISIBLE_DEVICES": "0", "PYTHONPATH": "${workspaceFolder}/src" },
+      "justMyCode": true
+    },
+    {
+      // 数据管线跟模型无关，秒级就能跑完，用 sample 目录里的 60 条。
+      "name": "数据 · 规范化（小样本）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/prepare_data.py",
+      "args": ["--config", "configs/data.yaml", "--input", "data/raw/sample"],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+      "justMyCode": true
+    },
+    {
+      // 在当前打开的文件上按 F5 就能调它的测试。
+      "name": "调试当前测试文件",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["-q", "-x", "--no-header", "${file}"],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "purpose": ["debug-test"],
+      "justMyCode": true
+    }
+  ]
+}

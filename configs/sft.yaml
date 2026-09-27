@@ -1,0 +1,65 @@
+defaults: base
+
+# 选用的模型配置：本地调试用 model_debug_small，Kaggle 上用 model_chatglm3_6b
+model_config: configs/model_chatglm3_6b.yaml
+data_config: configs/data.yaml
+
+sft:
+  output_dir: outputs/sft
+  num_epochs: 3
+  per_device_batch_size: 1
+  # 梯度累积：等效 batch = 1 * 16 * 2 卡 = 32
+  # 显存不够时只能靠它把 batch 撑起来，代价是训练变慢
+  grad_accum_steps: 16
+
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  lr_scheduler: cosine
+  # cosine 衰减的下限比例：最终学习率 = learning_rate * min_lr_ratio
+  min_lr_ratio: 0.0
+  max_grad_norm: 1.0 # 梯度裁剪阈值
+
+  # 混合精度：float16 | bfloat16 | float32
+  # 必须与所用模型配置里的 bnb_4bit_compute_dtype 保持一致。
+  # T4 是 Turing 架构、不支持 bf16，所以线上固定用 float16（配 GradScaler）；
+  # bf16 不需要 GradScaler，因为它的动态范围和 fp32 一样宽。
+  dtype: float16
+  gradient_checkpointing: true
+
+  # DataLoader
+  # Kaggle 上 num_workers 设太大会因为共享内存不足被杀进程，2 就够
+  num_workers: 2
+  pin_memory: true
+
+  # Kaggle 单次会话上限 9 小时，必须频繁存档才能续训
+  save_every_n_steps: 200
+  keep_last_n_checkpoints: 3
+  log_every_n_steps: 10
+
+  # 断点续训。只有两种模式，没有"自动找最新"：
+  #
+  #   null 或 ""   → 从头训练。即使 output_dir 里有 checkpoint 也不碰。
+  #   <文件路径>    → 从该文件继续；文件不存在会直接报错，不会静默从头开始。
+  #
+  # 为什么不做"自动找最新"：output_dir 里混着不同实验的 checkpoint 时会接错；
+  # 改了学习率之后接上旧的优化器动量也没有意义（动量是在旧学习率下累积的）。
+  # 这两种情况都不会报错，你只会在几小时后发现 loss 曲线形状不对。
+  #
+  # 示例：
+  #   resume_from: outputs/sft/step_000400.pt                 # 本地续训
+  #   resume_from: /kaggle/input/sfzy-ckpt/step_000400.pt     # Kaggle 挂载回来的
+  resume_from: null
+
+  # torch.compile 默认关闭。
+  # 它和 bitsandbytes 4-bit 量化、梯度检查点叠加时容易静默重编译或直接报错，
+  # 而 LoRA 训练本身很小，加速收益抵不上排查成本。
+  use_compile: false
+
+# 手写 LoRA 注入的参数（models/lora.py）
+lora:
+  r: 8
+  alpha: 16          # 常用 alpha = 2 * r
+  dropout: 0.05
+  # ChatGLM3 的注意力是融合的 QKV 投影，层名与 LLaMA 系不同
+  target_modules: ["query_key_value"]

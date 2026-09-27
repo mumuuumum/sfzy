@@ -1,0 +1,50 @@
+defaults: sft
+
+# Kaggle 2×T4 上跑 ChatGLM3-6B 的 QLoRA 微调。
+#
+# 本文件里的 batch / 累积步数 / max_length 都是**保守起点**，
+# 必须先跑 --limit 200 的冒烟测试实测显存和速度，再按下面的公式调整：
+#
+#   等效 batch = per_device_batch_size × grad_accum_steps × GPU数
+#   单次会话可训练的样本数 ≈ 9小时 / (每样本秒数) × GPU数
+#
+# T4 是 Turing 架构，**不支持 bf16**，只能 fp16 + GradScaler，
+# 所以 sft.dtype 必须是 float16，且要和 model 配置里的
+# bnb_4bit_compute_dtype 一致。
+
+model_config: configs/model_chatglm3_6b.yaml
+data_config: configs/data_kaggle.yaml
+
+sft:
+  output_dir: outputs/sft_chatglm3
+  num_epochs: 1
+  per_device_batch_size: 2
+  grad_accum_steps: 8          # 等效 batch = 2 × 8 = 16
+  learning_rate: 2.0e-4
+  weight_decay: 0.0
+  warmup_ratio: 0.03
+  min_lr_ratio: 0.0
+  max_grad_norm: 1.0
+
+  dtype: float16               # T4 不支持 bf16
+  gradient_checkpointing: true
+
+  # ChatGLM3 的序列会长很多（判决书平均 2600 字），先压到 1536 试
+  max_length: 1536
+
+  num_workers: 2               # Kaggle 上设大了会被 OOM killer 干掉
+  pin_memory: true
+
+  save_every_n_steps: 100
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 10
+
+  use_compile: false
+  resume_from: null
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # ChatGLM3 的注意力是融合的 QKV 投影，不是 LLaMA 系的 q_proj/k_proj/v_proj
+  target_modules: ["query_key_value"]

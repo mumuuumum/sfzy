@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sfzy"
+version = "0.1.0"
+description = "CAIL2020 司法摘要：自实现的 SFT / RLHF / RAG 训练与评测框架"
+readme = "README.md"
+requires-python = ">=3.10"
+# 核心依赖只有 PyYAML（config.py 读取配置用）。
+# data/ 与 eval/ 两个核心模块刻意只用标准库实现，
+# 保证不开 GPU、不装重依赖也能在本地跑通数据管线与评测。
+dependencies = ["pyyaml>=6.0"]
+
+[project.optional-dependencies]
+# 本地开发：跑 tests/
+dev = ["pytest>=9.0"]
+# 检索：纯 CPU 即可运行
+rag = ["jieba>=0.42", "numpy>=1.24", "faiss-cpu>=1.8"]
+# QLoRA 训练：bitsandbytes 依赖 CUDA，只在 Kaggle 上安装
+train = ["peft>=0.11", "bitsandbytes>=0.43"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+# src 布局：让 pytest 直接 import sfzy，无需先 pip install -e .
+pythonpath = ["src"]
+testpaths = ["tests"]
