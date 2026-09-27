@@ -1,10 +1,19 @@
-"""把代码打包成可以上传到 Kaggle 的 zip。
+"""把代码打包成 zip（**备用方案**）。
 
-为什么需要：Kaggle notebook 里改代码很痛苦，而 Dataset 挂载是只读的、
-正好适合放代码。每次本地改完重新跑一遍这个脚本、更新 Dataset 版本即可。
+⚠️ 正式流程已经改成 **Git**：本地 push、Kaggle `git clone`。
+   见 docs/kaggle_sft.md 的「第一步：数据走 Dataset，代码走 Git」。
+
+   改成 git 的原因：代码是高频小改动（一天十几次），而 Dataset 是
+   为大数据设计的 —— 版本化慢、只读、没有 diff。继续用它同步代码，
+   最后一定会滑向"在 Kaggle 上就地打补丁"，然后两边对不上。
+   我们用这个 zip 方案实际走过一遍，最终在 Kaggle 上攒了六七个补丁。
+
+保留这个脚本是因为两种情况还能用上：
+  1. Kaggle 那边不能联网（无法 git clone）时的离线部署；
+  2. 想把"某个特定版本的代码 + 数据"一起打包归档。
 
 排除：data/ models/ outputs/ .git/ 等 —— 数据和模型单独作为 Dataset，
-代码包应该只有几百 KB。
+代码包应该只有一两百 KB。
 
 用法：
     python tools/make_kaggle_bundle.py

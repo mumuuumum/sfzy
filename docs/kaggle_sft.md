@@ -16,33 +16,64 @@ Kaggle 每周只有 30 GPU 小时，一次会话上限 9 小时。所以**不要
 
 ---
 
-## 第一步：准备两个 Kaggle Dataset
+## 第一步：数据走 Dataset，代码走 Git
 
-### 一个 Dataset 装两样东西
+**这两样东西的更新频率差了两个数量级，所以同步方式必须分开。**
+
+| | 数据 | 代码 |
+|---|---|---|
+| 体积 | 105MB | 150KB |
+| 变化频率 | 几乎不变 | 一天改十几次 |
+| 同步方式 | **Kaggle Dataset** | **Git 仓库** |
+
+一开始我们把代码也打包成 zip 塞进 Dataset，结果是每改一行都要重新打包、
+重新上传、等几分钟。中间还图快改用"在 Kaggle 上就地打补丁"，
+结果攒了六七个补丁，和本地代码越对越不上 —— 这是个错配：
+**Dataset 是为大数据设计的，版本化慢、只读、没有 diff**。
+
+### A. 数据（Kaggle Dataset）
 
 本地执行：
 
 ```bash
-python tools/make_splits.py          # → data/splits/{train,val,test}.jsonl  (105MB)
-python tools/make_kaggle_bundle.py   # → dist/sfzy-code.zip                  (130KB)
-unzip -o dist/sfzy-code.zip -d dist/sfzy-code    # 解压成目录
+python tools/make_splits.py     # → data/splits/{train,val,test}.jsonl  (105MB)
 ```
 
-然后建一个 Kaggle Dataset（命名比如 `sfzy-sft`），把下面这些放进去：
+建一个 Kaggle Dataset（命名比如 `sfzy-sft`），**只放这三个文件**：
 
 ```
 train.jsonl
 val.jsonl
 test.jsonl
-sfzy-code/          ← dist/sfzy-code/ 的内容
 ```
 
-**挂载后的实际路径是 `/kaggle/input/datasets/<用户名>/<数据集名>/`** —— 这是
-Kaggle 较新的格式，早期是 `/kaggle/input/<数据集名>/`。两种都可能遇到，
-所以下面 notebook 里**不写死路径，按文件名自动探测**。
+> 挂载后的实际路径是 `/kaggle/input/datasets/<用户名>/<数据集名>/`（Kaggle
+> 较新的格式，早期是 `/kaggle/input/<数据集名>/`）。下面 notebook 里
+> **不写死路径，按文件名自动探测**，两种格式都能用。
 
-> 代码上传成 zip 或目录都可以，格 1 里的探测逻辑对两种都成立。
-> 每次本地改完代码都要重新打包并上传新版本。
+### B. 代码（Git 仓库）
+
+本地执行一次：
+
+```bash
+cd ~/projects/sfzy
+git remote add origin git@github.com:<你的用户名>/sfzy.git
+git push -u origin main
+```
+
+之后每次改完代码：
+
+```bash
+git add -A && git commit -m "..." && git push
+```
+
+Kaggle 那边 `git clone`（格 1）。**代码版本就是 commit hash**，
+实验记录里写清楚用的是哪个 commit，结果就可复现了。
+
+> **建议公开仓库**：一是 Kaggle clone 时不用配 token，二是这是个面试项目，
+> GitHub 本身就该给人看。
+> 如果要用私有仓库，clone 时用 `https://<token>@github.com/user/repo.git`，
+> token 放 Kaggle 的 Secrets 里而不是硬编码在 notebook。
 
 ---
 
@@ -58,32 +89,31 @@ New Notebook，然后在右侧设置面板里：
 
 ## 第三步：环境准备（notebook 里逐格跑）
 
-### 格 1 — 部署代码、链接数据
+### 格 1 — 拉代码、链接数据
 
 ```python
-import glob, pathlib, shutil
+import pathlib, shutil, subprocess, os
 
-INPUT = pathlib.Path("/kaggle/input")
+REPO = "https://github.com/<你的用户名>/sfzy.git"     # ← 改这里
+CODE = pathlib.Path("/kaggle/working/sfzy")
 
-# Kaggle 的挂载路径格式变过两次：
+# 每次会话都是新的容器，所以每次都要重新 clone（代码 150KB，一两秒）
+if CODE.exists():
+    shutil.rmtree(CODE)
+subprocess.run(["git", "clone", "--depth", "1", REPO, str(CODE)], check=True)
+
+REV = subprocess.run(["git", "-C", str(CODE), "log", "--oneline", "-1"],
+                     capture_output=True, text=True).stdout.strip()
+print("代码版本:", REV)     # ← 把这一行记进实验记录，结果才可复现
+
+# 数据仍然从 Dataset 挂载。路径格式变过两次，所以按文件名自动探测：
 #     /kaggle/input/<数据集名>/
 #     /kaggle/input/datasets/<用户名>/<数据集名>/
-# 所以不写死路径，按内容自动找。
-train_jsonl = next(INPUT.rglob("train.jsonl"))
+train_jsonl = next(pathlib.Path("/kaggle/input").rglob("train.jsonl"))
 DATA = train_jsonl.parent
 print("数据目录:", DATA)
 
-CODE_SRC = next(p for p in INPUT.rglob("sfzy-code") if p.is_dir())
-CODE = pathlib.Path("/kaggle/working/sfzy")
-
-# 必须拷到 /kaggle/working：/kaggle/input 是只读的，而训练要写 outputs/
-# 顺便这也让你能在 Kaggle 上直接改 configs/ 而不用重新上传
-if CODE.exists():
-    shutil.rmtree(CODE)
-shutil.copytree(CODE_SRC, CODE)
-print("代码目录:", CODE_SRC, "->", CODE)
-
-# 数据文件是只读的，软链到代码期望的相对路径（configs/data_kaggle.yaml 里写的是 data/splits）
+# 数据是只读的，软链到代码期望的相对路径（configs/data_kaggle.yaml 写的是 data/splits）
 splits = CODE / "data" / "splits"
 splits.mkdir(parents=True, exist_ok=True)
 for name in ("train.jsonl", "val.jsonl", "test.jsonl"):
@@ -94,6 +124,12 @@ for name in ("train.jsonl", "val.jsonl", "test.jsonl"):
 
 print("就绪:", sorted(p.name for p in splits.iterdir()))
 ```
+
+> **同一会话里想用最新代码**：本地 push 之后，在 notebook 里跑
+> `!git -C /kaggle/working/sfzy pull` 即可，不用重跑整格。
+>
+> **不建议在 Kaggle 上直接改代码** —— 那样又会出现"两边不一致"的老问题。
+> 临时调参可以改 `configs/`（不提交），代码改动一律走本地 → push → pull。
 
 ### 格 2 — 装依赖、设缓存路径
 
