@@ -4,7 +4,7 @@ __pycache__/
 *$py.class
 *.egg-info/
 build/
-dist/
+/dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -35,13 +35,19 @@ data/index*/
 #       属于项目资产，保留在版本库中。
 
 # ==================== 训练产物 ====================
-outputs/
-checkpoints/
-logs/
-wandb/
+#
+# ⚠️ 前导斜杠不能省！gitignore 里不带斜杠的模式会匹配**任意层级**的同名目录。
+#    我们在这里栽过一次：写 `models/` 本意是排除根目录下的模型权重，
+#    结果它把 `src/sfzy/models/` 整个子包也排除了 —— 本地因为有文件在磁盘上
+#    完全看不出来，直到在 Kaggle 上 clone 下来才报
+#        ModuleNotFoundError: No module named 'sfzy.models'
+/outputs/
+/checkpoints/
+/logs/
+/wandb/
 
 # 下载到项目内的模型权重（由 tools/download_model.py 管理，体积大不入库）
-models/
+/models/
 
 # ==================== 本地配置 ====================
 .env
