@@ -383,19 +383,38 @@ LoRA 只保存可训练的 adapter（A/B 矩阵），不存整个 6B 底座。
 
 ## 双卡（DDP）训练
 
-单卡实测 10.4 秒/样本，全量训练集 10738 条要 **31 小时** —— 超过单次 10 小时，
-也超过每周 30 小时的配额。所以双卡不是"想更快"，是**必须做**。
+单卡实测 9.4 秒/样本（200 条冒烟：151 秒/优化步 ÷ 16 条/步），
+全量训练集 10738 条要 **28 小时** —— 超过单次 10 小时，也超过每周 30 小时的配额。
+所以双卡不是"想更快"，是**必须做**。
 
 ### 速度预期：接近 2×，但不是精确 2×
 
-LoRA 让 DDP 的效率很高：**需要 all-reduce 的梯度只有 3.9M 个参数 ≈ 15.6MB**，
-而 T4 之间走 PCIe 传 15MB 是大材小用，通信开销几乎可以忽略。
+LoRA 让 DDP 的效率很高：**需要 all-reduce 的梯度只有 7.4M 个参数 ≈ 30MB**
+（r=4 打在 qkv/dense/dense_h_to_4h/dense_4h_to_h 上），
+而 T4 之间走 PCIe 传 30MB 是大材小用，通信开销几乎可以忽略。
 
 损失的 10~30% 来自：数据加载的串行部分、每步的同步等待、以及一个 batch 里
 长短样本混杂导致的卡间负载不均。
 
 > 反过来说，**如果换成全参数微调，梯度是 12GB 量级，PCIe 就会变成瓶颈**，
 > 加速比会明显下降。LoRA 在这里帮了大忙。
+
+### DDP 到底在每张卡上放什么
+
+**数据并行 = 每张卡一份完整的模型副本**（权重、LoRA 参数、优化器动量、梯度），
+只有喂进去的数据不同；每一步结束用 all-reduce 把各卡的梯度求平均。
+
+所以有三件事必须记住：
+
+1. **每卡显存 ≈ 单卡训练的显存**，不会因为多了张卡就变小。
+   这就是 `load_model(..., local_rank=)` 要用 `device_map={"": local_rank}`
+   把整个模型钉在本进程自己那张卡上的原因 —— 用 `auto` 会变成"模型并行"，
+   把层摊到两张卡上，跟 DDP 的语义正好相反（每个进程只有一部分层，没法各自前向）。
+2. `per_device_batch_size` 是**每张卡**的批量。全局批量
+   = per_device_batch_size × grad_accum_steps × 卡数。
+3. **单步不会变快**：DDP 提速的方式是"同样时间处理两倍数据"。
+   一次优化步的耗时和单卡一样（再加几个百分点的通信），
+   但它现在吃掉两倍的样本 —— 所以按 epoch 算的墙钟时间才接近减半。
 
 ### 启动方式
 
@@ -412,18 +431,56 @@ LoRA 让 DDP 的效率很高：**需要 all-reduce 的梯度只有 3.9M 个参�
 
 用 `python -m torch.distributed.run` 而不是 `torchrun` 可执行文件 —— 后者不一定在 PATH 里。
 
+`--dev-limit 50` 不是可选项：验证集有 1340 条，每轮到 epoch 结束都要完整跑一遍
+（约 1 秒/条，单卡 20 分钟左右），冒烟阶段没必要付这个时间。
+正式训练时才放开（它同时决定 `best.pt` 是什么时候存的）。
+
+正式训练去掉 `--limit` / `--dev-limit`：
+
+```python
+!python -m torch.distributed.run --nproc_per_node 2 --standalone \
+    scripts/train_sft.py --config configs/sft_kaggle.yaml
+```
+
 ### batch 怎么配
 
-单卡 11GB/15GB 只剩 4GB 余量，直接加 batch 有风险。但 DDP 下每张卡只需要放
-一份完整的 4-bit 模型（3.5GB）+ 自己的激活，余量比单卡宽。
+单卡实测 11 GiB/14.6 GiB，只剩约 4 GiB 余量。DDP 不会让这个余量变宽：
+每张卡都要放**一整份** 4-bit 权重（约 3.5 GiB）+ 未被量化的 fp32 词表/输出层
+（0.54 B × 4 B ≈ 2.1 GiB）+ 自己的激活。
 
 ```yaml
 per_device_batch_size: 2      # 每卡 2 条
-grad_accum_steps: 4           # 等效 batch = 2 × 4 × 2卡 = 16
+grad_accum_steps: 8           # 等效 batch = 2 × 8 × 2卡 = 32
 ```
 
-**等效 batch 保持 16 不变**是有意的：超参（学习率）不用重调，单卡的 smoke
-结果还能当基线。有余量再把 `per_device_batch_size` 提到 4、`grad_accum_steps` 降到 2。
+**`per_device_batch_size` 停在 2，不要再往上调。** 原因不是权重，而是
+**词表投影**：ChatGLM3 的 vocab 是 65024，官方 `modeling_chatglm.py` 里
+
+```python
+lm_logits = lm_logits.to(torch.float32)      # fp16 → fp32，多一份
+shift_logits = lm_logits[..., :-1, :].contiguous()   # 又一份 fp32 拷贝
+```
+
+一次前向里同时存在 fp16 logits、fp32 logits、fp32 的 shift 副本，
+反传时还有同尺寸的 fp32 梯度，合计约 `B×L×0.9 MB`：
+
+| 配置 | 均值长度（B×L≈2×2000） | p95 长度（B×L≈2×3500） |
+|---|---|---|
+| B=2 | ≈ 3.6 GiB | ≈ 6.3 GiB |
+| B=4 | ≈ 7.2 GiB | ≈ 12.6 GiB |
+
+加上 5 GiB 静态权重，B=4 在 15 GiB 的卡上必然 OOM（长样本批更早）。
+想验证就跑：
+
+```python
+!python scripts/check_memory.py --batch-size 4 --seq-len 3500
+```
+
+判据：**"backward 后"的余量 < 1 GiB 就不要用**。9 小时会话里必然遇到长样本批，
+而 OOM 会挑那种批发作 —— 你不会想在第 150 步丢掉整个会话。
+
+要更大的等效批量就加 `grad_accum_steps`：梯度累积和真 batch 在数学上等价
+（我们没有 BatchNorm，只有 LoRA 的 dropout 分布略有区别），代价只是慢一点。
 
 ### 代码上做了什么
 
@@ -446,3 +503,61 @@ grad_accum_steps: 4           # 等效 batch = 2 × 4 × 2卡 = 16
 第 2、3 条都是 `tests/test_ddp_smoke.py` 抓出来的 —— 它用 **CPU + gloo** 起两个
 进程，验证分片、梯度同步、步数折算。本机只有一张卡跑不了真双卡，但 DDP 的
 正确性和后端无关，gloo 就能验。
+
+---
+
+## 参数依据（实测 + 推算，改配置前先看这里）
+
+### 一次会话能跑多少
+
+| 量 | 数值 | 来源 |
+|---|---|---|
+| 每优化步耗时（单卡，16 条/步） | 151 s | 06:22–06:54 的 13 步冒烟 |
+| 每样本耗时 | 9.4 s | 151 ÷ 16 |
+| 每优化步耗时（双卡，32 条/步） | ≈ 160 s | 单卡步时 + 几个百分点的 all-reduce |
+| 9 小时会话 | ≈ 190 步 ≈ **6100 条** | 扣除 clone / 装依赖 / 加载模型的约 20 分钟 |
+| 全量一轮 | 336 步 ≈ **15 小时** | 10738 ÷ 32 |
+
+**结论：一轮训练要跨两次 Kaggle 会话。** 这不是意外情况，是常态，
+所以 `resume_from` + 每 40 分钟落一次盘是这套配置的核心，不是补丁。
+第一次会话结束前记得把 `outputs/` 存成 Dataset（Kaggle 的 Save Version），
+下一次会话挂回来再用 `--resume` 指到具体的 `step_*.pt`。
+
+### 存档间隔为什么是 15 步 / 45 分钟
+
+目标只有一个：**会话被掐的时候，最新的 checkpoint 离被掐点尽可能近**。
+
+* Kaggle 的 9 小时从 **notebook 启动**算起，不是从训练开始算 ——
+  所以按"墙钟时间"存档比按"步数"存档更贴近真实限制，
+  `save_every_n_minutes: 45` 就是干这个的（两者是「或」的关系）。
+* `save_every_n_steps: 15` ≈ 40 分钟一存，作用是在训练比预估快时也不至于
+  攒太久才落一次盘。
+* 最坏情况丢失 40~45 分钟 ≈ 15 步 ≈ 480 条。相对 15 小时的总量是 5%。
+* 单个 checkpoint 只存可训练参数 + 优化器动量 ≈ 90 MB，写盘几秒，
+  所以"存得勤"几乎没有代价 —— 真正有代价的是**丢掉 8 小时的成果**。
+* `keep_last_n_checkpoints: 3` 给出 90 分钟冗余；`best.pt` 是固定文件名，
+  永远不会被按数量清理。
+
+### 关键超参
+
+| 参数 | 值 | 依据 |
+|---|---|---|
+| `per_device_batch_size` | 2 | 实测 11 GiB/14.6 GiB；B=4 的词表投影要多吃 ~7 GiB，必 OOM |
+| `grad_accum_steps` | 8 | 等效 batch = 2×8×2卡 = 32，与 2025-03 那版 LLaMA-Factory 一致 |
+| `learning_rate` | 2.0e-4 | QLoRA 推荐带宽 1e-4~3e-4 的中上值；只跑 1 轮、步数少，取偏大一侧。**不按 batch 线性放大**（线性缩放律是全参微调的经验） |
+| `max_length` | 8192 | 模型自身 `seq_length`；实测 prompt+answer 的 p99 只有 4741 token，截断率 0.05% |
+| `lora.r` / `alpha` | 4 / 8 | scaling = alpha/r = 2，与原 `16/32` 相同 → 学习率不用重调 |
+| `target_modules` | qkv + dense + dense_h_to_4h + dense_4h_to_h | 等价于 LLaMA-Factory 的 `lora_target: all`（7.4M 可训练参数，占 6.25B 的 0.119%） |
+| `save_every_n_steps` / `_minutes` | 15 / 45 | 见上 |
+
+两个与 ChatGLM3 结构绑定的数字，换模型时一定要重算：
+
+* `query_key_value` 是**融合**的 QKV（out = 4096 + 2×128×2 = 4608），
+  不是 `q_proj/k_proj/v_proj` 三个独立层；
+* MLP 是 SwiGLU，`dense_h_to_4h` 的输出维度是 `ffn_hidden_size * 2 = 27392`，
+  而 `dense_4h_to_h` 的输入是 13696 —— 两个形状不对称。
+
+按这几个形状算出来的 LoRA 参数量，和 Kaggle 日志对得上：
+r=16 只打 `query_key_value` = 3,899,392（日志里的 `trainable_params`），
+r=8 = 1,949,696（`check_model.py` 打印的 1.95 M），
+r=4 打满四个目标层 = 7,411,712（占 6.25 B 的 0.119%）。

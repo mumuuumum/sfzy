@@ -1,12 +1,18 @@
 defaults: sft
 
-# Kaggle 2×T4 上跑 ChatGLM3-6B 的 QLoRA 微调。
+# Kaggle 2×T4 上跑 ChatGLM3-6B 的 QLoRA 微调（DDP 数据并行）。
 #
-# 本文件里的 batch / 累积步数 / max_length 都是**保守起点**，
-# 必须先跑 --limit 200 的冒烟测试实测显存和速度，再按下面的公式调整：
+# 这里每个数字都有实测或算术依据，改动前先看 docs/kaggle_sft.md 的
+# 「参数依据」一节 —— 尤其是 per_device_batch_size 为什么停在 2。
 #
-#   等效 batch = per_device_batch_size × grad_accum_steps × GPU数
-#   单次会话可训练的样本数 ≈ 9小时 / (每样本秒数) × GPU数
+#   等效 batch = per_device_batch_size × grad_accum_steps × 卡数
+#              = 2 × 8 × 2 = 32
+#
+# 实测（单卡 T4，8192 上限，200 条冒烟）：151 s/优化步 ÷ 16 样本
+#   ≈ 9.4 s/样本，峰值显存 11 GiB / 14.6 GiB。
+# 双卡后每次优化步 ≈ 160 s、吃掉 32 条 → 9 小时会话 ≈ 190 步 ≈ 6100 条。
+# 全量训练集 10738 条 ÷ 32 ≈ 336 步 ≈ 15 小时：
+# **一轮要跨两次 Kaggle 会话**，所以 resume 和存档策略是刚需。
 #
 # T4 是 Turing 架构，**不支持 bf16**，只能 fp16 + GradScaler，
 # 所以 sft.dtype 必须是 float16，且要和 model 配置里的
@@ -18,8 +24,31 @@ data_config: configs/data_kaggle.yaml
 sft:
   output_dir: outputs/sft_chatglm3
   num_epochs: 1
+
+  # 每卡 2 条，是实测能稳住的**上限**（不是保守起点）。
+  #
+  # 显存的大头不是模型权重（4-bit 权重 + 未被量化的 fp32 词表，约 5 GiB），
+  # 而是**词表投影**：ChatGLM3 的 vocab 有 65024，官方 modeling 里
+  #     lm_logits = lm_logits.to(torch.float32)
+  #     shift_logits = lm_logits[..., :-1, :].contiguous()
+  # 也就是一次前向里同时存在 fp16 logits、fp32 logits、fp32 的 shift 副本、
+  # 以及反传时同尺寸的 fp32 梯度，合计约 B×L×0.9 MB：
+  #     B=1, L=2000 → 1.8 GiB      B=2 → 3.6 GiB      B=4 → 7.2 GiB
+  # 再加 5 GiB 静态权重和激活，B=4 在 15 GiB 卡上必然 OOM（长样本批更早）。
+  # 结论：**不要再往上调**，要更大的等效 batch 就加 grad_accum_steps。
   per_device_batch_size: 2
-  grad_accum_steps: 8          # 等效 batch = 2 × 8 = 16
+  grad_accum_steps: 8          # 等效 batch = 2 × 8 × 2 卡 = 32
+
+  # LoRA 的学习率带宽很窄（1e-4 ~ 3e-4），而且**不该按 batch 线性放大**：
+  # 线性缩放律是全参数微调的经验，LoRA 的可训练参数少两个数量级，
+  # 放大学习率更容易把随机初始化的旁路推坏。
+  #
+  # 取值依据：
+  #   * 2025-03 用 LLaMA-Factory 跑通过的是 1e-4（等效 batch 32、3 轮）；
+  #   * QLoRA 原论文的推荐值是 2e-4；
+  #   * 我们只跑 1 轮（≈336 步），步数少，取带宽的中上值。
+  # 又因为 alpha/r 保持 2 不变（见文件末尾 lora 段），
+  # 从 r=16 换到 r=4 不需要动学习率。
   learning_rate: 2.0e-4
   weight_decay: 0.0
   warmup_ratio: 0.03
@@ -29,22 +58,56 @@ sft:
   dtype: float16               # T4 不支持 bf16
   gradient_checkpointing: true
 
-  # ChatGLM3 的序列会长很多（判决书平均 2600 字），先压到 1536 试
-  max_length: 1536
+  # 8192 = 模型自身的 seq_length（config.json 里写的就是 8192）。
+  # 用真实 tokenizer 量过 train.jsonl：prompt+answer 的 token 数是
+  #   p50 1893 / p75 2371 / p95 3487 / p99 4741，只有 0.05% 的样本被 8192 截断。
+  # 也就是说 8192 对训练集**几乎无损**，而 1536 会砍掉一半以上的文书
+  # （判决书的"本院认为""判决如下"都在结尾，被砍掉的正是摘要最需要的部分）。
+  # 不设更大的值也没意义：截断率已经接近 0。
+  max_length: 8192
 
   num_workers: 2               # Kaggle 上设大了会被 OOM killer 干掉
   pin_memory: true
 
-  save_every_n_steps: 100
-  keep_last_n_checkpoints: 2
+  # 存档节奏：目标是"会话被掐时，最新的 checkpoint 离被掐点尽可能近"。
+  # Kaggle 的 9 小时是从 **notebook 启动**算的，不是从训练开始算的，
+  # 所以要留出 clone / 装依赖 / 下模型的十几分钟。
+  #
+  #   160 s/优化步 → 15 步 ≈ 40 分钟
+  #   9 小时会话 ≈ 190 步 → 约 12 个存档点，最多回退 40 分钟（≈15 步）
+  #
+  # 单个 checkpoint 只存可训练参数 + 优化器动量（约 90 MB，写盘几秒），
+  # 所以 40 分钟一存不会成为 I/O 负担。
+  save_every_n_steps: 15
+  # 墙钟兜底：不管跑到第几步，距上次存档 >= 45 分钟就存。
+  # 它的意义是防止"训练比预估慢"时步数触发一直不落盘（两者是「或」的关系）。
+  save_every_n_minutes: 45
+  keep_last_n_checkpoints: 3   # 90 分钟的冗余，best.pt 永远不被清理
   log_every_n_steps: 10
 
   use_compile: false
   resume_from: null
+  # 续训时贴上一次会话最后那个文件的路径（Kaggle 上要先把 output 目录
+  # 存成 Dataset 再挂回来），例如：
+  #   resume_from: /kaggle/input/sfzy-ckpt/step_000180.pt
 
 lora:
-  r: 16
-  alpha: 32
+  # r=4 / alpha=8 → scaling = alpha/r = 2，与原来 r=16/alpha=32 完全相同。
+  # 保持 scaling 不变，学习率就不用跟着重调（这也是"调 r 时固定 alpha/r"
+  # 这条经验被反复推荐的原因）。
+  r: 4
+  alpha: 8
   dropout: 0.05
-  # ChatGLM3 的注意力是融合的 QKV 投影，不是 LLaMA 系的 q_proj/k_proj/v_proj
-  target_modules: ["query_key_value"]
+  # 四个目标层等价于 LLaMA-Factory 的 `lora_target: all`。
+  # 依据：LLaMA-Factory 的 find_all_linear_modules() 收集的是**所有叶子
+  # nn.Linear 的后缀名**，只排除 lm_head（chatglm 另加 output_layer）。
+  # ChatGLM3-6B 的叶子线性层正好就是这四个，所以旧配置的 `all` = 这四个。
+  #
+  # 命名上有两个 ChatGLM 特有的坑：
+  #   * 注意力是**融合的** QKV，叫 query_key_value，不是 q_proj/k_proj/v_proj；
+  #   * MLP 是 SwiGLU，dense_h_to_4h 的输出维度是 ffn_hidden_size * 2 = 27392，
+  #     不是 13696（少算一半会让可训练参数对不上）。
+  #
+  # 注入是按「叶子名精确相等」匹配的（name.split(".")[-1] in target_modules），
+  # 所以 "dense" 不会误伤 "dense_h_to_4h" / "dense_4h_to_h"。
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]

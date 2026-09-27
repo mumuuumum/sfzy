@@ -9,10 +9,11 @@ is_main_process。好处有三个：
   * 测试里能干净地构造 trainer，不用 mock 环境变量；
   * "谁来装配"这件事是明确的 —— 装配在 scripts/ 里。
 
-本项目当前**只跑单卡**（Kaggle 单张 T4 足够放下 6B 的 QLoRA），
-所以下面的分布式分支是"设计上可插拔、实现上先留好接口"。
-真要上多卡时，脚本里包一层 DistributedDataParallel 即可，
-trainer 一行都不用改。
+本项目在 Kaggle 上跑 **2×T4 数据并行**（6B 的 QLoRA 一轮要 15 小时，
+单卡装不下这 9 小时的会话限制）。设计上坚持"进程相关的东西全收在这里"：
+脚本负责装配（clone 环境、建 trainer、包 DDP），trainer 只接收
+注入进来的 is_main_process —— 所以同一份 trainer 在 CPU 单卡 / GPU 单卡 /
+DDP 下都能跑，`tests/test_ddp_smoke.py` 用 CPU + gloo 也能验 DDP 的正确性。
 """
 
 from __future__ import annotations
