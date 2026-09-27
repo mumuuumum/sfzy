@@ -211,25 +211,55 @@ notebook 时能快速定位 —— 不用再花五个来回重新发现一遍。
 | 3 | `AttributeError: ... no attribute 'all_tied_weights_keys'` | 新版 transformers 的量化路径要读这个属性，2023 年的远程代码没提供 | `models/compat.py::patch_tied_weights_keys` |
 | 4 | `AttributeError: 'list' object has no attribute 'keys'` | 上面那条的补丁填错了类型 —— 同一属性 transformers 内部两处要求不同，**必须填 dict** | 同上，默认值写成 `{}` |
 | 5 | `AssertionError` at `tokenization_chatglm.py:300 in _pad` | 它的 tokenizer 里写死了 `assert self.padding_side == "left"` | `models/compat.py::resolve_padding_side`，默认 left |
-| 6 | **训练时 OOM，但报错栈里全是 bitsandbytes** | **ChatGLM3 重写了 `gradient_checkpointing_enable`，但函数体是空的** —— 只做了 `supports_gradient_checkpointing` 校验就直接返回，一个 flag 都没设。于是 `gradient_checkpointing: true` 是死配置，激活值按「每层完整保存」算 | `models/compat.py::ensure_gradient_checkpointing`，直接设 `model.transformer.encoder.gradient_checkpointing = True` |
+| 6 | **训练时 OOM，但报错栈里全是 bitsandbytes** | **两个原因叠加**（见下） | `compat.py::ensure_gradient_checkpointing` + `trainer.train()` 开头的 `self.model.train()` |
 
 **这一组的共同特征是：根因全部在 ChatGLM3 的远程代码里，不在我们的代码里。**
 它们的代码停留在 2023 年，而 transformers 一直在演进。
 
-### 第 6 个坑为什么最难查
+### 第 6 个坑：两个原因叠加，而且一个在我们的代码里
 
 它是**唯一一个不报自己名字的**。前五个都有明确的异常信息；这个只报 OOM，
-而 OOM 的调用栈会一路穿过 `bnb.matmul_4bit` → `gemm_4bit` → `_dequant_linear_fallback`，
+而调用栈一路穿过 `bnb.matmul_4bit` → `gemm_4bit` → `_dequant_linear_fallback`，
 **看起来像是在量化库里炸的**。
 
-判据只能靠对比：LLaMA-Factory 用同一个模型、**同样 `cutoff_len=8192`、
-batch 还大一倍**（`per_device_train_batch_size: 2`），在同样的 2×T4 上跑得通。
-序列长度一样、batch 更大却没事，唯一的解释就是梯度检查点这个数量级的差异。
+ChatGLM3 的 `GLMTransformer.forward` 里，梯度检查点的条件是：
 
-另外这一坑我们**连续猜错了两轮**（先猜 `device_map`，再猜 `max_length`），
+```python
+if self.gradient_checkpointing and self.training:   # ← 两个条件缺一不可
+    layer_ret = torch.utils.checkpoint.checkpoint(layer, ...)
+```
+
+**两个条件我们各踩了一个：**
+
+**原因一，flag 没设上（ChatGLM3 的锅）。** 它的
+`ChatGLMPreTrainedModel.gradient_checkpointing_enable` 重写了基类方法，
+但**函数体是空的** —— 只做了 `supports_gradient_checkpointing` 校验就返回，
+一个 flag 都没设。所以 `prepare_model_for_kbit_training` 调完之后，
+`GLMTransformer.gradient_checkpointing` 仍然是 `False`。
+
+**原因二，模型不在 train 模式（我们的锅）。** HF 的 `from_pretrained`
+结尾会调 `model.eval()`（它自己的文档里写着 "The model is set in evaluation
+mode by default"），而**我们的 `SFTTrainer.train()` 从来没有切回 train 模式** ——
+`model.train()` 只出现在 `evaluate()` 的 finally 里。
+
+所以 `self.training` 全程是 `False`，条件短路。
+
+> **顺带的影响**：dropout 也全程关闭了，正则化失效 —— 同样不报错。
+
+**判据只能靠对比**：LLaMA-Factory 用同一个模型、**同样 `cutoff_len=8192`、
+batch 还大一倍**（`per_device_train_batch_size: 2`），在同样的 2×T4 上跑得通。
+序列一样长、batch 更大却没事，只能是梯度检查点这个数量级的差异。
+
+**这一坑我们连续猜错了两轮**（先猜 `device_map`、再猜 `max_length`），
 最后是去读 ChatGLM3 的 `modeling_chatglm.py` 源码才确认的。
-这也是为什么 `check_model.py` 现在会把梯度检查点的**实际状态**整个打印出来 ——
-它之前用 `gradient_checkpointing=False` 加载，结构上就不可能发现这件事。
+教训是：**别猜，去读源码；写了修复，就用测试证明它能抓住 bug。**
+
+相应的两处可见化：
+- `check_model.py` 会把梯度检查点的**实际状态**整个打印出来（它之前用
+  `gradient_checkpointing=False` 加载，结构上就不可能发现这件事）
+- `test_smoke_train.py::test_训练前把模型切回train模式` 用 forward hook 在
+  **训练过程中**读 `model.training`（不能等训练结束再读，那时 `evaluate()`
+  的 finally 已经把它切回来了，会把 bug 掩盖掉）
 
 > **为什么本地发现不了？**
 > 本机的 transformers 是 4.57.6，而 Kaggle 上装的是更新版本 —— 量化路径

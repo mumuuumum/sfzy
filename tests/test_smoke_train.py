@@ -160,6 +160,43 @@ def test_loss在下降(tmp_path):
     assert last < first, f"loss 没有下降：首步 {first:.4f}，末步 {last:.4f}"
 
 
+def test_训练前把模型切回train模式(tmp_path):
+    """HF 的 from_pretrained 结尾会调 model.eval()，所以模型拿到手时是 eval。
+
+    trainer.train() 如果不切回 train 模式，会有两个后果，**而且都不报错**：
+
+      1. **梯度检查点不生效。** ChatGLM3 的 GLMTransformer.forward 里是
+             if self.gradient_checkpointing and self.training:
+         training=False 会让整个条件短路 —— 激活值按「每层完整保存」算，
+         16GB 的 T4 上必然 OOM，而报错栈里全是 bitsandbytes 的调用。
+         （我们为此查了三轮：先猜 device_map、再猜 max_length，
+          最后才发现 flag 设对了、但 training 是 False。）
+      2. dropout 全程关闭，正则化失效，模型更容易过拟合。
+
+    这里用 forward hook 在**训练过程中**读 model.training ——
+    不能等训练结束再读，因为 evaluate() 的 finally 会把它切回 train，
+    那样就把 bug 掩盖过去了。
+    """
+    trainer = make_trainer(tmp_path, num_epochs=1)
+    trainer.model.eval()                       # 模拟 from_pretrained 的行为
+    assert trainer.model.training is False
+
+    seen: list[bool] = []
+    handle = trainer.model.register_forward_hook(
+        lambda module, args, output: seen.append(module.training)
+    )
+    try:
+        trainer.train(SFTDataset(make_records(4)))
+    finally:
+        handle.remove()
+
+    assert seen, "训练过程中一次前向都没发生"
+    assert all(seen), (
+        "训练期间模型不在 train 模式 —— 梯度检查点会失效（激活值按每层完整保存算），"
+        "而且 dropout 被全程关闭。这两个后果都不会报错。"
+    )
+
+
 def test_训练确实更新了参数(tmp_path):
     """直接查"参数变了没有"，不依赖 loss 的走势。
 

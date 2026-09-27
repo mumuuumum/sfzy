@@ -255,6 +255,21 @@ class SFTTrainer:
         is killed by signal: Killed"，看起来和显存无关，很容易误判）。
         pin_memory=True 让数据在 CPU 侧锁页，传到 GPU 更快。
         """
+        # 必须显式切到 train 模式。
+        #
+        # HF 的 from_pretrained 结尾会调 model.eval()（它自己的文档里写着
+        # "The model is set in evaluation mode by default"），所以模型拿到手时
+        # 是 eval。不切回来的话有两个后果，而且**两个都不报错**：
+        #
+        #   1. **梯度检查点不生效。** ChatGLM3 的 GLMTransformer.forward 里是
+        #          if self.gradient_checkpointing and self.training:
+        #      training=False 会让整个条件短路 —— 激活值按「每层完整保存」算，
+        #      16GB 的 T4 上必然 OOM，而报错栈里全是 bitsandbytes 的调用。
+        #      （我们为此查了三轮：先猜 device_map、再猜 max_length、
+        #        最后才发现 flag 设对了但 training 是 False。）
+        #   2. dropout 全程关闭，正则化失效，模型更容易过拟合。
+        self.model.train()
+
         steps_per_epoch = math.ceil(len(train_dataset) / (self.batch_size * self.grad_accum_steps))
         total_steps = steps_per_epoch * self.num_epochs
         start_epoch = self.state.epoch
