@@ -211,9 +211,25 @@ notebook 时能快速定位 —— 不用再花五个来回重新发现一遍。
 | 3 | `AttributeError: ... no attribute 'all_tied_weights_keys'` | 新版 transformers 的量化路径要读这个属性，2023 年的远程代码没提供 | `models/compat.py::patch_tied_weights_keys` |
 | 4 | `AttributeError: 'list' object has no attribute 'keys'` | 上面那条的补丁填错了类型 —— 同一属性 transformers 内部两处要求不同，**必须填 dict** | 同上，默认值写成 `{}` |
 | 5 | `AssertionError` at `tokenization_chatglm.py:300 in _pad` | 它的 tokenizer 里写死了 `assert self.padding_side == "left"` | `models/compat.py::resolve_padding_side`，默认 left |
+| 6 | **训练时 OOM，但报错栈里全是 bitsandbytes** | **ChatGLM3 重写了 `gradient_checkpointing_enable`，但函数体是空的** —— 只做了 `supports_gradient_checkpointing` 校验就直接返回，一个 flag 都没设。于是 `gradient_checkpointing: true` 是死配置，激活值按「每层完整保存」算 | `models/compat.py::ensure_gradient_checkpointing`，直接设 `model.transformer.encoder.gradient_checkpointing = True` |
 
 **这一组的共同特征是：根因全部在 ChatGLM3 的远程代码里，不在我们的代码里。**
 它们的代码停留在 2023 年，而 transformers 一直在演进。
+
+### 第 6 个坑为什么最难查
+
+它是**唯一一个不报自己名字的**。前五个都有明确的异常信息；这个只报 OOM，
+而 OOM 的调用栈会一路穿过 `bnb.matmul_4bit` → `gemm_4bit` → `_dequant_linear_fallback`，
+**看起来像是在量化库里炸的**。
+
+判据只能靠对比：LLaMA-Factory 用同一个模型、**同样 `cutoff_len=8192`、
+batch 还大一倍**（`per_device_train_batch_size: 2`），在同样的 2×T4 上跑得通。
+序列长度一样、batch 更大却没事，唯一的解释就是梯度检查点这个数量级的差异。
+
+另外这一坑我们**连续猜错了两轮**（先猜 `device_map`，再猜 `max_length`），
+最后是去读 ChatGLM3 的 `modeling_chatglm.py` 源码才确认的。
+这也是为什么 `check_model.py` 现在会把梯度检查点的**实际状态**整个打印出来 ——
+它之前用 `gradient_checkpointing=False` 加载，结构上就不可能发现这件事。
 
 > **为什么本地发现不了？**
 > 本机的 transformers 是 4.57.6，而 Kaggle 上装的是更新版本 —— 量化路径

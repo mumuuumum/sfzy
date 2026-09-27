@@ -124,14 +124,41 @@ def ensure_gradient_checkpointing(model: Any) -> bool:
     实测证据：max_length=8192 / batch=1 在 16GB 的 T4 上仍然 OOM，
     说明激活值是按"每层完整保存"算的。
     """
-    # 正常路径：基类的递归设置成功了，某个模块上会有 flag
-    if any(getattr(module, "gradient_checkpointing", False) for module in model.modules()):
-        return True
-
-    # 兜底：ChatGLM3 的 transformer 主体是 model.transformer.encoder
+    # **不要写"先检查有没有模块开着，开着就提前返回"** —— 那正是它上次没生效的原因：
+    # 只要有任何模块碰巧带着这个属性为 True，就会提前 return，
+    # 而真正需要设的 encoder 反而没被设上。
+    #
+    # ChatGLM3 的 transformer 主体是 model.transformer.encoder（GLMTransformer），
+    # 它在 __init__ 里定义了 self.gradient_checkpointing = False，
+    # 而 forward 里会检查它。直接设即可。
     encoder = getattr(getattr(model, "transformer", None), "encoder", None)
     if encoder is not None and hasattr(encoder, "gradient_checkpointing"):
         encoder.gradient_checkpointing = True
-        return True
 
-    return False
+    # 通用兜底：其他模型走 HuggingFace 的标准接口
+    if not any(getattr(m, "gradient_checkpointing", False) for m in model.modules()):
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:  # noqa: BLE001 - 有些远程代码的实现不规范
+            pass
+
+    return any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
+
+
+def describe_gradient_checkpointing(model: Any) -> Dict[str, Any]:
+    """诊断用：把梯度检查点的实际状态全部摊开。
+
+    加这个是因为我们在这件事上**连续猜错了两轮** —— 每次都是"推理认为应该开了"，
+    然后在 Kaggle 上 OOM。与其继续推测，不如让代码把状态直接打印出来。
+    """
+    on = [n for n, m in model.named_modules() if getattr(m, "gradient_checkpointing", False)]
+    encoder = getattr(getattr(model, "transformer", None), "encoder", None)
+    return {
+        "modules_with_flag": len(on),
+        "examples": on[:3],
+        "model_training": getattr(model, "training", None),
+        "has_transformer": hasattr(model, "transformer"),
+        "has_encoder": encoder is not None,
+        "encoder_flag": getattr(encoder, "gradient_checkpointing", "（无此属性）")
+        if encoder is not None else None,
+    }

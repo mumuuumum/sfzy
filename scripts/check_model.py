@@ -87,10 +87,14 @@ def main() -> None:
                        gradient_checkpointing=use_ckpt)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"      参数量 {n_params/1e9:.2f} B  dtype={next(model.parameters()).dtype}")
-    gc_on = [n for n, m in model.named_modules() if getattr(m, "gradient_checkpointing", False)]
-    print(f"      梯度检查点: 配置={use_ckpt}  实际生效的模块={len(gc_on)} 个")
-    if use_ckpt and not gc_on:
-        print("      ✗ 配置要求开梯度检查点，但模型上一个模块都没开")
+    from sfzy.models.compat import describe_gradient_checkpointing
+
+    gc = describe_gradient_checkpointing(model)
+    print(f"      梯度检查点: 配置={use_ckpt}")
+    for key, value in gc.items():
+        print(f"        {key:24s} = {value}")
+    if use_ckpt and gc["modules_with_flag"] == 0:
+        print("      ✗ 配置要求开梯度检查点，但一个模块都没开")
         print("        训练时激活值会按「每层完整保存」算，几乎必然 OOM")
         raise SystemExit(1)
 
