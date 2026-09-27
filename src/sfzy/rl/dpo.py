@@ -39,37 +39,51 @@ import torch
 import torch.nn.functional as F
 
 
-def sequence_logprob(model: Any, input_ids: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def sequence_logprob(
+    model: Any,
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    shift: bool = True,
+) -> torch.Tensor:
     """算每条序列上**答案部分**的对数概率之和，返回形状 (B,)。
 
-    ============================ 要写的步骤 ============================
+    GRPO 和 DPO 都要用这个函数：前者要 rollout 时的 old_logprobs，
+    后者要策略模型和参考模型的 logprob。所以它放在这里、两边共用。
 
-    1. forward 拿到 logits，形状 (B, L, V)
-    2. **错开一位**：第 i 个位置的 logits 预测第 i+1 个 token，
-       所以用 logits[:, :-1] 对 labels[:, 1:]
-    3. 对 logits 做 log_softmax(dim=-1)，再按 labels 做 gather
-    4. 只在 labels != -100 的位置累加（-100 是 prompt 段和 padding，
-       要先把它们替换成 0 再 gather，否则 gather 会越界）
-    5. 返回 sum(dim=-1)
+    三个必须做对的地方：
 
-    ============================ 必要知识 ============================
+    **一、错开一位。** 第 i 个位置的 logits 预测的是第 i+1 个 token。
+    用 logits[:, :-1] 对 labels[:, 1:]。不错开的话算出来的是"复制输入"
+    的置信度，数值看着正常但完全错误 —— 这是这类实现最常见的 bug。
 
-    **为什么必须错开一位。**
-    因果语言模型的输出是"预测下一个 token"。第 i 个位置的 logits 对应的是
-    第 i+1 个 token 的分布。不错开的话算出来的是"复制输入的置信度"，
-    数值看着正常但完全错误——这是这类实现最常见的一个 bug。
+    **二、只累加答案段。** labels == -100 的位置是 prompt 和 padding，
+    要先用 masked_fill 换成 0 再 gather，否则 gather 会越界。
+    最后乘 mask 求和，得到整条序列的 logprob。
 
-    **为什么不能对负的 logprob 求和后平均。**
-    DPO 用的是整条序列的 logprob 之和（不是平均），因为 β 是在
-    这个尺度上调的。如果改成平均，β 的有效含义会随序列长度变化，
-    换个长度就得重调——这也是很多 DPO 复现"照着论文做却调不出来"的原因。
+    **三、不要让 fp32 的中间张量物化。** 直接 `log_softmax(logits.float())`
+    会复制一份完整的 fp32 logits —— 6B 模型在 batch 4 / seq 2048 /
+    vocab 65024 下是 2.1GB。改成"只 gather 目标 logit、logsumexp 用
+    dtype 参数算 fp32"，数值稳定性和显存两头都占。
 
-    **为什么要在 no_grad 下算参考模型的 logprob。**
-    参考模型的参数是冻结的，算它的 logprob 只是要一个常数，
-    不需要也不应该建图。省显存也省时间。
+    `shift=False` 用于生成后的场景：此时 input_ids 已经是
+    "prompt + 已生成 token"，labels 与之逐位对齐，不再错开。
     """
-    # TODO
-    raise NotImplementedError("TODO: 实现 sequence_logprob")
+    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+    logits = outputs.logits
+
+    if shift:
+        logits = logits[:, :-1, :]
+        labels = labels[:, 1:]
+
+    mask = labels != -100
+    safe_targets = labels.masked_fill(~mask, 0)
+
+    target_logits = logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
+    log_z = torch.logsumexp(logits, dim=-1, dtype=torch.float32)
+    token_logprobs = target_logits.float() - log_z
+
+    return (token_logprobs * mask).sum(dim=-1)
 
 
 @contextmanager

@@ -186,12 +186,32 @@ def load_model(
                 "显存会按未开启的方式增长，很可能 OOM。",
                 stacklevel=2,
             )
-    elif gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        # 非量化模型不会走 prepare_model_for_kbit_training，得在这里显式开启，
-        # 否则配置里写了 gradient_checkpointing: true 也是**静默不生效**的
-        # ——显存不够时你会以为是别的原因。
-        # 同时必须关掉 use_cache：两者同时启用会直接报错。
-        model.gradient_checkpointing_enable()
+    elif gradient_checkpointing:
+        # 非量化分支（bf16 / fp16）不会走 prepare_model_for_kbit_training，
+        # 得在这里自己开。
+        #
+        # **关键：不能只调 model.gradient_checkpointing_enable()。**
+        # ChatGLM3 把这个方法覆写成了空壳 —— 它只检查 supports 标志，
+        # 然后什么都不做（见 modeling_chatglm.py 的 ChatGLMPreTrainedModel）。
+        # 调用它不报错、也不生效，于是显存按"每层完整保存"的方式涨，
+        # 最后 OOM，而报错栈里全是别的东西，看不出是这里的问题。
+        #
+        # 真正的开关在 GLMTransformer（model.transformer.encoder）上，
+        # 由 compat.ensure_gradient_checkpointing 直接设。
+        try:
+            model.gradient_checkpointing_enable()
+        except Exception:  # noqa: BLE001 - 有些远程代码的实现不规范
+            pass
+
+        if not ensure_gradient_checkpointing(model):
+            import warnings
+
+            warnings.warn(
+                "梯度检查点没能启用（配置里写了 true，但模型上没有任何模块生效）。"
+                "显存会按未开启的方式增长，很可能 OOM。",
+                stacklevel=2,
+            )
+
         if hasattr(model, "enable_input_require_grads"):
             # 梯度检查点要求被检查的片段至少有一个输入需要梯度，否则重算出来的
             # 输出没有 grad_fn，反向传播时整条链是断的，报

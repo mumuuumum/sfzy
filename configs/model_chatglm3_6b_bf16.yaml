@@ -9,7 +9,11 @@ defaults: base
 # 其余（模型名、trust_remote_code、max_length 的位置）结构不变。
 
 model:
-  model_name_or_path: models/chatglm3-6b
+  # AutoDL 上的实际路径。
+  # 注意这是台机器专属的绝对路径，换机器要改。
+  # 如果想要可移植的写法，改成 models/chatglm3-6b 并做软链：
+  #     ln -s /root/autodl-tmp/chatglm3-6b models/chatglm3-6b
+  model_name_or_path: /root/autodl-tmp/chatglm3-6b
   # ChatGLM3 自带建模代码，必须开启
   trust_remote_code: true
 

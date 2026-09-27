@@ -204,12 +204,22 @@ def ensure_gradient_checkpointing(model: Any) -> bool:
     if encoder is not None and hasattr(encoder, "gradient_checkpointing"):
         encoder.gradient_checkpointing = True
 
-    # 通用兜底：其他模型走 HuggingFace 的标准接口
+    # 其他模型先走 HuggingFace 的标准接口（Qwen 这类原生支持的模型走这条）
     if not any(getattr(m, "gradient_checkpointing", False) for m in model.modules()):
         try:
             model.gradient_checkpointing_enable()
         except Exception:  # noqa: BLE001 - 有些远程代码的实现不规范
             pass
+
+    # 最后一道兜底：凡是**自己带着这个属性**的模块全部置 True。
+    #
+    # 这一条是为了覆盖"模型实现了自己的检查点逻辑，但既不走 HF 的标准接口、
+    # 也不是 ChatGLM3 那个层级"的情况 —— 比如 GLM-4、以及各种从零实现的模型。
+    # 只在前面两条都没生效时才做，避免和 HF 的选择性设置打架。
+    if not any(getattr(m, "gradient_checkpointing", False) for m in model.modules()):
+        for module in model.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = True
 
     return any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
 

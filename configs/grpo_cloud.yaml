@@ -1,0 +1,63 @@
+defaults: sft_cloud
+
+# 2× RTX 4090 上的 GRPO 配置。
+#
+# 主方案：门控 + 事实覆盖 + ROUGE。
+# 对照组见文件末尾的注释 —— A1/A3 靠改 reward.mode 和 weights 实现。
+
+model_config: configs/model_chatglm3_6b_bf16.yaml
+data_config: configs/data_splits.yaml
+
+rl:
+  output_dir: outputs/grpo_chatglm3
+  prompt_style: structured
+  # 用 tools/select_rl_prompts.py 筛出来的 prompt 池
+  prompt_file: data/splits/rl_prompts.jsonl
+
+  # ---- rollout ----
+  group_size: 8                 # 主流取值；大了一倍成本，小了优势估计不稳
+  prompts_per_step: 4           # 每步 4 个 prompt × 8 条 = 32 条采样
+  max_new_tokens: 384           # 参考摘要中位数 293 字，留点余量
+  max_length: 2048
+  temperature: 0.9              # 要有方差才能算出 advantage
+  top_p: 0.95
+
+  # ---- 算法 ----
+  clip_ratio: 0.2
+  # KL 系数是要**做对照**的一项，不是照抄默认值：
+  #   SFT 本身就有漏事实的习惯，而 KL 惩罚会把策略往 SFT 拉 ——
+  #   等于保护了要改进的错误行为。所以三档都跑一遍：
+  #   0.0（不约束） / 0.01 / 0.05
+  kl_coef: 0.0
+  length_norm: sqrt             # 输出长度差 13 倍，必须归一化
+  learning_rate: 1.0e-5
+  max_grad_norm: 1.0
+  grad_accum_steps: 1
+
+  # ---- 存档与日志 ----
+  save_every_n_steps: 50
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 1
+  resume_from: null
+
+  # ---- 奖励 ----
+  # 三层结构（门控 / 事实覆盖 / ROUGE）的默认值在 rl/reward.py 里，
+  # 这里只覆盖要动的那几项。
+  reward:
+    mode: gated                # flat = 对照组（所有项加权求和，可互相补偿）
+    weights:
+      rouge_l: 0.5
+      fact_coverage: 0.5       # ★ 主信号
+      length: 0.1              # 只在 flat 模式下生效
+
+# ==================== 三组对照实验怎么配 ====================
+#
+# A1  纯 ROUGE 基线（回答"传统 RLVR 能到哪"）
+#     reward.mode: flat
+#     reward.weights: {rouge_l: 1.0, fact_coverage: 0.0, length: 0.0}
+#
+# A2  主方案（门控 + 事实覆盖 + ROUGE）
+#     就是本文件的默认值
+#
+# A3  只隔离事实信号（回答"事实覆盖单独能做什么"）
+#     reward.weights: {rouge_l: 0.0, fact_coverage: 1.0}

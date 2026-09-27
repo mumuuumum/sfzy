@@ -216,3 +216,85 @@ def test_老版transformers没有这个函数时补丁是空操作():
 
         pytest.skip("当前 transformers 有该函数，这个用例只在旧版上有意义")
     assert patch_tp_plan_for_quantized_load() is False
+
+
+# ---------------------------------------------------------------- 梯度检查点
+#
+# 这三个测试锁住的是一个**花了三轮才定位到**的坑：
+# 配置里写了 gradient_checkpointing: true，模型上一个标志都没设，
+# 于是显存按"每层完整保存"涨，最后 OOM，而报错栈里全是别的东西。
+#
+# 根因：ChatGLM3 的 gradient_checkpointing_enable 是空实现 ——
+# 它只检查 supports 标志，然后什么都不做。调用它不报错、也不生效。
+# 真正的开关在 GLMTransformer（model.transformer.encoder）上。
+
+import torch.nn as nn  # noqa: E402
+
+from sfzy.models.compat import ensure_gradient_checkpointing  # noqa: E402
+
+
+class _FakeGLMTransformer(nn.Module):
+    """ChatGLM3 的 GLMTransformer：开关定义在它自己身上。"""
+
+    def __init__(self):
+        super().__init__()
+        self.gradient_checkpointing = False
+
+
+class _FakeChatGLMModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.encoder = _FakeGLMTransformer()
+
+
+class _FakeChatGLM(nn.Module):
+    """按 ChatGLM3 的真实结构搭：model.transformer.encoder.gradient_checkpointing。
+
+    gradient_checkpointing_enable 是空实现 —— 这正是坑的来源，
+    所以这里按真实行为复刻，不"修好"它。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.transformer = _FakeChatGLMModel()
+
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+        return None
+
+
+def test_ChatGLM3的gradient_checkpointing_enable是静默无效的():
+    """先把坑本身测出来。
+
+    这条是"反面证据"：如果哪天有人把 loader 里的
+    ensure_gradient_checkpointing 删掉、只留 model.gradient_checkpointing_enable()，
+    这条会继续通过，而下面那条会失败 —— 正好把问题指出来。
+    """
+    model = _FakeChatGLM()
+    model.gradient_checkpointing_enable()
+    flags = [n for n, m in model.named_modules()
+             if getattr(m, "gradient_checkpointing", False)]
+    assert flags == [], "ChatGLM3 的空实现不该设上任何标志"
+
+
+def test_ensure_gradient_checkpointing_能补上ChatGLM3的空实现():
+    model = _FakeChatGLM()
+    assert ensure_gradient_checkpointing(model) is True
+    assert model.transformer.encoder.gradient_checkpointing is True
+
+
+def test_ensure_gradient_checkpointing_对自带开关的自定义模型也有效():
+    """既不走 HF 标准接口、也不是 ChatGLM3 层级的模型（比如 GLM-4）。"""
+
+    class _Block(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gradient_checkpointing = False
+
+    class _Custom(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layers = nn.ModuleList([_Block() for _ in range(2)])
+
+    model = _Custom()
+    assert ensure_gradient_checkpointing(model) is True
+    assert all(b.gradient_checkpointing for b in model.layers)
