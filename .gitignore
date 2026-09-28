@@ -19,7 +19,7 @@ data/raw/sfzy_cail.json
 data/raw/sfzy_big.json
 data/raw/sfzy_small.json
 # 切分产物：由 tools/make_splits.py 从 sfzy_cail.json 生成，可随时重建（105MB）
-data/splits/
+# data/splits/
 # 开发期小样本，由 tools/make_sample_data.py 生成
 data/raw/sample/
 data/raw/sample_test_input.jsonl
