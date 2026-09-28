@@ -544,10 +544,6 @@ class SFTTrainer:
         scaled_loss = loss / self.grad_accum_steps
         self.scaler.scale(scaled_loss).backward() # 对张量 backward
         return loss_value
-        # TODO
-        # 自己实现loss计算
-            
-
 
     # ------------------------------------------------------------------
     def _optimizer_step(self, lr: float) -> None:
@@ -618,13 +614,14 @@ class SFTTrainer:
             if self.is_main_process:
                 self.save(tag="best")
 
-        self.state.history.append({
-            "step": self.state.step,
-            "epoch": epoch,
-            "loss": None,
-            "lr": None,
-            "dev_loss": dev_loss,
-        })
+        if self.is_main_process:
+            self.state.history.append({
+                "step": self.state.step,
+                "epoch": epoch,
+                "loss": None,
+                "lr": None,
+                "dev_loss": dev_loss,
+            })
 
         if self.is_main_process:
             logger.info(

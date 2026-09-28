@@ -105,15 +105,29 @@ def main() -> None:
     parser.add_argument("--adapter", default=None,
                         help="LoRA checkpoint 路径；不传则用未微调的底座（当基线用）")
     parser.add_argument("--split", default="val", choices=["train", "val", "test"])
+    parser.add_argument("--input", default=None,
+                        help="直接指定输入 jsonl，覆盖 --split。用来给**任意子集**生成"
+                             "（比如 GRPO 的 prompt 池 —— 它是 train 里筛出来的，"
+                             "不是 train 的前 N 条，用 --split train --limit 对不上 id）")
     parser.add_argument("--data-dir", default=None,
                         help="覆盖数据目录：本地冒烟 data/processed，全量切分 data/splits")
     parser.add_argument("--out", default=None, help="默认 data/triples/sft_{split}.jsonl")
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--shard", default=None, metavar="I/N",
+                        help="数据分片，形如 0/2 或 1/2。**多卡推理用这个，不要用 DDP** —— "
+                             "推理没有梯度，DDP 的 all-reduce 无事可做，只会引入 NCCL "
+                             "初始化、进程组和超时这一堆失败面。两个进程各跑一个分片，"
+                             "用 CUDA_VISIBLE_DEVICES 绑不同的卡即可。")
     parser.add_argument("--prompt-style", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=384)
     parser.add_argument("--batch-size", type=int, default=8,
                         help="批处理大小。实测 batch=8 相对 batch=1 有 5~6 倍加速；"
-                             "6B 模型在 16GB 卡上建议从 4 起步，OOM 就往下调")
+                            "6B 模型在 16GB 卡上建议从 4 起步，OOM 就往下调")
+    parser.add_argument("--quantize", action="store_true",
+                        help="允许 4-bit 量化加载。**默认关闭，而且不应该轻易打开** —— "
+                             "推理的精度必须和 SFT 训练时一致：4-bit 底座配上 bf16 "
+                             "训出来的 LoRA adapter，量化误差会直接进生成结果。"
+                             "只有显存真的不够（比如 16GB 的 T4）才考虑。")
     args = parser.parse_args()
 
     cfg = load_config(resolve(args.config))
@@ -126,13 +140,34 @@ def main() -> None:
         model_cfg = {**model_cfg, "model_name_or_path": str(local)}
 
     # ---- 数据 ----
-    split_path = resolve_split_file(data_cfg, args.split, args.data_dir)
+    split_path = resolve(args.input) if args.input else resolve_split_file(data_cfg, args.split, args.data_dir)
     logger.info("数据: %s", split_path)
     records = load_records(str(split_path))
     if args.limit:
         records = records[: args.limit]
 
-    out_path = resolve(args.out or f"data/triples/sft_{args.split}.jsonl")
+    # ---- 分片：按下标取模 ----
+    # 用下标而不是哈希：同一个输入文件下每个进程拿到的切片是确定的，
+    # 改了 --limit 也不会变（哈希分片会因为顺序变化而不稳定）。
+    shard_idx = shard_total = None
+    if args.shard:
+        try:
+            shard_idx, shard_total = (int(x) for x in args.shard.split("/"))
+        except ValueError as exc:
+            raise SystemExit(f"--shard 要写成 I/N 的形式，收到：{args.shard!r}") from exc
+        if not (0 <= shard_idx < shard_total):
+            raise SystemExit(f"--shard 序号要在 [0, {shard_total}) 内，收到 {shard_idx}")
+        before = len(records)
+        records = [r for i, r in enumerate(records) if i % shard_total == shard_idx]
+        logger.info("分片 %d/%d：%d 条 → %d 条", shard_idx, shard_total, before, len(records))
+
+    if args.out:
+        out_path = resolve(args.out)
+    elif shard_total:
+        # 自动分名，免得两个进程写同一个文件互相覆盖
+        out_path = resolve(f"data/triples/sft_{args.split}_shard{shard_idx}of{shard_total}.jsonl")
+    else:
+        out_path = resolve(f"data/triples/sft_{args.split}.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = load_done_ids(out_path)
     todo = [r for r in records if r["id"] not in done]
@@ -142,6 +177,26 @@ def main() -> None:
     logger.info("读入 %d 条，已完成 %d 条，待生成 %d 条", len(records), len(done), len(todo))
 
     # ---- 模型 ----
+    #
+    # **推理精度由代码决定，不由配置文件决定。**
+    #
+    # 理由：精度不是用户偏好，是**正确性约束** —— LoRA adapter 是在 bf16 底座上
+    # 训出来的，换成 4-bit 底座会引入额外的量化误差，直接进生成结果。
+    # 把它留在共享的 model 配置里，等于让"为了 Kaggle 省显存"的一次编辑
+    # 悄悄改掉云上的推理行为 —— 这正是刚才那个报错的成因。
+    #
+    # 但也不能硬编码 bf16：Kaggle 的 16GB T4 上推理确实需要 4-bit。
+    # 所以做成"默认强制不量化 + 显式开关 + 大声警告"。
+    if model_cfg.get("load_in_4bit") and not args.quantize:
+        logger.warning(
+            "模型配置里 load_in_4bit=True，但推理默认强制关闭量化："
+            "SFT 用的是非量化底座，推理必须一致，否则量化误差会进生成结果。"
+            "确实需要 4-bit（比如 16GB 显存）请显式传 --quantize"
+        )
+        model_cfg = {**model_cfg, "load_in_4bit": False}
+    if args.quantize:
+        logger.warning("已启用 4-bit 量化推理 —— 确认这与 SFT 训练时的精度一致")
+
     logger.info("加载模型: %s", model_cfg.get("model_name_or_path"))
     tokenizer = load_tokenizer(model_cfg)
     model = load_model(model_cfg, quant_config=build_quant_config(model_cfg),

@@ -16,7 +16,12 @@ rl:
 
   # ---- rollout ----
   group_size: 8                 # 主流取值；大了一倍成本，小了优势估计不稳
-  prompts_per_step: 4           # 每步 4 个 prompt × 8 条 = 32 条采样
+  # **显存 = prompts_per_step × group_size × 序列长度**，一次 forward 全塞进去。
+  # 4×8=32 条 × 2432 token = 7.8 万 token，6B 模型上必然 OOM。
+  # 所以从 1 起步（8 条 ≈ 1.95 万 token），量完显存再往上加：
+  #     python scripts/check_memory.py --batch-size 8 --seq-len 2432
+  # 加不加都不影响总生成量（rollout 才是瓶颈），只影响每个优化步的梯度质量。
+  prompts_per_step: 1
   max_new_tokens: 384           # 参考摘要中位数 293 字，留点余量
   max_length: 2048
   temperature: 0.9              # 要有方差才能算出 advantage
@@ -41,23 +46,65 @@ rl:
   resume_from: null
 
   # ---- 奖励 ----
-  # 三层结构（门控 / 事实覆盖 / ROUGE）的默认值在 rl/reward.py 里，
+  # 四层结构（门控 / 事实 F1 / 裁判语义分 / ROUGE）的默认值在 rl/reward.py 里，
   # 这里只覆盖要动的那几项。
   reward:
-    mode: gated                # flat = 对照组（所有项加权求和，可互相补偿）
+    # rouge_only | flat | gated | gated_judge
+    mode: gated_judge
+    # 事实项用对称 F1（漏写扣分、参考没写时多写也扣分），
+    # 旧口径 coverage 只保留作报告字段。理由见 rl/reward.py 的 docstring。
+    fact_term: f1
     weights:
-      rouge_l: 0.5
-      fact_coverage: 0.5       # ★ 主信号
+      rouge_l: 0.3             # 官方口径的锚，权重压低但不为 0
+      fact: 0.4                # ★ 可验证、不可骗
+      semantic: 0.3            # 生成式裁判，补 ROUGE 和事实项都覆盖不到的语义
       length: 0.1              # 只在 flat 模式下生效
 
-# ==================== 三组对照实验怎么配 ====================
+  # ---- SFT 基线锚（可选）----
+  # 组内所有采样都不如 SFT 输出时，丢掉这一组不产生梯度。
+  # **默认关**：它需要 prompt 池里带 sft_output（见 tools/select_rl_prompts.py
+  # --triples），没带就自动跳过。先跑无锚的版本，把锚当作第二个实验变量。
+  anchor:
+    enabled: false
+    slack: 0.05                # 容差：比 SFT 差 5 分以内仍算这一组排序有意义
+
+# ==================== 语义裁判 ====================
+# 和 rl.reward.mode 配套：只有 gated_judge 或显式 --judge-backend 才会加载。
+# 裁判模型放在**卡 1**（策略吃满卡 0）。用 API 后端则不占显存。
+semantic:
+  backend: local               # local | api | cache | none
+  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
+  rubric_file: configs/judge_rubric_v1.yaml   # 进奖励的 rubric
+  device: cuda:1
+  dtype: bfloat16
+  load_in_4bit: false          # 4090 上 7B 用 bf16 够（约 15G）
+  samples: 1                   # 1 条就够；要测裁判自噪声时才调大
+  temperature: 0.7
+  max_new_tokens: 512          # 逐维度写理由，给小了会被截断（截断样本按失败丢弃）
+
+  # ---- backend=api 时用 ----
+  base_url: https://api.deepseek.com/v1
+  api_model: deepseek-chat
+  api_key_env: JUDGE_API_KEY   # key 放环境变量，别写进 yaml（会跟着 git 走）
+  max_workers: 8
+
+  # ---- backend=cache 时用（离线评测）----
+  cache_files: []
+
+# ==================== 四组对照实验怎么配 ====================
 #
-# A1  纯 ROUGE 基线（回答"传统 RLVR 能到哪"）
+# A1  纯 ROUGE 基线（回答"不设计奖励、只优化官方指标能到哪"）
+#     --override rl.reward.mode=rouge_only
+#
+# A2  可补偿的加权求和（对照组：证明"门控"这个设计本身有用）
 #     reward.mode: flat
-#     reward.weights: {rouge_l: 1.0, fact_coverage: 0.0, length: 0.0}
+#     --override rl.reward.mode=flat
 #
-# A2  主方案（门控 + 事实覆盖 + ROUGE）
+# A3  门控 + 事实 F1 + ROUGE（不含裁判）
+#     --override rl.reward.mode=gated --judge-backend none
+#
+# A4  主方案：加上生成式语义裁判
 #     就是本文件的默认值
 #
-# A3  只隔离事实信号（回答"事实覆盖单独能做什么"）
-#     reward.weights: {rouge_l: 0.0, fact_coverage: 1.0}
+# 判据见 docs/semantic_metrics.md 第 4 节。A3 → A4 的差值是"语义指标这一项
+# 值不值一个 7B 裁判的显存和每步多出的十几秒"。

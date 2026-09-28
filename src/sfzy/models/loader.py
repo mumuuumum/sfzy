@@ -34,6 +34,7 @@ from transformers import (
 )
 from sfzy.models.compat import (
     ensure_gradient_checkpointing,
+    ensure_legacy_cache,
     patch_pretrained_config,
     patch_tied_weights_keys,
     patch_tp_plan_for_quantized_load,
@@ -42,6 +43,10 @@ from sfzy.models.compat import (
 from peft import prepare_model_for_kbit_training
 
 import torch
+
+from sfzy.utils.logging import get_logger
+
+logger = get_logger("loader")
 
 
 def build_quant_config(model_cfg: Dict[str, Any]) -> Any:
@@ -221,8 +226,38 @@ def load_model(
             # prepare_model_for_kbit_training 内部会做同样的事，
             # 我们这条非量化分支要自己补上。
             model.enable_input_require_grads()
-        if hasattr(model, "config"):
-            model.config.use_cache = False
+
+    # ---- use_cache 的处理必须放在**两个分支之外** ----
+    #
+    # 之前这一行只写在非量化分支里，于是走 4-bit 路径时 use_cache 一直是 True，
+    # ChatGLM3 的 GLMTransformer.forward 会打出
+    #     "`use_cache=True` is incompatible with gradient checkpointing..."
+    # 然后在内部自己改掉。**它自己兜住了，所以不会故障** ——
+    # 但也正因为不会故障，这个配置没生效的问题一直没被发现。
+    #
+    # 换成没有这道自我保护的模型（比如 Qwen 系），use_cache=True 会在训练时
+    # 真的建 KV cache，白白吃显存，在 24GB 卡上可能就是 OOM 和不 OOM 的区别。
+    if gradient_checkpointing and hasattr(model, "config"):
+        model.config.use_cache = False
+
+    # ---- 旧版缓存路径 ----
+    #
+    # 新版 transformers 的 generate() 默认给模型造一个 DynamicCache 传进去，
+    # 而它是**惰性分配**的（初始时每层 key/value 都是 None）。ChatGLM3 的
+    # 远程代码期望的是自己的 past_key_values 格式，于是它的 get_masks 里
+    # `past_key_values[0][0].shape[0]` 直接炸在 None 上。
+    #
+    # 这两行让 ChatGLM3 退回**旧版缓存路径**（模型自己维护 past_key_values）。
+    # 注意它和 use_cache 是两件事：use_cache 关掉会让每个 token 重算整个
+    # 前缀（慢几百倍），而旧版路径是正常的增量解码。
+    #
+    # 训练永远不会碰到这段 —— 只有 generate() 走缓存逻辑。所以 check_model.py
+    # 的第八步（真调一次 generate）是专门为它加的。
+    if ensure_legacy_cache(model, force=model_cfg.get("force_legacy_cache")):
+        logger.info(
+            "已为 %s 启用旧版缓存路径（DynamicCache 与它的 past_key_values 格式不兼容）",
+            type(model).__name__,
+        )
 
     return model
     

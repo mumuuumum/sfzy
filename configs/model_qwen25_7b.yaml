@@ -1,0 +1,25 @@
+defaults: base
+
+# Qwen2.5-7B-Instruct：ChatGLM3 的替代底座。
+#
+# 为什么换：ChatGLM3 的远程代码停留在 2023 年（config.json 里写着
+# "transformers_version": "4.30.2"），在**生成路径**上连续暴露了四个
+# 不兼容问题：
+#   1. config 缺 num_hidden_layers（构造 KV cache 时崩）
+#   2. 期望自己的 past_key_values 格式，不认 DynamicCache
+#   3. get_masks 假设 attention_mask 与当前输入等长、且无 padding
+#   4. KV cache 解包成 2 元组，但传进来的是别的结构
+# 每一层修完，下一层才暴露 —— 这是"远程代码 + 新 transformers"的必然结果。
+#
+# Qwen2.5 是 transformers 官方直接支持的架构：
+#   * 不需要 trust_remote_code（没有远程代码要兼容）
+#   * 批量生成、左 padding、KV cache、vLLM 全部原生可用
+#   * 7B bf16 = 14GB，24GB 的 4090 装得下
+
+model:
+  model_name_or_path: models/Qwen2.5-7B-Instruct
+  trust_remote_code: false
+  load_in_4bit: false
+  torch_dtype: bfloat16
+  device_map: null
+  max_length: 4096

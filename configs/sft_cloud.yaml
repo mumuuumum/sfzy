@@ -16,7 +16,7 @@ sft:
   # 1. 权重精度：4-bit → bf16，权重从 3.5GB 涨到 12GB
   #    （在 model_chatglm3_6b_bf16.yaml 里设）
   # 2. batch：2 → 4，24GB 的推荐起点，测完可以试 6
-  per_device_batch_size: 4
+  per_device_batch_size: 2
   # 3. 序列长度：1536 → 2048。激活和 logits 都随它增长，
   #    是 OOM 风险最大的一项，真撑不住先降它
   max_length: 4096
@@ -26,7 +26,7 @@ sft:
   dtype: bfloat16                # 4090 支持，scaler 自动关闭
 
   # ==================== 以下不影响显存，保持 Kaggle 的值 ====================
-  grad_accum_steps: 4            # 等效 batch = 4 × 4 = 16
+  grad_accum_steps: 8            # 等效 batch = 4 × 4 = 16
   learning_rate: 2.0e-4
   weight_decay: 0.0
   warmup_ratio: 0.03

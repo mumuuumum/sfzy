@@ -1,0 +1,18 @@
+defaults: sft_cloud
+
+# 换成 Qwen2.5-7B 的 SFT 配置。
+#
+# **只需要覆盖两项** —— 其余全部继承 sft_cloud.yaml（batch/精度/序列长度
+# 这些和模型无关的都不动），这样两套底座的结果可以直接对比。
+
+model_config: configs/model_qwen25_7b.yaml
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  # Qwen2.5 的注意力是分开的 q/k/v/o 投影，
+  # 而 ChatGLM3 用的是融合的 query_key_value + FFN 三层。
+  # **这一项必须改** —— 不改的话 inject_lora 会一个层都匹配不上，
+  # train_sft.py 里那道 `replaced == 0` 的检查会直接拦下。
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

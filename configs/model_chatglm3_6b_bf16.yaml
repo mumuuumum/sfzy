@@ -22,9 +22,9 @@ model:
   # 这一改顺带绕开了 fp16 + GradScaler 那一整类坑
   # （未缩放就裁剪、fp16 主权重、Attempting to unscale FP16 gradients）。
   # 代价是少了 4-bit 的显存节省，但 24GB 不需要省。
-  load_in_4bit: false
+  load_in_4bit: true
   torch_dtype: bfloat16
 
   # 不做 accelerate 分片，由 scripts/train_sft.py 手动 .to(device)
   device_map: null
-  max_length: 2048
+  max_length: 4096

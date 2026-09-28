@@ -53,15 +53,57 @@ def group_advantages(rewards: torch.Tensor, eps: float = 1e-4) -> torch.Tensor:
     return (rewards - mean) / (std + eps)
 
 
-def group_mask(rewards: torch.Tensor, min_std: float = 1e-6) -> torch.Tensor:
-    """标出"有区分度"的组，返回形状 (num_prompts,) 的 bool 张量。
+def group_mask(
+    rewards: torch.Tensor,
+    min_std: float = 1e-6,
+    baseline: Optional[torch.Tensor] = None,
+    slack: float = 0.0,
+) -> torch.Tensor:
+    """标出"该产生梯度"的组，返回形状 (num_prompts,) 的 bool 张量。
 
     奖励全同的组（全过门控 / 全被门控）归一化后 advantage 恒为 0，
     **算它们纯属浪费算力**。主动过滤掉，省下的时间可以多跑几组有区分度的。
 
     这是 RTL-RLVR 那条"n=8 配合组内过滤"的做法。
+
+    ---- baseline：SFT 基线锚（防止整体退化）----
+    `baseline[i]` 是第 i 个 prompt 上 **SFT 输出**的奖励，形状 (num_prompts,)。
+    给了它之后，只有满足"组内最好的那一条 ≥ 基线 - slack"的组才保留。
+
+    为什么必须是过滤而不是"奖励里减去基线"：
+
+        GRPO 的 advantage 是组内归一化 A_i = (r_i - mean_j r_j) / std_j r_j，
+        **给组内所有 r 同加同减一个常数，A_i 完全不变**。
+
+    所以"r_i - 基线"这种写法对梯度毫无影响（有测试钉住这条）。
+    要让基线真的起作用，只能走非线性：要么过滤整组（这里），
+    要么在奖励里做门控（`reward.py` 的 mode=gated*）。
+
+    `slack` 是容差：slack=0 意味着"只要整组都不如 SFT 就丢掉"，
+    在训练早期这会频繁触发。给 0.05 表示"比 SFT 差 5 分以内还算这一组的
+    相对排序有意义"。**这一项是实验变量，不是拍脑袋的常数。**
+
+    被过滤的样本在日志里记为 `anchor_filtered`，和 `无区分度` 分开统计 ——
+    前者说明策略在退步，后者只是运气不好，两者要做的事完全不同。
     """
-    return rewards.std(dim=-1, unbiased=False) > min_std
+    keep = rewards.std(dim=-1, unbiased=False) > min_std
+    if baseline is not None:
+        best = rewards.max(dim=-1).values
+        keep = keep & (best >= baseline.to(rewards.device) - slack)
+    return keep
+
+
+def mask_advantages(
+    advantages: torch.Tensor, keep: torch.Tensor, group_size: int
+) -> torch.Tensor:
+    """把被过滤掉的组的 advantage 置 0，返回展平后的张量。
+
+    置 0 之后这些组对 loss 的贡献是常数 0，梯度自然为 0 —— 等价于不训练它们，
+    但**保留在同一个 batch 里**，不用重排张量。
+    """
+    flat = advantages.reshape(-1)
+    mask = keep.repeat_interleave(group_size).to(flat.device, dtype=flat.dtype)
+    return flat * mask
 
 
 def length_normalize(
@@ -145,12 +187,17 @@ def compute_advantages(
     lengths: torch.Tensor,
     length_mode: str = "sqrt",
     eps: float = 1e-4,
+    baseline: Optional[torch.Tensor] = None,
+    slack: float = 0.0,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """串起来：组内归一化 → 长度归一化。返回 (advantages, 组掩码)。
+    """串起来：组内归一化 → 长度归一化 → 组过滤。返回 (advantages, 组掩码)。
 
-    组掩码是"哪些组有区分度"，调用方用来只对有效组做反向传播。
+    advantages 已经**按组掩码置 0**（被过滤的组不产生梯度），所以调用方
+    直接拿去算 loss 就行，不用再管掩码。掩码同时返回是为了打日志：
+    `kept_groups / total_groups` 是判断奖励设计好坏的第一手信号。
     """
     advantages = group_advantages(rewards, eps=eps)
     flat_len = lengths.reshape(-1).float()
-    advantages = length_normalize(advantages.reshape(-1), flat_len, mode=length_mode)
-    return advantages, group_mask(rewards)
+    flat = length_normalize(advantages.reshape(-1), flat_len, mode=length_mode)
+    keep = group_mask(rewards, baseline=baseline, slack=slack)
+    return mask_advantages(flat, keep, rewards.shape[-1]), keep

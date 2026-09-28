@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
@@ -34,7 +34,7 @@ from sfzy.config import Config
 from sfzy.data.prompts import build_messages
 from sfzy.models.chat_template import encode_prompt
 from sfzy.rl.dpo import sequence_logprob
-from sfzy.rl.grpo import compute_advantages, grpo_loss, kl_penalty
+from sfzy.rl.grpo import compute_advantages, group_mask, grpo_loss, kl_penalty
 from sfzy.rl.reward import (
     compute_rewards,
     summarize_gate_reasons,
@@ -67,9 +67,14 @@ class GRPOTrainer:
         output_dir: Optional[str] = None,
         tracker: Any = None,
         is_main_process: bool = True,
+        scorer: Any = None,
     ) -> None:
         """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
         关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
+
+        `scorer` 是语义裁判（`sfzy.eval.metrics.SemanticScorer`）。传了就用，
+        没传就在 `gated_judge` 模式下直接报错 —— 配置说要接裁判却没有裁判，
+        静默降级成 gated 是最坏的结果。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -78,6 +83,7 @@ class GRPOTrainer:
         self.output_dir = Path(output_dir or cfg.path_("rl.output_dir", "outputs/grpo"))
         self.tracker = tracker
         self.is_main_process = is_main_process
+        self.scorer = scorer
 
         rl = cfg.rl
         self.group_size = rl.get("group_size", 8)
@@ -97,10 +103,99 @@ class GRPOTrainer:
         self.reward_cfg = rl.get("reward", None)
         self.resume_from = rl.get("resume_from") or None
 
+        # ---- SFT 基线锚：防止策略整体退化，见 grpo.group_mask ----
+        anchor = rl.get("anchor") or {}
+        self.anchor_enabled = bool(anchor.get("enabled", False))
+        self.anchor_slack = float(anchor.get("slack", 0.05))
+        self.baseline_rewards: Dict[str, float] = {}
+
+        mode = (self.reward_cfg or {}).get("mode", "gated")
+        if mode == "gated_judge" and self.scorer is None:
+            raise ValueError(
+                "reward.mode=gated_judge 但没传语义裁判（scorer）。\n"
+                "  要么在配置里写 semantic.backend（local/api），"
+                "要么改成 mode=gated 跑对照组。"
+            )
+
         trainable = [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable, lr=rl.get("learning_rate", 1e-5))
         self.device = next(model.parameters()).device
         self.state = RLState()
+
+    # ------------------------------------------------------------------
+    def score_semantic(self, candidates, references, sources) -> Optional[List[Optional[float]]]:
+        """批量算裁判分。返回 None 表示这次不接裁判（模式不需要）。"""
+        if self.scorer is None:
+            return None
+        items = [
+            {"candidate": c, "reference": r, "source": s}
+            for c, r, s in zip(candidates, references, sources)
+        ]
+        return self.scorer.score_batch(items)
+
+    def prepare_baseline(self, prompts: List[Dict[str, Any]]) -> None:
+        """用 prompt 池里的 `sft_output` 预先把 SFT 的奖励算出来，当锚。
+
+        只算一次（SFT 输出是固定的），之后每步查表。
+        **必须和训练用同一个奖励函数**：锚和策略得分不在一个尺度上，
+        比较就没有意义。所以这里也要过裁判。
+
+        prompt 池没有 `sft_output` 就直接跳过并说明怎么补 ——
+        `tools/select_rl_prompts.py --triples ...` 会把 SFT 输出带进来。
+        """
+        if not self.anchor_enabled:
+            return
+        with_out = [p for p in prompts if p.get("sft_output")]
+        if not with_out:
+            logger.warning(
+                "anchor.enabled=true 但 prompt 池里没有 sft_output，基线锚不生效。\n"
+                "  重新生成 prompt 池：python tools/select_rl_prompts.py --n 1000 \\\n"
+                "      --triples data/triples/sft_val_shard0of2.jsonl"
+            )
+            return
+
+        refs = [p["summary"] for p in with_out]
+        srcs = [p["source"] for p in with_out]
+        cands = [p["sft_output"] for p in with_out]
+        semantic = self.score_semantic(cands, refs, srcs)
+        bds = compute_rewards(cands, refs, srcs, self.reward_cfg, semantic)
+        for p, bd in zip(with_out, bds):
+            self.baseline_rewards[str(p.get("id"))] = bd.total
+        vals = list(self.baseline_rewards.values())
+        logger.info(
+            "SFT 基线锚: %d 条，奖励均值 %.4f（锚 slack=%.3f）",
+            len(vals), sum(vals) / len(vals), self.anchor_slack,
+        )
+
+    def fill_semantic_gaps(
+        self, scores: List[Optional[float]], group_size: int
+    ) -> Tuple[List[float], float]:
+        """裁判个别失败时不中断训练，用**组内可用分的均值**补上，并返回缺失比例。
+
+        为什么不是直接抛错：300 步的 run 里任何一次 API 超时或截断都会在
+        第 137 步崩掉，前面几小时白跑。一个失败样本不该有这种权力。
+
+        为什么用组内均值而不是 0 或全局均值：
+          * 填 0 等于"这条很差"，会把优势估计带偏（模型被惩罚了一个和它
+            无关的失误）
+          * 全局均值跨 prompt 不可比 —— 不同文书的裁判分本身就有系统差
+          * 组内均值是**该组的中性点**，归一化后它的 advantage 接近 0，
+            既不奖励也不惩罚这一条
+
+        整组都缺失时填 0：语义项在组内变成常数，GRPO 会自然忽略它，
+        这一组仍能靠 ROUGE 和事实项学习。缺失比例记进日志 —— 超过 10%
+        说明裁判配置有问题，该去查超时和 max_new_tokens，而不是接着跑。
+        """
+        filled: List[float] = [0.0] * len(scores)
+        missing = 0
+        for start in range(0, len(scores), group_size):
+            chunk = scores[start:start + group_size]
+            ok = [s for s in chunk if s is not None]
+            fallback = sum(ok) / len(ok) if ok else 0.0
+            missing += sum(1 for s in chunk if s is None)
+            for i, s in enumerate(chunk):
+                filled[start + i] = float(s) if s is not None else fallback
+        return filled, missing / max(len(scores), 1)
 
     # ------------------------------------------------------------------
     def rollout(self, prompts: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -162,7 +257,13 @@ class GRPOTrainer:
         for i in batch["prompt_index"].tolist():
             refs.append(prompts[i]["summary"])
             sources.append(prompts[i]["source"])
-        breakdowns = compute_rewards(batch["responses"], refs, sources, self.reward_cfg)
+        semantic = self.score_semantic(batch["responses"], refs, sources)
+        judge_missing = 0.0
+        if semantic is not None:
+            semantic, judge_missing = self.fill_semantic_gaps(semantic, self.group_size)
+        breakdowns = compute_rewards(
+            batch["responses"], refs, sources, self.reward_cfg, semantic
+        )
         rewards = torch.tensor([b.total for b in breakdowns], dtype=torch.float32)
         rewards = rewards.reshape(len(prompts), self.group_size)
 
@@ -170,7 +271,23 @@ class GRPOTrainer:
         lengths = torch.tensor(
             [len(r.strip()) for r in batch["responses"]], dtype=torch.float32
         ).reshape(len(prompts), self.group_size)
-        advantages, keep = compute_advantages(rewards, lengths, length_mode=self.length_mode)
+        # 基线锚：查不到基线的 prompt 用 -1e9 填充 —— 阈值比较永远成立，
+        # 等价于"这一组不参与锚过滤"，不会误伤。
+        baseline = None
+        if self.baseline_rewards:
+            baseline = torch.tensor(
+                [self.baseline_rewards.get(str(p.get("id")), -1e9) for p in prompts],
+                dtype=torch.float32,
+            )
+        advantages, keep = compute_advantages(
+            rewards, lengths, length_mode=self.length_mode,
+            baseline=baseline, slack=self.anchor_slack,
+        )
+        # 把"没区分度"和"被锚挡住"分开记：前者是运气，后者是策略在退步
+        anchor_filtered = 0
+        if baseline is not None:
+            has_var = group_mask(rewards)
+            anchor_filtered = int((has_var & ~keep).sum())
 
         # ---- old_logprobs：必须在任何参数更新之前算 ----
         with torch.no_grad():
@@ -222,6 +339,8 @@ class GRPOTrainer:
             "kl": kl_value,
             "kept_groups": int(keep.sum()),
             "total_groups": len(prompts),
+            "anchor_filtered": anchor_filtered,
+            "judge_missing": judge_missing,
             "gating_rate": gate_stats.get("gated", 0) / max(gate_stats.get("total", 1), 1),
             "output_len_mean": float(lengths.mean()),
         }
@@ -229,12 +348,25 @@ class GRPOTrainer:
         metrics["fact_coverage"] = float(
             sum(b.fact_coverage for b in breakdowns) / len(breakdowns)
         )
+        metrics["fact_score"] = float(
+            sum(b.fact_score for b in breakdowns) / len(breakdowns)
+        )
+        metrics["fact_precision"] = float(
+            sum(b.fact_precision for b in breakdowns) / len(breakdowns)
+        )
+        metrics["semantic"] = float(
+            sum(b.semantic for b in breakdowns) / len(breakdowns)
+        )
         metrics["rouge_l"] = float(sum(b.rouge_l for b in breakdowns) / len(breakdowns))
         return metrics
 
     # ------------------------------------------------------------------
     def train(self, prompts: List[Dict[str, Any]]) -> RLState:
         """主循环。每步处理 prompts_per_step 个 prompt。"""
+        if self.is_main_process:
+            # 基线锚只在前 N 条 prompt 上用得上，但 prepare_baseline 会整池算 ——
+            # 便宜（一次前向），换来的是每步都能查表。
+            self.prepare_baseline(prompts)
         n_steps = len(prompts) // self.prompts_per_step
         logger.info(
             "GRPO 开始: %d 个 prompt，每步 %d 个，共 %d 步，G=%d",
@@ -248,12 +380,13 @@ class GRPOTrainer:
             if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
                 self.state.history.append({"step": self.state.step, **metrics})
                 logger.info(
-                    "step %d/%d | reward %.4f±%.4f | ROUGE-L %.4f | 事实 %.4f | "
-                    "门控 %.1f%% | clip %.1f%% | len %.0f",
+                    "step %d/%d | reward %.4f±%.4f | ROUGE-L %.4f | 事实F1 %.4f | "
+                    "裁判 %.3f | 门控 %.1f%% | 保留组 %d/%d | clip %.1f%% | len %.0f",
                     self.state.step, n_steps, metrics["reward_mean"], metrics["reward_std"],
-                    metrics["rouge_l"], metrics["fact_coverage"],
-                    metrics["gating_rate"] * 100, metrics["clipped_frac"] * 100,
-                    metrics["output_len_mean"],
+                    metrics["rouge_l"], metrics["fact_score"], metrics["semantic"],
+                    metrics["gating_rate"] * 100,
+                    metrics["kept_groups"], metrics["total_groups"],
+                    metrics["clipped_frac"] * 100, metrics["output_len_mean"],
                 )
                 if self.tracker is not None:
                     self.tracker.log(metrics, self.state.step)

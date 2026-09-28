@@ -1,0 +1,10 @@
+defaults: grpo_cloud
+
+# GRPO 换 Qwen 的版本。同样只覆盖和底座相关的两项。
+model_config: configs/model_qwen25_7b.yaml
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.05
+  target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]

@@ -1,4 +1,4 @@
-"""规则奖励：门控 + 事实覆盖 + ROUGE-L。
+"""分层奖励：门控 + 事实 F1 + 生成式语义分 + ROUGE-L。
 
 ================================ 为什么这么设计 ================================
 从旧模型的 12172 条输出上分析出来的结论：
@@ -20,14 +20,41 @@
 门控和加权求和的区别是**可补偿性**：加权求和下模型能学会"格式烂一点、
 但 ROUGE 多拿分"，总分反而更高；门控切断的就是这条路。
 
+================================ 四种模式 ================================
+`mode` 是一个字符串，决定**哪些项参与、能不能互相补偿**。四种模式共用
+同一套分项计算（`RewardBreakdown`），所以对比是干净的单变量：
+
+  rouge_only    总分 = ROUGE-L。官方口径的裸基线，回答"不设计奖励能到哪"
+  flat          所有项加权求和，长度是正向项。可补偿，对照组
+  gated         门控 → 不通过直接 0；通过后 事实 F1 + ROUGE-L
+  gated_judge   gated 再加上生成式语义分（LLM 裁判），本次的主方案
+
+================================ 为什么事实项换成对称 F1 ================================
+旧的 `fact_coverage` 在"参考里没有事实"时返回 0 —— 那些样本占 61.7%。
+0 是**组内常数**，GRPO 的组内归一化会把它整个抵消，整组零梯度。
+
+更要命的是方向：模型在参考**没有**事实的样本上多写数字，代价是 ROUGE 掉
+0.099（实测），但 `fact_coverage` 对此**毫无惩罚**（返回 0，反正不加分）。
+模型学不会"什么时候该写数字"。
+
+对称 F1 把这件事补上：
+
+    参考无事实 + 候选无事实 → 1.0    一致，满分
+    参考无事实 + 候选写了   → 0.0    多写 = 错，有惩罚（组内不再是常数）
+    参考有事实 + 候选没写   → 0.0    漏写 = 错
+    都有 → 重叠的 F1
+
 ================================ 防 hacking ================================
-覆盖率有个明显的漏洞：模型可以把参考里所有数字都堆进去。
+事实项有个明显的漏洞：模型可以把参考里所有数字都堆进去。
 三道防线：
   1. 长度门控 —— 堆数字会把长度推高，直接撞上限
-  2. `fact_precision` —— 输出的事实有多少真在原文里（监控指标，不进奖励）
-  3. ROUGE 互补 —— 覆盖率和 ROUGE 反向变动就是报警
+  2. `fact_precision` —— 输出的事实有多少真在原文里（精确率进了 F1，但仍单独记录）
+  3. ROUGE 互补 —— 事实项和 ROUGE 反向变动就是报警
 
 **前两条都要和覆盖率一起记录**，只看覆盖率会自欺欺人。
+
+裁判项同样会被 hack（模型学会讨好裁判），所以 `semantic` 必须和
+`fact_precision`、`rouge_l` 一起看：三个一起涨才是真的好了。
 """
 
 from __future__ import annotations
@@ -59,12 +86,18 @@ ARTICLE_RE = re.compile(r"第\s*\d+\s*条")
 RESULT_MARKERS = ("判决如下", "判令", "驳回", "本院认为", "判决", "裁定")
 
 DEFAULT_REWARD_CFG: Dict[str, Any] = {
-    # flat  —— 所有项加权求和，可以互相补偿（对照组）
-    # gated —— 门控项不满足直接 0 分，其余加权
+    # rouge_only | flat | gated | gated_judge，见模块 docstring
     "mode": "gated",
-    "weights": {"rouge_l": 0.5, "fact_coverage": 0.5, "length": 0.1},
+    # weights 的键是"项名"。事实项的键叫 fact（不叫 fact_coverage），
+    # 因为它乘的到底是 coverage 还是 f1 由 fact_term 决定。
+    # 老配置里的 fact_coverage 键会被自动识别，见 _merge_cfg。
+    "weights": {"rouge_l": 0.3, "fact": 0.4, "semantic": 0.3, "length": 0.1},
+    # 事实项用哪个函数：coverage（旧口径）/ f1（对称，能用组内梯度）
+    "fact_term": "f1",
     "fact_kinds": ["money", "date", "id"],
     "rouge_mode": "jieba",
+    # 裁判分数的量程。scorer 返回 0-100，这里除以它变成 0-1。
+    "semantic_scale": 100.0,
     "gate": {
         "min_chars": 60,
         "length_ratio_range": [0.5, 1.5],
@@ -83,7 +116,9 @@ class RewardBreakdown:
     gate_reason: str = ""
     rouge_l: float = 0.0
     fact_coverage: float = 0.0
+    fact_score: float = 0.0
     fact_precision: float = 0.0
+    semantic: float = 0.0
     length_ratio: float = 0.0
     n_ref_facts: int = 0
     n_missed_facts: int = 0
@@ -93,12 +128,18 @@ class RewardBreakdown:
             "reward": self.total,
             "reward_rouge_l": self.rouge_l,
             "reward_fact_coverage": self.fact_coverage,
+            "reward_fact_score": self.fact_score,
+            "reward_semantic": self.semantic,
             "fact_precision": self.fact_precision,
             "length_ratio": self.length_ratio,
             "n_ref_facts": self.n_ref_facts,
             "n_missed_facts": self.n_missed_facts,
             "gated": float(self.gated),
         }
+
+    def fact_value(self, term: str = "f1") -> float:
+        """按 `fact_term` 取事实项的值。"""
+        return self.fact_coverage if term == "coverage" else self.fact_score
 
 
 def _mask(text: str, spans: Iterable[Tuple[int, int]]) -> str:
@@ -186,6 +227,44 @@ def fact_precision(
     return len(cand_facts & extract_facts(source, kinds)) / len(cand_facts)
 
 
+def fact_score(
+    candidate: str, reference: str, kinds: Sequence[str] = ("money", "date", "id")
+) -> float:
+    """事实项的**对称 F1**：既罚漏写，也罚多写。
+
+    四种情况的取值（这是它和 `fact_coverage` 的全部区别）：
+
+        参考无事实 + 候选无事实 → 1.0   两边一致，这组该拿满分
+        参考无事实 + 候选写了   → 0.0   ★ 多写要扣分
+        参考有事实 + 候选没写   → 0.0   漏写扣分（和 coverage 一致）
+        都有事实               → 重叠的 F1
+
+    ★ 那一行是这次改动的核心。旧口径返回 0，而 0 在"参考无事实"的组里
+    是常数 —— GRPO 组内归一化会把它抵消掉，整组零梯度。改成 1/0 之后，
+    "参考不写数字时也不该乱写数字"才第一次有了训练信号。
+
+    实测依据：参考**无**事实的 827 条里，模型多写 3 个以上数字的样本
+    官方总分从 0.5912 掉到 0.4921 —— 损失巨大却没有对应的惩罚项。
+
+    注意 F1 用的是"参考"而不是"原文"：参考是金标准，原文里的事实未必该
+    进摘要（写全文数字是 ROUGE 和长度都会罚的另一种错）。
+    """
+    ref_facts = extract_facts(reference, kinds)
+    cand_facts = extract_facts(candidate, kinds)
+
+    if not ref_facts and not cand_facts:
+        return 1.0
+    if not ref_facts or not cand_facts:
+        return 0.0
+
+    overlap = len(ref_facts & cand_facts)
+    if overlap == 0:
+        return 0.0
+    precision = overlap / len(cand_facts)
+    recall = overlap / len(ref_facts)
+    return 2 * precision * recall / (precision + recall)
+
+
 def length_reward(candidate: str, reference: str, tolerance: float = 0.5) -> float:
     """长度落在参考的 ±tolerance 内给满分，越远越低。**只在 flat 模式下用。**"""
     ref_len = len(reference.strip())
@@ -226,32 +305,46 @@ def compute_reward(
     reference: str,
     source: Optional[str] = None,
     cfg: Optional[Dict[str, Any]] = None,
+    semantic: Optional[float] = None,
 ) -> Tuple[float, RewardBreakdown]:
     """算一条样本的奖励，返回 (总分, 分项明细)。
 
-    `mode="flat"` 时所有项加权求和、长度是正向项（对照组）；
-    `mode="gated"` 时先过门控、不通过直接 0 分。两种模式共用同一套
-    分项计算，所以 A1/A2 的对比是干净的单变量。
+    `semantic` 是裁判给出的原始分（默认量程 0-100），只有 `gated_judge`
+    模式会用到它；其余模式即使传了也只记录进明细，不参与总分 ——
+    这样"同一个 checkpoint 用不同奖励口径离线重打分"是免费的。
+
+    四种模式的差别只在最后几行，**分项计算完全共用**，所以 A1/A2/A4 的
+    对比是干净的单变量。
     """
     full_cfg = _merge_cfg(cfg)
     weights = full_cfg["weights"]
     kinds = full_cfg["fact_kinds"]
+    term = full_cfg["fact_term"]
+    mode = full_cfg["mode"]
 
     bd = RewardBreakdown()
+    bd.semantic = 0.0 if semantic is None else float(semantic) / full_cfg["semantic_scale"]
     bd.rouge_l = score_pair(
         candidate.strip(), reference.strip(), mode=full_cfg["rouge_mode"]
     )["rouge-l-f"]
     bd.fact_coverage, bd.n_ref_facts, bd.n_missed_facts = fact_coverage(
         candidate, reference, kinds
     )
+    bd.fact_score = fact_score(candidate, reference, kinds)
     bd.length_ratio = len(candidate.strip()) / max(len(reference.strip()), 1)
     if source:
         bd.fact_precision = fact_precision(candidate, source, kinds)
 
-    if full_cfg["mode"] == "flat":
+    # ---- A1：官方指标的裸基线。不过门控、不看事实，回答"传统做法能到哪" ----
+    if mode == "rouge_only":
+        bd.total = bd.rouge_l
+        return bd.total, bd
+
+    # ---- 对照组：所有项加权求和，可以互相补偿 ----
+    if mode == "flat":
         bd.total = (
             weights["rouge_l"] * bd.rouge_l
-            + weights["fact_coverage"] * bd.fact_coverage
+            + weights["fact"] * bd.fact_value(term)
             + weights["length"] * length_reward(candidate, reference)
         )
         return bd.total, bd
@@ -263,10 +356,17 @@ def compute_reward(
         bd.total = 0.0
         return 0.0, bd
 
-    bd.total = (
-        weights["rouge_l"] * bd.rouge_l
-        + weights["fact_coverage"] * bd.fact_coverage
-    )
+    # ---- 主方案：门控 + 事实 F1 + ROUGE-L（+ 可选的裁判语义分）----
+    bd.total = weights["rouge_l"] * bd.rouge_l + weights["fact"] * bd.fact_value(term)
+    if mode == "gated_judge":
+        if semantic is None:
+            # 静默降级成 gated 是最坏的选项：你会以为在跑 A4，其实跑的是 A2。
+            raise ValueError(
+                "mode=gated_judge 需要每条样本都有裁判分，收到 None。"
+                "检查 semantic scorer 是否传给了 compute_rewards，"
+                "以及脚本启动日志里的 '裁判' 行。"
+            )
+        bd.total += weights["semantic"] * bd.semantic
     return bd.total, bd
 
 
@@ -275,12 +375,23 @@ def compute_rewards(
     references: Sequence[str],
     sources: Optional[Sequence[str]] = None,
     cfg: Optional[Dict[str, Any]] = None,
+    semantic_scores: Optional[Sequence[Optional[float]]] = None,
 ) -> List[RewardBreakdown]:
-    """批量打分，返回分项明细列表（GRPO 的 rollout 用这个）。"""
+    """批量打分，返回分项明细列表（GRPO 的 rollout 用这个）。
+
+    `semantic_scores` 是裁判分（原始量程，默认 0-100），由调用方先批量算好
+    再传进来 —— 裁判模型比规则慢几个数量级，必须批处理，不能在这里逐条调用。
+    """
     sources = sources or [None] * len(candidates)
+    if semantic_scores is None:
+        semantic_scores = [None] * len(candidates)
+    if len(semantic_scores) != len(candidates):
+        raise ValueError(
+            f"裁判分个数 {len(semantic_scores)} 与候选数 {len(candidates)} 不一致"
+        )
     return [
-        compute_reward(c, r, s, cfg)[1]
-        for c, r, s in zip(candidates, references, sources)
+        compute_reward(c, r, s, cfg, semantic=sem)[1]
+        for c, r, s, sem in zip(candidates, references, sources, semantic_scores)
     ]
 
 
@@ -299,7 +410,14 @@ def summarize_gate_reasons(breakdowns: Sequence[RewardBreakdown]) -> Dict[str, i
 
 
 def _merge_cfg(override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """把配置和默认值深合并一层，允许只覆盖部分字段。"""
+    """把配置和默认值深合并一层，允许只覆盖部分字段。
+
+    两处兼容处理：
+      * 老配置写的 `weights.fact_coverage` 自动改名为 `weights.fact`
+        （事实项乘 coverage 还是 f1 由 `fact_term` 决定，键名不该跟着变）
+      * `mode: gated_judge` 但权重里没有 semantic → 补上默认权重，否则
+        裁判分乘 0，等于没接
+    """
     import copy
 
     cfg = copy.deepcopy(DEFAULT_REWARD_CFG)
@@ -309,4 +427,8 @@ def _merge_cfg(override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 cfg[key].update(value)
             else:
                 cfg[key] = value
+    if "fact_coverage" in cfg["weights"]:
+        cfg["weights"]["fact"] = cfg["weights"].pop("fact_coverage")
+    if cfg["mode"] == "gated_judge" and "semantic" not in cfg["weights"]:
+        cfg["weights"]["semantic"] = DEFAULT_REWARD_CFG["weights"]["semantic"]
     return cfg

@@ -11,6 +11,7 @@ from __future__ import annotations
 from transformers import PreTrainedModel
 
 from sfzy.models.compat import (
+    ensure_legacy_cache,
     ensure_tp_plan,
     patch_pretrained_config,
     patch_tied_weights_keys,
@@ -298,3 +299,106 @@ def test_ensure_gradient_checkpointing_对自带开关的自定义模型也有�
     model = _Custom()
     assert ensure_gradient_checkpointing(model) is True
     assert all(b.gradient_checkpointing for b in model.layers)
+def test_回填架构属性别名():
+    """ChatGLM3 的 config 只有 num_layers，而新版 transformers 的
+    generate() 在构造 KV cache 时要 num_hidden_layers。
+
+    这个 bug 的症状极有迷惑性：加载 ✓ 前向 ✓ generate() ✗。
+    它骗过了整条训练链路（训练只做前向和反向），要等 SFT 跑完、
+    开始生成三元组时才炸。所以必须单独测。
+    """
+
+    class FakeChatGLMConfig:
+        num_layers = 28
+        multi_query_group_num = 2
+        num_attention_heads = 32
+
+    config = FakeChatGLMConfig()
+    assert not hasattr(config, "num_hidden_layers")
+    patch_pretrained_config(config)
+
+    assert config.num_hidden_layers == 28
+    # 必须优先取 multi_query_group_num（=2）而不是 num_attention_heads（=32），
+    # 否则 KV cache 会按 32 个头分配，显存虚高且形状错
+    assert config.num_key_value_heads == 2
+
+
+def test_已有的架构属性不被覆盖():
+    """模型自己声明过就不要动 —— 回填只补缺失，不覆盖已有值。"""
+
+    class FakeConfig:
+        num_hidden_layers = 12
+        num_layers = 28
+
+    config = FakeConfig()
+    patch_pretrained_config(config)
+    assert config.num_hidden_layers == 12
+
+
+def test_别名缺失时不硬造属性():
+    """别名也不存在时保持缺失，不要凭空造一个 None —— 那会让报错
+    从"缺属性"变成更难懂的"类型错误"。"""
+
+    class Bare:
+        pass
+
+    config = Bare()
+    patch_pretrained_config(config)
+    assert not hasattr(config, "num_hidden_layers")
+def test_按类名自动判断旧版缓存():
+    """类名里带 chatglm 的走旧版缓存路径，其它模型不动。
+
+    ChatGLM3 的远程代码期望自己的 past_key_values 格式，而新版 transformers
+    会传一个惰性分配的 DynamicCache —— 它的 get_masks 直接
+    `past_key_values[0][0].shape[0]`，撞在 None 上。
+    """
+
+    class ChatGLMForConditionalGeneration:
+        @classmethod
+        def _supports_default_dynamic_cache(cls):
+            return True
+
+    class Qwen2ForCausalLM:
+        @classmethod
+        def _supports_default_dynamic_cache(cls):
+            return True
+
+    assert ensure_legacy_cache(ChatGLMForConditionalGeneration()) is True
+    assert ChatGLMForConditionalGeneration._supports_default_dynamic_cache() is False
+
+    # 其它模型不能被误伤
+    assert ensure_legacy_cache(Qwen2ForCausalLM()) is False
+    assert Qwen2ForCausalLM._supports_default_dynamic_cache() is True
+
+
+def test_旧版缓存可以不按类名强制():
+    class Anything:
+        @classmethod
+        def _supports_default_dynamic_cache(cls):
+            return True
+
+    assert ensure_legacy_cache(Anything(), force=True) is True
+    assert Anything._supports_default_dynamic_cache() is False
+
+
+def test_旧版缓存不重复patch():
+    """同一个类被多次加载时，第二次应该直接跳过（返回值 False）。"""
+
+    class ChatGLMConfig:
+        @classmethod
+        def _supports_default_dynamic_cache(cls):
+            return True
+
+    instance = ChatGLMConfig()
+    assert ensure_legacy_cache(instance) is True
+    assert ensure_legacy_cache(instance) is False
+
+
+def test_显式关闭旧版缓存():
+    class ChatGLMForConditionalGeneration:
+        @classmethod
+        def _supports_default_dynamic_cache(cls):
+            return True
+
+    assert ensure_legacy_cache(ChatGLMForConditionalGeneration(), force=False) is False
+    assert ChatGLMForConditionalGeneration._supports_default_dynamic_cache() is True

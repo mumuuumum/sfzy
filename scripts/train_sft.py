@@ -47,6 +47,7 @@ from sfzy.utils.distributed import (                     # noqa: E402
 from sfzy.utils.logging import get_logger                # noqa: E402
 from sfzy.utils.seed import set_seed                     # noqa: E402
 from sfzy.utils.tracking import build_tracker, make_run_name  # noqa: E402
+import logging
 
 logger = get_logger("train_sft")
 
@@ -128,6 +129,8 @@ def main() -> None:
 
     # ---------------- 1. 环境 ----------------
     local_rank = init_distributed()
+    if not is_main_process():
+        logging.getLogger("sfzy").setLevel(logging.WARNING)
     set_seed(cfg.get("seed", 42))
     device = pick_device(cfg.get("device", "auto"))
     logger.info("设备: %s", device)

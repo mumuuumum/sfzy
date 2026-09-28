@@ -22,6 +22,7 @@ from sfzy.rl.reward import (
     extract_facts,
     fact_coverage,
     fact_precision,
+    fact_score,
     length_reward,
     summarize_gate_reasons,
 )
@@ -134,6 +135,52 @@ def test_精确率_候选没写事实时返回1():
     assert fact_precision("被告应当归还借款", "经查被告欠48000元") == 1.0
 
 
+# ---------------------------------------------------------------- 对称 F1
+
+def test_事实F1_两边都没写事实时满分():
+    """★ 这是换掉 coverage 的全部理由之一。
+
+    参考里没有事实的样本占 38.3%（含事实）之外的那 61.7%。旧口径返回 0，
+    而 0 在组内是常数 —— GRPO 组内归一化会把它抵消掉，整组零梯度。
+    """
+    assert fact_score("被告应当归还借款", "被告应当归还借款") == 1.0
+
+
+def test_事实F1_参考没写但候选写了要扣分():
+    """★ 另一半理由。实测：参考无事实的 827 条里，模型多写 3 个以上数字时
+    官方总分从 0.5912 掉到 0.4921，而旧口径对此毫无惩罚。"""
+    assert fact_score("判令被告支付48000元", "被告应当归还借款") == 0.0
+
+
+def test_事实F1_参考写了但候选漏了要扣分():
+    assert fact_score("被告应当归还借款", "判令归还48000元") == 0.0
+
+
+def test_事实F1_全命中():
+    assert fact_score("判令被告支付48000元", "判令被告支付48000元") == 1.0
+
+
+def test_事实F1_单位不同也算命中():
+    assert fact_score("判令归还4.8万元", "判令归还48000元") == 1.0
+
+
+def test_事实F1_部分命中取调和平均():
+    # 参考 2 个事实 {48000, 2015-07-19}，候选 1 个 {48000}
+    # P = 1/1, R = 1/2 → F1 = 2*1*0.5/1.5 = 2/3
+    cand = "判令支付48000元"
+    ref = "判令支付48000元，于2015年7月19日付清"
+    assert fact_score(cand, ref) == pytest.approx(2 / 3)
+
+
+def test_事实F1_多写了参考没有的也要扣分():
+    """堆数字刷分会被 F1 惩罚：precision 掉下来。"""
+    ref = "判令归还48000元"
+    cand = "判令归还48000元，另支付99999元和88888元"
+    # P=1/3, R=1 → F1 = 2*1/3*1/(1/3+1) = 0.5。写对的那一个盖不住多堆的两个。
+    assert fact_score(cand, ref) == pytest.approx(0.5)
+    assert fact_score(cand, ref) < fact_score("判令归还48000元", ref)
+
+
 # ---------------------------------------------------------------- 门控
 
 REF = "原被告系借款合同纠纷。原告请求判令被告归还借款本金48000元及利息。本院认为借贷关系合法有效。判决如下：被告归还原告48000元。"
@@ -184,7 +231,8 @@ def test_gated模式_被门控时总分是0():
 def test_gated模式_通过后按权重组合():
     score, bd = compute_reward(REF, REF)
     assert bd.gated is False
-    expected = 0.5 * bd.rouge_l + 0.5 * bd.fact_coverage
+    # 默认权重 0.3 ROUGE / 0.4 事实 / 0.3 裁判（gated 模式不用裁判）
+    expected = 0.3 * bd.rouge_l + 0.4 * bd.fact_score
     assert score == pytest.approx(expected)
 
 
@@ -206,6 +254,7 @@ def test_两种模式的分项相同():
     _, bd_flat = compute_reward(REF, REF, cfg={"mode": "flat"})
     assert bd_gated.rouge_l == bd_flat.rouge_l
     assert bd_gated.fact_coverage == bd_flat.fact_coverage
+    assert bd_gated.fact_score == bd_flat.fact_score
     assert bd_gated.length_ratio == bd_flat.length_ratio
 
 
@@ -232,9 +281,53 @@ def test_长度奖励():
 
 
 def test_权重可覆盖():
-    cfg = {"weights": {"rouge_l": 1.0, "fact_coverage": 0.0, "length": 0.0}}
+    cfg = {"weights": {"rouge_l": 1.0, "fact": 0.0, "length": 0.0}}
     score, bd = compute_reward(REF, REF, cfg=cfg)
     assert score == pytest.approx(bd.rouge_l)
+
+
+def test_旧配置的fact_coverage键仍被识别():
+    """老 yaml 写的是 weights.fact_coverage。改名不该让老配置静默失效 ——
+    静默失效的表现是"事实项乘了 0，等于没接"，很难发现。"""
+    cfg = {"weights": {"rouge_l": 0.0, "fact_coverage": 1.0}}
+    score, bd = compute_reward(REF, REF, cfg=cfg)
+    assert score == pytest.approx(bd.fact_score)
+
+
+# ---------------------------------------------------------------- 四种模式
+
+def test_rouge_only模式_裸官方指标():
+    """A1 对照组：不过门控、不看事实，回答"传统 RLVR 能到哪"。"""
+    short_score, bd_short = compute_reward("太短", REF, cfg={"mode": "rouge_only"})
+    assert bd_short.gated is False                       # 不过门控，这就是对照组的定义
+    assert short_score == pytest.approx(bd_short.rouge_l)
+    long_score, _ = compute_reward(REF, REF, cfg={"mode": "rouge_only"})
+    assert long_score > short_score
+
+
+def test_gated_judge模式_加入裁判分():
+    cfg = {"mode": "gated_judge"}
+    s_low, bd_low = compute_reward(REF, REF, cfg=cfg, semantic=20.0)
+    s_high, bd_high = compute_reward(REF, REF, cfg=cfg, semantic=90.0)
+    assert bd_low.semantic == pytest.approx(0.2)
+    assert bd_high.semantic == pytest.approx(0.9)
+    assert s_high > s_low
+    assert s_high - s_low == pytest.approx(0.3 * 0.7)
+
+
+def test_gated_judge模式_缺裁判分要报错而不是降级():
+    """静默降级成 gated 是最坏的结果：你会以为在跑 A4，其实跑的是 A2。"""
+    with pytest.raises(ValueError, match="gated_judge"):
+        compute_reward(REF, REF, cfg={"mode": "gated_judge"})
+
+
+def test_非judge模式也记录裁判分但不计分():
+    """同一个 checkpoint 换口径离线重打分要免费。"""
+    cfg = {"mode": "gated"}
+    s_with, bd_with = compute_reward(REF, REF, cfg=cfg, semantic=90.0)
+    s_without, _ = compute_reward(REF, REF, cfg=cfg)
+    assert bd_with.semantic == pytest.approx(0.9)
+    assert s_with == pytest.approx(s_without)
 
 
 # ---------------------------------------------------------------- 批量与统计
@@ -243,6 +336,20 @@ def test_批量打分():
     out = compute_rewards([REF, "太短"], [REF, REF])
     assert len(out) == 2
     assert out[1].gated is True
+
+
+def test_批量打分_裁判分个数必须对齐():
+    with pytest.raises(ValueError, match="裁判分个数"):
+        compute_rewards([REF, REF], [REF, REF], semantic_scores=[80.0])
+
+
+def test_批量打分_带裁判分():
+    out = compute_rewards(
+        [REF, REF], [REF, REF], cfg={"mode": "gated_judge"},
+        semantic_scores=[10.0, 90.0],
+    )
+    assert out[0].semantic == pytest.approx(0.1)
+    assert out[1].total > out[0].total
 
 
 def test_门控原因统计():
@@ -256,4 +363,14 @@ def test_门控原因统计():
 
 def test_默认配置是gated模式():
     assert DEFAULT_REWARD_CFG["mode"] == "gated"
-    assert set(DEFAULT_REWARD_CFG["weights"]) == {"rouge_l", "fact_coverage", "length"}
+    assert set(DEFAULT_REWARD_CFG["weights"]) == {"rouge_l", "fact", "semantic", "length"}
+    assert DEFAULT_REWARD_CFG["fact_term"] == "f1"
+
+
+def test_分项明细能导出():
+    """训练日志要把分项都记下来 —— 只盯总分判断不出"好在哪"。"""
+    _, bd = compute_reward(REF, REF)
+    d = bd.to_dict()
+    for key in ("reward", "reward_rouge_l", "reward_fact_score", "reward_semantic",
+                "fact_precision", "gated"):
+        assert key in d

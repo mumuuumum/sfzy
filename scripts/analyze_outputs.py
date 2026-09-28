@@ -68,16 +68,51 @@ def q(values, p):
     return a[min(int(len(a) * p), len(a) - 1)]
 
 
+def _pearson(xs, ys) -> float:
+    """皮尔逊相关。这一节要看的是"裁判分和 ROUGE 是不是同一个信号"，
+    相关高说明新指标没带来新信息 —— 那就不值一个 7B 裁判的成本。"""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx, my = st.mean(xs), st.mean(ys)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    dx = math.sqrt(sum((x - mx) ** 2 for x in xs))
+    dy = math.sqrt(sum((y - my) ** 2 for y in ys))
+    return num / (dx * dy) if dx > 0 and dy > 0 else 0.0
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="观察模型输出的诊断报告")
-    parser.add_argument("--input", required=True, help="三元组 jsonl")
+    parser.add_argument("--input", required=True, nargs="+",
+                        help="一个或多个三元组 jsonl，支持通配符。"
+                             "多卡推理会产出多个分片文件，这里直接全部读进来，"
+                             "不用手动 cat 合并（手动合并容易漏或重复）")
     parser.add_argument("--rouge-mode", default="jieba", choices=["char", "jieba"])
+    parser.add_argument("--judge-file", nargs="*", default=None,
+                        help="裁判分 jsonl（scripts/judge_score.py 的产物）。"
+                             "给了就多打一节语义指标；多个文件按 id 合并")
     parser.add_argument("--top-examples", type=int, default=3)
     args = parser.parse_args()
 
-    recs = load(ROOT / args.input if not Path(args.input).is_absolute() else Path(args.input))
+    paths: list[Path] = []
+    for pattern in args.input:
+        p = Path(pattern) if Path(pattern).is_absolute() else ROOT / pattern
+        matched = sorted(p.parent.glob(p.name))
+        if not matched:
+            raise FileNotFoundError(f"没有匹配到文件：{pattern}")
+        paths.extend(matched)
+
+    seen, recs = set(), []
+    for p in paths:
+        for r in load(p):
+            if r["id"] not in seen:       # 分片之间有重叠时去重，避免重复计数
+                seen.add(r["id"])
+                recs.append(r)
     n = len(recs)
-    print(f"\n{'='*72}\n输入: {args.input}\n样本数: {n}\n{'='*72}")
+    print(f"\n{'='*72}\n输入 {len(paths)} 个文件，去重后 {n} 条")
+    for p in paths:
+        print(f"  {p.relative_to(ROOT) if str(p).startswith(str(ROOT)) else p}")
+    print('='*72)
 
     # ---------------- 1. ROUGE ----------------
     scores = [score_pair(r["output"].strip(), r["reference"].strip(), mode=args.rouge_mode)
@@ -126,6 +161,40 @@ def main() -> None:
     print(f"  比值: 中位数 {st.median(ratios):.2f}  P90 {q(ratios,0.9):.2f}")
     print(f"  长 30%+ 的占 {sum(1 for x in ratios if x>1.3)/n:.1%}"
           f"   短 30%+ 的占 {sum(1 for x in ratios if x<0.7)/n:.1%}")
+
+    # ---------------- 3.5 语义指标（裁判）----------------
+    # 为什么单独一节：语义分和 ROUGE 是两套口径，混在一起算平均没有意义。
+    # 判据是"语义涨、ROUGE 不跌"，所以必须并排看。
+    judge_by_id: dict = {}
+    for pattern in (args.judge_file or []):
+        jp = Path(pattern) if Path(pattern).is_absolute() else ROOT / pattern
+        for jpath in sorted(jp.parent.glob(jp.name)):
+            for line in open(jpath, encoding="utf-8"):
+                line = line.strip()
+                if line:
+                    j = json.loads(line)
+                    if j.get("judge_score") is not None:
+                        judge_by_id[str(j["id"])] = float(j["judge_score"])
+    if judge_by_id:
+        paired = [(judge_by_id[str(r["id"])], scores[i]["rouge-l-f"], covs[i], ratios[i])
+                  for i, r in enumerate(recs) if str(r["id"]) in judge_by_id]
+        js = [p[0] for p in paired]
+        print("\n【3.5】语义指标（LLM 裁判）")
+        print(f"  覆盖 {len(paired)}/{n} 条")
+        print(f"  裁判分: 均值 {st.mean(js):.2f}  中位数 {st.median(js):.2f}  "
+              f"标准差 {st.pstdev(js):.2f}  P10 {q(js,0.1):.1f}  P90 {q(js,0.9):.1f}")
+        distinct = len({round(x, 1) for x in js})
+        note = ""
+        if distinct < 0.3 * len(js):
+            note = "  ← 取值太集中，裁判在给模板分：检查 rubric 的档位描述和温度"
+        print(f"  不同取值 {distinct} 个 / {len(js)} 条{note}")
+        corr_rl = _pearson([p[0] for p in paired], [p[1] for p in paired])
+        corr_cov = _pearson([p[0] for p in paired], [p[2] for p in paired])
+        corr_len = _pearson([p[0] for p in paired], [p[3] for p in paired])
+        print(f"  与 ROUGE-L 相关 {corr_rl:+.3f}  与事实覆盖 {corr_cov:+.3f}  "
+              f"与长度比 {corr_len:+.3f}")
+        print("  ← 和 ROUGE 相关太高（>0.9）说明它没带来新信息；"
+              "和长度比相关太高说明它在奖励写长")
 
     # ---------------- 4. 格式坍缩 ----------------
     out_ent = opening_entropy([r["output"] for r in recs])

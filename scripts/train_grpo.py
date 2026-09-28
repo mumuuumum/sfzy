@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                       # noqa: E402
+from sfzy.eval.metrics import build_scorer                # noqa: E402
 from sfzy.models.loader import build_quant_config, load_model, load_tokenizer  # noqa: E402
 from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
 from sfzy.rl.trainer import GRPOTrainer                   # noqa: E402
@@ -74,6 +75,12 @@ def main() -> None:
     parser.add_argument("--limit-prompts", type=int, default=None,
                         help="只用前 N 个 prompt，用来跑最小闭环")
     parser.add_argument("--resume", default=None)
+    parser.add_argument("--quantize", action="store_true",
+                        help="允许 4-bit 量化加载。默认关闭 —— 策略精度必须和 SFT "
+                             "训练时一致，只有显存真的不够才开")
+    parser.add_argument("--judge-backend", default=None,
+                        choices=["local", "api", "cache", "none"],
+                        help="覆盖 semantic.backend：临时换成 API 裁判 / 临时关掉")
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
 
@@ -100,6 +107,16 @@ def main() -> None:
 
     logger.info("加载模型: %s", model_cfg.get("model_name_or_path"))
     tokenizer = load_tokenizer(model_cfg)
+    # 和 generate_triples.py 同一条约束：**策略模型的精度必须和 SFT 一致**。
+    # LoRA adapter 是在非量化底座上训出来的，换成 4-bit 底座会引入量化误差；
+    # 而 RL 阶段是在这个（已经带误差的）策略上继续优化，误差会被放大。
+    if model_cfg.get("load_in_4bit") and not args.quantize:
+        logger.warning(
+            "模型配置里 load_in_4bit=True，但 GRPO 默认强制关闭量化："
+            "SFT 用的是非量化底座，策略必须一致。确实需要 4-bit 请显式传 --quantize"
+        )
+        model_cfg = {**model_cfg, "load_in_4bit": False}
+
     model = load_model(model_cfg, quant_config=build_quant_config(model_cfg),
                        gradient_checkpointing=rl_cfg.get("gradient_checkpointing", True))
     if model_cfg.get("device_map") in (None, "", "none"):
@@ -146,8 +163,27 @@ def main() -> None:
     if args.limit_prompts:
         prompts = prompts[: args.limit_prompts]
     logger.info("prompt 池: %d 条", len(prompts))
+    n_with_sft = sum(1 for p in prompts if p.get("sft_output"))
+    logger.info("其中带 SFT 输出（基线锚要用）: %d 条", n_with_sft)
     if len(prompts) < rl_cfg.get("prompts_per_step", 4):
         raise ValueError("prompt 数少于每步用量，没法训练")
+
+    # ---------------- 语义裁判 ----------------
+    # 裁判是独立模型，和策略**分卡放**：策略吃满卡 0，裁判在卡 1。
+    # 用 API 后端的话不占显存，但每次 rollout 都要等网络。
+    # 只有真的要裁判时才加载它 —— 一个 7B 裁判白占 15G 显存，
+    # 跑 A1/A2/A3 对照组时不该付这个代价。
+    reward_mode = (rl_cfg.get("reward") or {}).get("mode", "gated")
+    want_judge = reward_mode == "gated_judge" or args.judge_backend not in (None, "none")
+    scorer = build_scorer(cfg.get("semantic"), override=args.judge_backend) if want_judge else None
+    if scorer is not None:
+        logger.info(
+            "语义裁判: %s（backend=%s）",
+            getattr(scorer, "name", "unknown"),
+            args.judge_backend or cfg.path_("semantic.backend"),
+        )
+    else:
+        logger.info("未启用语义裁判（reward.mode 不含 judge 时这是正常的）")
 
     # ---------------- tracker ----------------
     tracker_cfg = cfg.get("tracking", {})
@@ -165,7 +201,7 @@ def main() -> None:
     trainer = GRPOTrainer(
         model=model, tokenizer=tokenizer, cfg=cfg,
         output_dir=str(resolve(rl_cfg.get("output_dir", "outputs/grpo"))),
-        tracker=tracker, is_main_process=is_main_process(),
+        tracker=tracker, is_main_process=is_main_process(), scorer=scorer,
     )
     trainer.resume(args.resume)
     state = trainer.train(prompts)

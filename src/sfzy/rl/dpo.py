@@ -80,8 +80,16 @@ def sequence_logprob(
     safe_targets = labels.masked_fill(~mask, 0)
 
     target_logits = logits.gather(-1, safe_targets.unsqueeze(-1)).squeeze(-1)
-    log_z = torch.logsumexp(logits, dim=-1, dtype=torch.float32)
-    token_logprobs = target_logits.float() - log_z
+    # **不要给 logsumexp 传 dtype。** torch.logsumexp 没有这个参数（只有
+    # log_softmax 有），传了直接 TypeError —— 而这条路径在本地从未被执行过，
+    # 所以直到 GRPO 冒烟测试才发现（tests/test_smoke_grpo.py）。
+    #
+    # 也**不要写 logsumexp(logits.float())**：那会复制一份完整的 B×L×V fp32
+    # 张量（batch 32 / seq 2432 / vocab 65024 ≈ 20GB），正是上面第三条要避免的。
+    # PyTorch 的 logsumexp 对半精度输入内部按 fp32 累加，直接算就是稳的；
+    # 需要 fp32 的只有最后这个 (B, L) 量级的减法。
+    log_z = torch.logsumexp(logits, dim=-1)
+    token_logprobs = target_logits.float() - log_z.float()
 
     return (token_logprobs * mask).sum(dim=-1)
 

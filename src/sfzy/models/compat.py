@@ -157,6 +157,92 @@ def patch_pretrained_config(config: Any, model_cfg: Optional[Dict[str, Any]] = N
         if not hasattr(config, field):
             setattr(config, field, value)
 
+    _patch_arch_aliases(config)
+
+
+# 架构属性的别名表：左边是新版 transformers 期望的名字，右边是 ChatGLM3
+# 实际用的名字（按优先级排列）。
+# 注意这些**不是** generation 配置项，所以上面那轮 GenerationConfig 回填
+# 覆盖不到它们，必须单独处理。
+_ARCH_ALIASES: Dict[str, tuple] = {
+    "num_hidden_layers": ("num_layers",),
+    "num_key_value_heads": ("multi_query_group_num", "num_attention_heads"),
+}
+
+
+def _patch_arch_aliases(config: Any) -> None:
+    """把 ChatGLM3 的架构属性名补成新版 transformers 期望的名字。
+
+    不补会怎样 —— 症状非常有迷惑性：
+
+        加载模型   ✓
+        前向一次   ✓
+        generate() ✗
+
+        AttributeError: 'ChatGLMConfig' object has no attribute 'num_hidden_layers'
+
+    崩在 `generation/utils.py` 的 `_prepare_cache_for_generation`：新版
+    transformers 构造 DynamicCache 时要 `decoder_config.num_hidden_layers`，
+    而 ChatGLM3 的 config 只有 `num_layers`。
+
+    **这个 bug 骗过了整条训练链路** —— 训练只做前向和反向，一次都不会碰
+    到 generate()。要等跑了几个小时的 SFT、开始生成三元组时才炸。
+    所以 check_model.py 现在会真的调一次 generate()。
+
+    只补"缺失 + 别名明确"的属性，不做猜测；拿不准的走
+    `model_cfg["config_patches"]` 显式指定。
+    """
+    for canonical, aliases in _ARCH_ALIASES.items():
+        if hasattr(config, canonical):
+            continue
+        for alias in aliases:
+            value = getattr(config, alias, None)
+            if value is not None:
+                setattr(config, canonical, value)
+                break
+
+
+def ensure_legacy_cache(model: Any, force: Optional[bool] = None) -> bool:
+    """让不兼容 DynamicCache 的模型（ChatGLM3）退回**旧版缓存路径**。
+
+    不处理会怎样 —— 训练全绿，生成崩溃：
+
+        modeling_chatglm.py:688, in get_masks
+            past_length = past_key_values[0][0].shape[0]
+        AttributeError: 'NoneType' object has no attribute 'shape'
+
+    原因是两套缓存约定对不上：
+      * 新版 transformers 的 generate() 默认造一个 `DynamicCache` 传给模型，
+        而它是**惰性分配**的 —— 初始时每层的 key/value 都是 None；
+      * ChatGLM3 的远程代码期望的是它自己的格式（list of (key, value) 元组）。
+
+    ChatGLM3 的 `get_masks` 里其实有 `if past_key_values:` 的判断，但
+    `DynamicCache` 实现了 `__len__`（28 层 > 0），所以判断为真，走进了崩溃分支。
+
+    **解法是让 `_supports_default_dynamic_cache()` 返回 False。** 见
+    `generation/utils.py` 的 "Quick escape route 3"：这时 generate() 直接
+    跳过 cache 的构造，退回旧版路径 —— 由模型自己维护 past_key_values，
+    正好是 ChatGLM3 期望的格式。
+
+    **为什么不用 `use_cache=False`。** 那条路每生成一个 token 都要重算整个
+    前缀（4096 token 的 prompt + 384 token 输出 → 计算量差几百倍）。
+    旧版缓存路径是**正常的增量解码**，只是缓存对象由模型自己管。
+
+    force 为 None 时按类名自动判断（含 chatglm 的走旧版），也可以由
+    model_cfg 显式覆盖。
+    """
+    cls = type(model)
+    if force is None:
+        force = "chatglm" in cls.__name__.lower()
+    if not force or getattr(cls, "_sfzy_legacy_cache_patched", False):
+        return False
+
+    # 这是 GenerationMixin 上的 classmethod，覆盖到具体模型类上即可。
+    # 打成标记避免重复 patch（同一个类可能被多次加载）。
+    cls._supports_default_dynamic_cache = classmethod(lambda _cls: False)
+    cls._sfzy_legacy_cache_patched = True
+    return True
+
 
 def resolve_padding_side(model_cfg: Optional[Dict[str, Any]] = None, default: str = "left") -> str:
     """决定 tokenizer 的 padding 方向。

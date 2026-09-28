@@ -86,6 +86,47 @@
       "console": "integratedTerminal",
       "purpose": ["debug-test"],
       "justMyCode": true
+    },
+    {
+      // 分析 SFT 模型在验证集上的输出。两个分片一起读进来、按 id 去重。
+      //
+      // 注意 --input 传的是**通配符字符串**，不是让 shell 展开的文件列表 ——
+      // VS Code 的 args 不经过 shell，所以通配符会原样传给 Python，由
+      // analyze_outputs.py 内部用 glob 展开。这是刻意的：手动列文件名
+      // 容易漏或重复，通配符让"分片数量变了"不用改配置。
+      //
+      // 纯 CPU，不需要 GPU —— 想仔细跟某一步（比如去看某个样本为什么漏了
+      // 事实）就在 reward.fact_coverage 或 extract_facts 里下断点。
+      "name": "分析 · SFT 三元组（两个分片）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/analyze_outputs.py",
+      "args": [
+        "--input", "data/triples/sft_val_shard*.jsonl",
+        "--top-examples", "3"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+      "justMyCode": true
+    },
+    {
+      // GRPO 之后的对比分析。分片文件还不存在时会报"没有匹配到文件"，
+      // 那是预期的 —— 等 GRPO 跑完、生成完三元组再切到这个配置。
+      "name": "分析 · GRPO 三元组（两个分片）",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/scripts/analyze_outputs.py",
+      "args": [
+        "--input", "data/triples/grpo_val_shard*.jsonl",
+        "--top-examples", "3"
+      ],
+      "cwd": "${workspaceFolder}",
+      "python": "/home/yukino/anaconda3/envs/minimind/bin/python",
+      "console": "integratedTerminal",
+      "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+      "justMyCode": true
     }
   ]
 }

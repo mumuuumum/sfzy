@@ -51,7 +51,7 @@ def main() -> None:
     model_cfg = load_config(ROOT / args.config).get("model", {})
     name = model_cfg.get("model_name_or_path")
 
-    print("[1/7] 环境版本")
+    print("[1/8] 环境版本")
     for pkg in PACKAGES:
         try:
             print(f"      {pkg:16s} {md.version(pkg)}")
@@ -59,13 +59,13 @@ def main() -> None:
             print(f"      {pkg:16s} ✗ 未安装")
     print(f"      cuda available   {torch.cuda.is_available()}")
 
-    print(f"[2/7] 加载 tokenizer: {name}")
+    print(f"[2/8] 加载 tokenizer: {name}")
     tokenizer = load_tokenizer(model_cfg)
     print(f"      pad_token_id={tokenizer.pad_token_id}  "
           f"eos_token_id={tokenizer.eos_token_id}  "
           f"padding_side={tokenizer.padding_side}")
 
-    print("[3/7] 渲染 chat template")
+    print("[3/8] 渲染 chat template")
     try:
         text = tokenizer.apply_chat_template(DEMO_MESSAGES, tokenize=False,
                                              add_generation_prompt=True)
@@ -75,7 +75,7 @@ def main() -> None:
         raise SystemExit(1)
     print(f"      渲染结果（前 200 字）：\n{text[:200]}")
 
-    print("[4/7] 加载模型")
+    print("[4/8] 加载模型")
     quant_config = build_quant_config(model_cfg)
     # **必须和训练用同一个梯度检查点设置。**
     # 早先这里写死 False，于是"配置要求开、实际没开"这种情况结构上就不可能被发现
@@ -98,7 +98,7 @@ def main() -> None:
         print("        训练时激活值会按「每层完整保存」算，几乎必然 OOM")
         raise SystemExit(1)
 
-    print("[5/7] 检查 LoRA 目标层是否存在")
+    print("[5/8] 检查 LoRA 目标层是否存在")
     targets = (args.target_modules.split(",") if args.target_modules
                else load_config(ROOT / "configs/sft_kaggle.yaml").path_("lora.target_modules", []))
     replaced = inject_lora(model, target_modules=targets, r=8, alpha=16)
@@ -116,7 +116,7 @@ def main() -> None:
 
     device = next(model.parameters()).device
 
-    print("[6/7] 走一遍我们自己的 collator（训练真正用的路径）")
+    print("[6/8] 走一遍我们自己的 collator（训练真正用的路径）")
     # 前几步调的都是 tokenizer / 模型的**原生接口**，这一步才走我们自己的代码。
     # 实测踩过一次：ChatGLM3 的 apply_chat_template(tokenize=True) 返回
     # BatchEncoding，而 Qwen 返回 list —— 只有到了 collator 里做
@@ -141,7 +141,7 @@ def main() -> None:
         print("      ✗ 答案段全被 mask 掉了 —— 模型永远学不会生成")
         raise SystemExit(1)
 
-    print("[7/7] 前向 + 反向一次，确认梯度能传下去")
+    print("[7/8] 前向 + 反向一次，确认梯度能传下去")
     inputs = tokenizer(text, return_tensors="pt").to(device)
     model.train()
     # 传 labels 让模型内部算 loss —— 和训练时走的是同一条路
@@ -164,7 +164,30 @@ def main() -> None:
             "走一步更新后 A 才会有梯度信号。"
         )
 
-    print("\n✓ 七步全部通过。可以开始训练了。")
+    print("[8/8] generate() 一次，确认推理路径能跑")
+    # **这一步不能省。** 上面七步全绿但 generate() 崩的情况是真实存在的：
+    # ChatGLM3 的 config 只有 num_layers，而 generate() 构造 KV cache 时要读
+    # num_hidden_layers —— 报错落在 transformers 的 cache_utils 里，
+    # 栈里看不到任何我们自己的代码。
+    #
+    # 症状极有迷惑性：加载 ✓ 前向 ✓ 反向 ✓ generate() ✗。
+    # 训练只做前向和反向，一次都不会碰 generate()，所以这个 bug 骗过了
+    # 整条训练链路 —— 要等 SFT 跑了几小时、开始生成三元组时才炸。
+    # 生成和训练走的是两条不同的 transformers 代码路径，两条都要验。
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(
+            **inputs, max_new_tokens=8, do_sample=False,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+    new_tokens = generated.shape[1] - inputs["input_ids"].shape[1]
+    print(f"      生成 {new_tokens} 个 token，输出形状 {tuple(generated.shape)}")
+    if new_tokens <= 0:
+        print("      ✗ 一个 token 都没生成出来")
+        raise SystemExit(1)
+
+    print("\n✓ 八步全部通过。可以开始训练和生成三元组了。")
 
 
 if __name__ == "__main__":

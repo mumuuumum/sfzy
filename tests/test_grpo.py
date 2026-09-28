@@ -22,6 +22,7 @@ from sfzy.rl.grpo import (
     grpo_loss,
     kl_penalty,
     length_normalize,
+    mask_advantages,
 )
 
 
@@ -73,6 +74,35 @@ def test_组掩码_过滤无区分度的组():
 def test_组掩码_全部有区分度():
     rewards = torch.tensor([[1.0, 2.0], [5.0, 6.0]])
     assert group_mask(rewards).all()
+
+
+def test_组掩码_基线锚过滤掉整体退步的组():
+    """组内最好的那条都不如 SFT 基线 → 这一组强化出来的只是"较不差"，
+    丢掉它。这是防止整体退化的**非线性**手段。"""
+    rewards = torch.tensor([[1.0, 2.0, 3.0, 4.0], [0.1, 0.2, 0.3, 0.4]])
+    baseline = torch.tensor([3.5, 3.5])
+    mask = group_mask(rewards, baseline=baseline, slack=0.0)
+    assert mask.tolist() == [True, False]
+
+
+def test_组掩码_基线锚的容差():
+    """slack 之内算"这一组的相对排序仍有意义"，不该被丢掉。"""
+    rewards = torch.tensor([[0.1, 0.2, 0.3, 3.3]])
+    baseline = torch.tensor([3.5])
+    assert group_mask(rewards, baseline=baseline, slack=0.0).tolist() == [False]
+    assert group_mask(rewards, baseline=baseline, slack=0.5).tolist() == [True]
+
+
+def test_组掩码_没有基线时行为和原来一致():
+    rewards = torch.tensor([[1.0, 2.0], [5.0, 5.0]])
+    assert group_mask(rewards).tolist() == [True, False]
+
+
+def test_掩码把被过滤组的advantage置零():
+    adv = torch.tensor([1.0, 2.0, 3.0, 4.0])
+    keep = torch.tensor([True, False])
+    out = mask_advantages(adv, keep, group_size=2)
+    assert out.tolist() == [1.0, 2.0, 0.0, 0.0]
 
 
 # ---------------------------------------------------------------- 长度归一化

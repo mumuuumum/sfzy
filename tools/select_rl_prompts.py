@@ -50,6 +50,9 @@ def main() -> None:
                         help="按哪些事实类型筛。默认只看金额（信号最强、占比最高 35.2%%）")
     parser.add_argument("--shuffle", action="store_true",
                         help="选完之后打乱顺序（默认按事实个数降序，先练难的）")
+    parser.add_argument("--triples", default=None,
+                        help="SFT 三元组 jsonl（含 id/output）。给了就把 SFT 输出挂到 "
+                             "每个 prompt 的 sft_output 字段上，训练时用来做基线锚")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -80,6 +83,33 @@ def main() -> None:
 
     if args.shuffle:
         random.Random(args.seed).shuffle(selected)
+
+    # ---- 挂上 SFT 输出（可选的基线锚要用）----
+    if args.triples:
+        tpath = ROOT / args.triples if not Path(args.triples).is_absolute() else Path(args.triples)
+        by_id: dict = {}
+        for line in open(tpath, encoding="utf-8"):
+            line = line.strip()
+            if line:
+                r = json.loads(line)
+                by_id[r["id"]] = r["output"]
+        hit = 0
+        for r in selected:
+            if r["id"] in by_id:
+                r["sft_output"] = by_id[r["id"]]
+                hit += 1
+        print(f"\n从 {tpath.name} 挂上 SFT 输出：{hit}/{len(selected)} 条")
+        if hit < len(selected):
+            print("  缺的那些在训练时不会被锚过滤（等价于不启用），不会报错")
+            print("  ⚠ 常见原因：三元组是 **val** 上的，而 prompt 池来自 **train**，"
+                  "两边 id 不重叠。\n"
+                  "    要用基线锚就得给 prompt 池这批文书本身生成三元组：\n"
+                  "      python scripts/generate_triples.py --config <cfg> "
+                  "--adapter <sft.pt> \\\n"
+                  f"          --input {args.out} "
+                  "--out data/triples/sft_rlpool.jsonl\n"
+                  "    （必须用 --input 指池子文件；--split train --limit 拿到的是"
+                  " train 的前 N 条，和池子的 id 对不上）")
 
     out_path = ROOT / args.out if not Path(args.out).is_absolute() else Path(args.out)
     ensure_dir(out_path.parent)

@@ -22,6 +22,60 @@ from sfzy.utils.logging import get_logger
 logger = get_logger("infer")
 
 
+def uses_native_generation(model: Any) -> bool:
+    """这个模型要不要走**它自己的**生成循环。
+
+    ChatGLM3 的远程代码（2023 年）和现代 transformers 的 generation loop
+    有多处不兼容，而且是**逐层暴露**的，每修一层都要重跑一次几小时的生成：
+
+        1. config 缺 num_hidden_layers      → 构造 KV cache 时 AttributeError
+        2. DynamicCache 与它的 past_key_values 格式不匹配 → get_masks 崩
+        3. 带 padding 的批量输入             → attention_mask 尺寸对不上
+        4. 缓存元组结构不一致                → cache_k, cache_v = kv_cache 崩
+
+    这不是配置错误，是**时间差** —— 作者的代码冻结在原地，transformers
+    一直在演进。逐个打补丁填不完。
+
+    好在作者自己写了生成循环 `stream_generate`，它和模型自己的缓存格式、
+    position_ids 计算完全配套。所以我们只借用它的 forward：
+
+        prompt 构造  ← 我们（apply_chat_template，与 SFT 训练严格一致）
+        生成循环     ← ChatGLM3 自己（stream_generate）
+
+    这样 prompt 仍然对齐，而缓存/掩码的所有兼容问题一次性绕开。
+    """
+    return hasattr(model, "stream_generate")
+
+
+def _generate_native(
+    model: Any,
+    input_ids: torch.Tensor,
+    max_new_tokens: int,
+    do_sample: bool,
+    temperature: float,
+    top_p: float,
+    repetition_penalty: float,
+) -> torch.Tensor:
+    """用模型自己的 stream_generate 生成，返回**完整序列（含 prompt）**。
+
+    `stream_generate` 是个**生成器**，每步 yield 一次"至今为止的完整序列"。
+    所以要把它耗完、取最后一次的输出 —— 用 for 循环的循环变量天然就是最后一次。
+
+    采样参数通过 `**kwargs` 透传 —— GRPO 的 rollout 依赖它们。
+    """
+    kwargs: Dict[str, Any] = dict(max_new_tokens=max_new_tokens, do_sample=do_sample)
+    if do_sample:
+        kwargs.update(temperature=temperature, top_p=top_p)
+    if repetition_penalty and repetition_penalty != 1.0:
+        kwargs["repetition_penalty"] = repetition_penalty
+
+    last = input_ids
+    with torch.no_grad():
+        for last in model.stream_generate(input_ids=input_ids, **kwargs):
+            pass
+    return last
+
+
 def generate_one(
     model: Any,
     tokenizer: Any,
@@ -60,19 +114,26 @@ def generate_one(
     device = next(model.parameters()).device
     input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
 
-    gen_kwargs: Dict[str, Any] = dict(
-        max_new_tokens=max_new_tokens,
-        do_sample=do_sample,
-        repetition_penalty=repetition_penalty,
-        pad_token_id=tokenizer.pad_token_id,
-        eos_token_id=tokenizer.eos_token_id,
-    )
-    # temperature / top_p 只在采样时有意义；贪心时传了会报 warning
-    if do_sample:
-        gen_kwargs.update(temperature=temperature, top_p=top_p)
-
-    with torch.no_grad():
-        output = model.generate(input_ids=input_ids, **gen_kwargs)
+    if uses_native_generation(model):
+        # ChatGLM3 走作者自己的生成循环，见 _generate_native 的说明
+        output = _generate_native(
+            model, input_ids, max_new_tokens=max_new_tokens, do_sample=do_sample,
+            temperature=temperature, top_p=top_p,
+            repetition_penalty=repetition_penalty,
+        )
+    else:
+        gen_kwargs: Dict[str, Any] = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            repetition_penalty=repetition_penalty,
+            pad_token_id=tokenizer.pad_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+        )
+        # temperature / top_p 只在采样时有意义；贪心时传了会报 warning
+        if do_sample:
+            gen_kwargs.update(temperature=temperature, top_p=top_p)
+        with torch.no_grad():
+            output = model.generate(input_ids=input_ids, **gen_kwargs)
 
     new_ids = output[0][len(prompt_ids):].tolist()
     return decode(tokenizer, new_ids).strip()
@@ -168,6 +229,25 @@ def generate_batch(
     """
     if not messages_list:
         return []
+
+    if uses_native_generation(model):
+        # ChatGLM3 的 get_masks 假设 attention_mask 与**当前输入等长且没有
+        # padding**，而批处理必然引入 padding（不同样本长度不同）。硬走
+        # 批量会在 attention_mask 的尺寸上崩掉。
+        #
+        # 所以逐条生成，丢掉批处理的 5~6 倍加速。这是取舍，不是疏忽：
+        # 批量能快，但 ChatGLM3 跑不了。
+        logger.debug("ChatGLM3 等自带生成循环的模型不支持批量输入，逐条生成")
+        results: List[str] = []
+        for messages in messages_list:
+            for _ in range(num_return_sequences):
+                results.append(generate_one(
+                    model, tokenizer, messages,
+                    max_new_tokens=max_new_tokens, max_length=max_length,
+                    temperature=temperature, top_p=top_p,
+                    repetition_penalty=repetition_penalty, do_sample=do_sample,
+                ))
+        return results
 
     encodings = [_encode_with_truncation(tokenizer, m, max_length) for m in messages_list]
     pad_id = tokenizer.pad_token_id
