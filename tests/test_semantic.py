@@ -116,16 +116,32 @@ def test_缓存后端_空缓存不报错(tmp_path):
 def test_rubric_必须带版本号():
     """训练日志会记版本号；不记的话半年后分不清哪次实验用的哪版标准。"""
     rubric = load_rubric()
-    assert rubric["version"] == "v1"
+    assert str(rubric["version"]).startswith("v1")
     assert int(rubric["scale"]) == 100
 
 
-def test_rubric_四个维度都写了锚点():
-    """没有锚点，"80 分"和"85 分"就是随机的。"""
+def test_rubric_要求逐条抄录而不是整体印象打分():
+    """v1 的锚点被裁判原样背进"理由"栏，20 条里 16 条满分。
+    v1.1 改成"先枚举要素、再从候选里原样抄出对应句、分数由枚举结果算出来"
+    —— 抄不出句子却给分是无效判定，而编不出没读到的句子。"""
     tpl = load_rubric()["template_with_source"]
-    for kw in ("事实准确性", "要素完整性", "取舍与篇幅", "法律表述规范"):
-        assert kw in tpl
-    assert tpl.count("25 分") >= 4      # 每档都有具体描述
+    assert "原样抄出" in tpl
+    assert "无效判定" in tpl
+    assert "要素覆盖分" in tpl
+
+
+def test_rubric_把可机械计算的项交给程序():
+    """长度、金额、日期都是能算的，交给 LLM 评只会得到幻觉
+    （实测：长度比 1.73 的候选被判"长度与参考相当"拿了满分）。"""
+    tpl = load_rubric()["template_with_source"]
+    assert "由程序另行核对" in tpl
+
+
+def test_rubric_给了算分公式():
+    """分数必须是枚举结果的函数，不能留"凭印象调分"的口子。"""
+    tpl = load_rubric()["template_with_source"]
+    assert "÷ (2 × 要素条数)" in tpl
+    assert "最低 0" in tpl
 
 
 def test_rubric_载入不存在的文件要报错():
