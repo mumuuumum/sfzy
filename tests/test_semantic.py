@@ -21,6 +21,7 @@ from sfzy.eval.metrics import (
     load_rubric,
     normalize_item,
     parse_judge_score,
+    verify_judge_output,
 )
 
 
@@ -125,8 +126,9 @@ def test_rubric_要求逐条抄录而不是整体印象打分():
     v1.1 改成"先枚举要素、再从候选里原样抄出对应句、分数由枚举结果算出来"
     —— 抄不出句子却给分是无效判定，而编不出没读到的句子。"""
     tpl = load_rubric()["template_with_source"]
-    assert "原样抄出" in tpl
-    assert "无效判定" in tpl
+    assert "逐字复制" in tpl
+    assert "评分作废" in tpl                      # 伪造抄录的后果要写明
+    assert "不要抄参考摘要里的句子" in tpl        # 实测 28% 的抄录抄的是参考
     assert "要素覆盖分" in tpl
 
 
@@ -142,6 +144,67 @@ def test_rubric_给了算分公式():
     tpl = load_rubric()["template_with_source"]
     assert "÷ (2 × 要素条数)" in tpl
     assert "最低 0" in tpl
+
+
+def test_rubric_要求要素只从参考拆():
+    """v1.1 的要素是从候选里挑的，于是必然全中、必然满分。
+    实测：某条候选的 6 条要素里 5 条直接来自候选，参考里两条关键推理
+    压根没被拆出来考。"""
+    tpl = load_rubric()["template_with_source"]
+    assert "只看【参考摘要】拆要素" in tpl
+    assert "不超过 15 字" in tpl
+
+
+# ---------------------------------------------------------------- 裁判质检
+
+REF = "原被告系租赁合同纠纷，被告未按期支付租金，法院判决解除合同。"
+CAND = "原被告系租赁合同关系，判决解除双方签订的租赁合同。"
+
+
+def test_质检_真抄录算命中():
+    raw = ('要素1 [2分] 抄录："原被告系租赁合同关系"\n'
+           '要素2 [0分] 抄录：无\n'
+           '总分：50')
+    a = verify_judge_output(raw, REF, CAND)
+    assert a["n_quotes"] == 1 and a["n_quote_hits"] == 1
+    assert a["quote_hit_rate"] == 1.0
+
+
+def test_质检_抄了参考的句子要被抓出来():
+    """★ 这是实测抓到的真问题：83 条抄录里 23 条（28%）在候选里找不到、
+    却能在参考里找到。裁判一边说"抄的是候选"，一边抄的是参考。"""
+    raw = ('要素2 [1分] 抄录："被告未按期支付租金"\n'
+           '总分：60')
+    a = verify_judge_output(raw, REF, CAND)
+    assert a["n_quote_hits"] == 0
+    assert a["n_quotes_from_ref_only"] == 1
+    assert "被告未按期支付租金" in a["suspect_quotes"][0]
+
+
+def test_质检_标点差异不算没找到():
+    """裁判抄录时常顺手改标点，不该因此判为编造。"""
+    raw = '要素1 [2分] 抄录："原被告系租赁合同关系。"\n总分：90'
+    assert verify_judge_output(raw, REF, CAND)["quote_hit_rate"] == 1.0
+
+
+def test_质检_改写太多算没找到():
+    """只保留 70% 以上连续片段才算命中；改得面目全非就是在编。"""
+    raw = '要素1 [2分] 抄录："双方因房屋租赁产生争议并解除合同"\n总分：90'
+    assert verify_judge_output(raw, REF, CAND)["quote_hit_rate"] == 0.0
+
+
+def test_质检_要素出处率():
+    raw = ("1. 被告未按期支付租金\n"
+           "2. 法院支持了原告的全部请求\n"
+           '要素1 [2分] 抄录："原被告系租赁合同关系"\n总分：80')
+    a = verify_judge_output(raw, REF, CAND)
+    assert a["n_elements"] == 2          # 第二步的"要素1 [2分] 抄录…"不算要素行
+    assert a["n_element_hits"] == 1      # 第二条在参考里不存在
+
+
+def test_质检_没有抄录时返回None不报错():
+    a = verify_judge_output("总分：100", REF, CAND)
+    assert a["n_quotes"] == 0 and a["quote_hit_rate"] is None
 
 
 def test_rubric_载入不存在的文件要报错():

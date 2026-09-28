@@ -41,7 +41,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from sfzy.eval.metrics import LocalJudgeScorer, load_rubric, normalize_item  # noqa: E402
+from sfzy.eval.metrics import (                            # noqa: E402
+    LocalJudgeScorer,
+    load_rubric,
+    normalize_item,
+    verify_judge_output,
+)
 
 
 def resolve(path: str | Path) -> Path:
@@ -65,8 +70,9 @@ def main() -> None:
                     help="从 stdin 读 {'candidate','reference'[,'source']}，stdout 每行一个分数")
     ap.add_argument("--samples", type=int, default=1, help="重复采样次数，>1 时报告裁判自噪声")
     ap.add_argument("--temperature", type=float, default=0.7)
-    ap.add_argument("--max-new-tokens", type=int, default=512,
-                    help="裁判要逐项写理由，给少了会被截断；被截断的样本按失败处理")
+    ap.add_argument("--max-new-tokens", type=int, default=1024,
+                    help="裁判要拆要素、逐条抄录、再算分，输出很长。"
+                         "512 实测会截断 10%% 的样本（截断的按失败丢弃，不计 0 分）")
     args = ap.parse_args()
 
     rubric = load_rubric(args.rubric_file)
@@ -104,14 +110,21 @@ def main() -> None:
 
     # 除了分数，把裁判的原文也存下来 —— 事后要人工核查"这个 85 分凭什么"
     raw_texts = scorer.last_raw or [[] for _ in recs]
+    # 自动质检：抄录是不是真来自候选、要素是不是真来自参考。
+    # 人工读 2 条抓不住 28% 的伪造率（实测），只能靠程序。
+    audits = [
+        verify_judge_output((raws or [""])[0], it["reference"], it["candidate"])
+        for it, raws in zip(items, raw_texts)
+    ]
     with open(out_path, "w", encoding="utf-8") as f:
-        for r, it, s, raws in zip(recs, items, scores, raw_texts):
+        for r, it, s, raws, au in zip(recs, items, scores, raw_texts, audits):
             f.write(json.dumps({
                 "id": it["id"] or r.get("id"),
                 "judge_score": s,
                 "judge_scale": scale,
                 "rubric": rubric.get("version", "unknown"),
                 "judge_raw": raws,
+                "audit": au,
             }, ensure_ascii=False) + "\n")
 
     ok = [s for s in scores if s is not None]
@@ -125,6 +138,25 @@ def main() -> None:
               f"min {min(ok):.2f}   max {max(ok):.2f}")
         print(f"  不同取值 {len({round(s, 1) for s in ok})} 个（满分 {scale}）"
               "—— 太少说明裁判在给模板分")
+
+    # ---- 自动质检：这是"裁判能不能用"的硬指标 ----
+    qr = [a["quote_hit_rate"] for a in audits if a["quote_hit_rate"] is not None]
+    er = [a["element_hit_rate"] for a in audits if a["element_hit_rate"] is not None]
+    print("\n自动质检（抄录/要素是不是真的存在于它声称的来源里）")
+    if qr:
+        print(f"  抄录命中率 {st.mean(qr):.1%}（{len(qr)} 条有抄录）"
+              "   ← 声称抄自候选的句子有多少真在候选里")
+        bad = [a for a in audits if (a["quote_hit_rate"] or 1.0) < 0.8]
+        print(f"  命中率低于 80% 的 {len(bad)} 条")
+        if st.mean(qr) < 0.8:
+            print("  ⚠ 裁判在编造依据：把参考摘要的句子当成候选的抄录了。"
+                  "这种错误不报错、分数看着正常，但整批判分都不可信。")
+            for a in bad[:2]:
+                for q in a["suspect_quotes"]:
+                    print(f"      疑似：{q[:60]}")
+    if er:
+        print(f"  要素出处率 {st.mean(er):.1%}"
+              "   ← 声称从参考拆出的要素有多少真在参考里")
     print(f"→ {out_path}")
 
 

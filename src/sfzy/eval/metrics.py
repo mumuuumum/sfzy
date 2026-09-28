@@ -114,6 +114,107 @@ def normalize_item(item: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# 裁判输出的自动质检
+# ---------------------------------------------------------------------------
+# ============================ 为什么必须自动质检 ============================
+# rubric 要求裁判"从待评摘要里原样抄出对应句"。实测（smoke_v11，18 条）：
+# 83 条抄录里有 23 条（28%）**在候选摘要里根本找不到，却能在参考摘要里找到**。
+# 也就是说它一边说"我抄的是候选"，一边抄的是参考 —— 然后把这一条判成 2 分。
+#
+#     参考：……原告有权解除与被告的租赁合同……
+#     候选：原被告系租赁合同关系。原告诉求：解除合同。……判决解除……
+#     裁判：要素2 [1分] 抄录："现被告在原告限定的合理期限内未向原告履行支付租金的义务"
+#                                                                    ↑ 候选里没有这句
+#
+# 这种错误**不报错、分数看着正常**，只有把抄录的句子拿去比对才能发现。
+# 人工读 2 条根本抓不住 28% 的伪造率，所以做成程序。
+#
+# 质检三项：
+#   1. 抄录命中率 —— 声称抄自候选的句子，有多少真在候选里
+#   2. 要素出处率 —— 声称从参考拆出的要素，有多少真在参考里
+#   3. 可疑条目清单 —— 逐条列出，人工核查时只看这几条
+
+_QUOTE_RE = re.compile(r"抄录[：:]\s*[“\"](.+?)[”\"]")
+_ELEM_RE = re.compile(r"^\s*(?:要素)?(\d+)\s*[.、]\s*(\S.*)$", re.M)
+_STRIP_RE = re.compile(r"[\s，。、；：！？,.;:!?（）()《》〈〉「」『』\[\]【】\-—_]")
+
+
+def _norm_for_match(text: str) -> str:
+    """比对前去掉空白和标点：裁判抄录时常顺手改标点，不该算作"没找到"。"""
+    return _STRIP_RE.sub("", text or "")
+
+
+def _longest_common_substring(a: str, b: str) -> int:
+    """最长公共子串长度。句子里有轻微改动时用它做模糊匹配。
+
+    短串（≤ 100 字）× 候选（≤ 1000 字）的 DP 只有 10 万次操作，够快。
+    """
+    if not a or not b:
+        return 0
+    prev = [0] * (len(b) + 1)
+    best = 0
+    for i in range(1, len(a) + 1):
+        cur = [0] * (len(b) + 1)
+        ai = a[i - 1]
+        for j in range(1, len(b) + 1):
+            if ai == b[j - 1]:
+                cur[j] = prev[j - 1] + 1
+                best = max(best, cur[j])
+        prev = cur
+    return best
+
+
+def _found(quote: str, haystack: str, fuzzy: float) -> bool:
+    """quote 是否是 haystack 里的连续片段（允许模糊：最长公共子串占比够高）。"""
+    q, h = _norm_for_match(quote), _norm_for_match(haystack)
+    if not q:
+        return False
+    if q in h:
+        return True
+    return _longest_common_substring(q, h) >= fuzzy * len(q)
+
+
+def verify_judge_output(
+    raw: str, reference: str, candidate: str, fuzzy: float = 0.7
+) -> Dict[str, Any]:
+    """核对裁判的抄录是否真的来自候选、要素是否真的来自参考。
+
+    返回 `quote_hit_rate`（抄录命中率）和 `element_hit_rate`（要素出处率），
+    以及可疑条目清单。**这两个比率是裁判能不能用的硬指标**：
+    命中率低说明裁判在编造依据，它给出的分数自然也不可信。
+
+    注意这不是"裁判写得对不对"的检查，只是"它引用的话存不存在"的检查 ——
+    引用都能编，后面的推理更不用谈。
+    """
+    quotes = [q for q in _QUOTE_RE.findall(raw or "") if len(_norm_for_match(q)) >= 4]
+    quote_hits = [q for q in quotes if _found(q, candidate, fuzzy)]
+    # 抄录里"找不到"的那些，看看是不是抄成了参考 —— 这是最典型的失败模式
+    quote_from_ref_only = [q for q in quotes
+                           if q not in quote_hits and _found(q, reference, fuzzy)]
+
+    elements = []
+    for _, body in _ELEM_RE.findall(raw or ""):
+        # 第二步的行是"要素1 [2分] 抄录：…"，不是第一步的要素定义，排除掉
+        if "抄录" in body or "分]" in body:
+            continue
+        if len(_norm_for_match(body)) >= 4:
+            elements.append(body)
+    elem_hits = [e for e in elements if _found(e, reference, fuzzy)]
+
+    return {
+        "n_quotes": len(quotes),
+        "n_quote_hits": len(quote_hits),
+        "quote_hit_rate": len(quote_hits) / len(quotes) if quotes else None,
+        "n_quotes_from_ref_only": len(quote_from_ref_only),
+        "n_elements": len(elements),
+        "n_element_hits": len(elem_hits),
+        "element_hit_rate": len(elem_hits) / len(elements) if elements else None,
+        "suspect_quotes": (quote_from_ref_only or
+                           [q for q in quotes if q not in quote_hits])[:3],
+    }
+
+
+# ---------------------------------------------------------------------------
 # 后端
 # ---------------------------------------------------------------------------
 class SemanticScorer:
