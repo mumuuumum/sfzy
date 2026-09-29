@@ -143,7 +143,7 @@ class FactConsistencyJudge:
         model_path: Optional[str] = None,
         device: str = "auto",
         dtype: str = "bfloat16",
-        max_batch_size: int = 8,
+        max_batch_size: int = 4,
         extract_max_new_tokens: int = 1024,
         weights: Optional[Dict[str, float]] = None,
         max_input_tokens: int = 4096,
