@@ -133,10 +133,13 @@ def main() -> None:
     pairs = [(p["element"], p["doc"], p["cand"]) for p in probes]
     scores, sources, pmaxs = judge.judge_elements_with_confidence(pairs)
 
+    # ================= 修改后的打印逻辑 =================
     print(f"\n{'探针':<14}{'期望':<8}{'得分':>5}{'pmax':>8}   说明")
     print("-" * 78)
     good, bad, fails = [], [], []
-    for p, s, pm in zip(probes, scores, pmaxs):
+    
+    # 将 sources 也加入 zip 循环
+    for p, s, src, pm in zip(probes, scores, sources, pmaxs):
         ok = s >= 3 if p["good"] else s <= 1
         (good if p["good"] else bad).append(s)
         if not ok:
@@ -144,6 +147,25 @@ def main() -> None:
         conf = f"{pm:.2f}" if pm is not None else "  - "
         print(f"{p['id']:<14}{'≥3' if p['good'] else '≤1':<8}{s:>5}{conf:>8}   "
               f"{'✓' if ok else '✗'} {p['note']}")
+
+    # ================= 新增：详细推理过程（人类审查视角） =================
+    print("\n" + "="*30 + " 详细推理过程 " + "="*30)
+    for p, s, src, pm in zip(probes, scores, sources, pmaxs):
+        print(f"\n【{p['id']}】{p['note']}")
+        print(f"  ▶ 原文要素 (doc)   : {p['doc']}")
+        print(f"  ▶ 摘要要素 (cand)  : {p['cand']}")
+        
+        # 处理 src 可能是 dict、list 或 None 的情况，确保美观打印
+        if isinstance(src, (dict, list)):
+            import json
+            src_str = json.dumps(src, ensure_ascii=False)
+        else:
+            src_str = str(src).replace("\n", " ⏎ ") # 把换行符替换成可见符号，方便单行阅读
+            
+        print(f"  ▶ 模型原始输出 (src): {src_str}")
+        print(f"  ▶ 解析得分 / 置信度 : {s} / {pm:.2f}" if pm is not None else f"  ▶ 解析得分 / 置信度 : {s} / -")
+        print("-" * 60)
+    # ==============================================================
 
     gap = st.mean(good) - st.mean(bad) if good and bad else 0.0
     print(f"\n好的四条均值 {st.mean(good):.2f}   坏的六条均值 {st.mean(bad):.2f}   "
@@ -154,7 +176,6 @@ def main() -> None:
     if not verdict:
         print("  表现是常量输出的话，问题在模型容量，不在提示词 —— 换更大的模型。")
     print("\n推理统计：", runtime.stats, " 提取统计：", judge.stats)
-
 
 if __name__ == "__main__":
     main()
