@@ -144,3 +144,17 @@ ROUGE 那一项（原文里平均有 21.9 个这样的数字，参考只写 0.94
 判据不是"gated 一定更好"，而是：**格式坍缩是否被抑制，且 ROUGE 没有掉**。
 如果 gated 把 ROUGE 拉低了，说明门控设得太紧，先把
 `gate.length_ratio_range` 放宽再看。
+
+### 事实一致性作奖励（`mode=fact_judge`）
+
+上面两种模式的"事实项"是金额/日期/编号的**规则匹配**。如果要求事实一致性
+全部由模型判断（不写额外 checker），改用六要素事实一致性 Judge：
+
+```bash
+python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
+    --sft-adapter outputs/sft_chatglm3/best.pt
+```
+
+这时 `reward.total = 0.3·ROUGE-L + 0.7·fact_judge`，`fact_judge` 是
+`sfzy/judge/` 那套 Judge 的加权分（∈ [0,1]），规则事实提取完全不跑。
+数据流、日志字段、失败降级见 `docs/fact_judge.md` 第 6 节。

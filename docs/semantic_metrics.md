@@ -275,7 +275,21 @@ python scripts/analyze_outputs.py --input "data/triples/sft_val_shard0of2.jsonl"
 
 前三条不过就别往下跑 —— 理由见 5.3。
 
-### 5.3 备用方案：组内排序裁判（v1.1 仍不达标时用）
+### 5.3 组内排序裁判（已实现，点式三版失败后的主方案）
+
+**实测记录**：点式打分试了三版，都没解决同一个结构性问题。
+
+| 版本 | 改动 | 结果 |
+|---|---|---|
+| v1 | 四维各 25 分 + 锚点 | 16/20 满分，锚点被原样背进"理由"栏 |
+| v1.1 | 枚举要素 + 逐条抄录 + 算分 | 满分降到 8/18，但要素是**从候选里挑的** |
+| v1.2 | 要素只从参考拆 + 附出处 | 20/20 有效、分数散开，但**要素出处率 2.9%** |
+
+根因：模型同时看到参考和候选时，会以更短、更像摘要的那份（**候选**）为锚点
+组织阅读，于是它算的是 precision（候选→参考），而我们要的是 recall
+（参考→候选）。实测表现为 `corr(裁判分, 长度比) = -0.35` —— 越短越占便宜。
+连着两版用指令纠正都没用，因为这是在要求它报告一个我们**无法验证**的
+内部过程。
 
 如果点式打分（每条独立给 0-100）怎么调都堆在满分，换成**组内排序**：
 把同一 prompt 的 G 条候选一次性给裁判，让它排序。
@@ -297,8 +311,32 @@ python scripts/analyze_outputs.py --input "data/triples/sft_val_shard0of2.jsonl"
   * **并列** —— 允许并列，并列时用规则奖励打破
   * 只适用于 RL 的奖励；**对外汇报还得用点式**（跨 run 比较需要绝对分）
 
-实现位置：`src/sfzy/eval/metrics.py` 再加一个 `ListwiseRankScorer`，
-`score_batch` 按 group_size 切块（rollout 输出的分组是连续的，天然满足）。
+**实现**：`src/sfzy/eval/metrics.py` 的 `ListwiseRankScorer`，
+`score_batch` 按 group_size 切块（rollout 输出的分组天然连续）。
+配置：`semantic.backend: rank`，标准在 `configs/judge_rank_rubric.yaml`。
+
+**上线前的验证**（不需要任何 GPU rollout）：
+
+```bash
+# 用可控扰动冒充"同一 prompt 的 5 条候选"：
+#   base 和 e_order 是好的，d_digit/d_party/d_halluc 是坏的
+python tools/check_ranker.py --input "data/triples/sft_val_shard0of2.jsonl" \
+    --limit 20 --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct --device cuda:1
+
+# 本地先验证接线（用 ROUGE 假装排序）
+python tools/check_ranker.py --limit 20 --stub
+```
+
+`--stub`（按 ROUGE 排序）的结果是**不通过**，正好说明这个测试有分辨力：
+
+```
+base        平均名次 0.25      d_digit  1.50
+e_order     平均名次 3.45  ←   d_halluc 2.60
+坏候选抢在好候选前面的组数: 19/20 = 95%   ✗ 不通过
+```
+
+ROUGE 把"只调换了句序"的候选排到最差（3.45 名），正是 §1 记录过的那个病。
+判据是"好候选排名第一 ≥80% 且 坏候选抢先 ≤20%"，真裁判必须比这个 stub 好。
 
 ---
 

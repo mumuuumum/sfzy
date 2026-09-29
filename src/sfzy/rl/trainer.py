@@ -72,9 +72,10 @@ class GRPOTrainer:
         """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
         关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
 
-        `scorer` 是语义裁判（`sfzy.eval.metrics.SemanticScorer`）。传了就用，
-        没传就在 `gated_judge` 模式下直接报错 —— 配置说要接裁判却没有裁判，
-        静默降级成 gated 是最坏的结果。
+        `scorer` 是裁判（`sfzy.eval.metrics.SemanticScorer` 或
+        `sfzy.judge.scorer.FactConsistencyScorer`）。传了就用，没传就在
+        `gated_judge` / `fact_judge` 模式下直接报错 —— 配置说要接裁判却没有
+        裁判，静默降级是最坏的结果。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -110,11 +111,27 @@ class GRPOTrainer:
         self.baseline_rewards: Dict[str, float] = {}
 
         mode = (self.reward_cfg or {}).get("mode", "gated")
-        if mode == "gated_judge" and self.scorer is None:
+        if mode in ("gated_judge", "fact_judge") and self.scorer is None:
             raise ValueError(
-                "reward.mode=gated_judge 但没传语义裁判（scorer）。\n"
-                "  要么在配置里写 semantic.backend（local/api），"
+                f"reward.mode={mode} 但没传裁判（scorer）。\n"
+                "  要么在配置里写 semantic.backend"
+                "（gated_judge 用 local/rank/api，fact_judge 用 fact），"
                 "要么改成 mode=gated 跑对照组。"
+            )
+        # 排序裁判按"每个 prompt 连续 G 条"分组，而基线锚是每 prompt 一条
+        # （SFT 的输出）。两种输入形态混在一起会错位打分 —— 直接拦住。
+        if self.anchor_enabled and getattr(self.scorer, "name", "") == "judge_rank":
+            raise ValueError(
+                "anchor.enabled=true 与排序裁判（semantic.backend=rank）不兼容：\n"
+                "  排序裁判要求输入是每 G 条一组，基线锚是每 prompt 一条 SFT 输出。\n"
+                "  要么关掉 anchor，要么把裁判换成点式（backend=local）。"
+            )
+        # 排序裁判的分组必须和 rollout 的 G 一致，否则会把不同 prompt 的候选
+        # 排到一起 —— 不报错，只是分数全错。train_grpo.py 会自动对齐，这里是兜底。
+        if getattr(self.scorer, "group_size", None) not in (None, self.group_size):
+            raise ValueError(
+                f"排序裁判的 group_size={self.scorer.group_size} 与 "
+                f"rl.group_size={self.group_size} 不一致。"
             )
 
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -351,13 +368,28 @@ class GRPOTrainer:
         metrics["fact_score"] = float(
             sum(b.fact_score for b in breakdowns) / len(breakdowns)
         )
+        # 六要素事实一致性分（mode=fact_judge 时的主信号，其它模式恒为 0）
+        metrics["fact_judge"] = float(
+            sum(b.fact_judge for b in breakdowns) / len(breakdowns)
+        )
         metrics["fact_precision"] = float(
             sum(b.fact_precision for b in breakdowns) / len(breakdowns)
         )
         metrics["semantic"] = float(
             sum(b.semantic for b in breakdowns) / len(breakdowns)
         )
+        # 语义项的**组内标准差**：这才是它在 GRPO 里有没有用的判据。
+        # 均值好看但组内没方差 → 归一化后是常数 → 白接一个裁判。
+        sem = torch.tensor([b.semantic for b in breakdowns], dtype=torch.float32)
+        metrics["semantic_group_std"] = float(
+            sem.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
+        )
         metrics["rouge_l"] = float(sum(b.rouge_l for b in breakdowns) / len(breakdowns))
+        # 六要素裁判自己汇报的统计量（需求第十二节）：mean_fact_reward、
+        # 各要素均值、0-4 各档比例。只有事实一致性后端有这个钩子，
+        # **不需要 trainer 认识六要素**，耦合面就一个方法名。
+        if hasattr(self.scorer, "summarize_last"):
+            metrics.update(self.scorer.summarize_last())
         return metrics
 
     # ------------------------------------------------------------------
@@ -381,13 +413,29 @@ class GRPOTrainer:
                 self.state.history.append({"step": self.state.step, **metrics})
                 logger.info(
                     "step %d/%d | reward %.4f±%.4f | ROUGE-L %.4f | 事实F1 %.4f | "
-                    "裁判 %.3f | 门控 %.1f%% | 保留组 %d/%d | clip %.1f%% | len %.0f",
+                    "裁判 %.3f(σ%.3f) | 门控 %.1f%% | 保留组 %d/%d | clip %.1f%% | len %.0f",
                     self.state.step, n_steps, metrics["reward_mean"], metrics["reward_std"],
                     metrics["rouge_l"], metrics["fact_score"], metrics["semantic"],
+                    metrics["semantic_group_std"],
                     metrics["gating_rate"] * 100,
                     metrics["kept_groups"], metrics["total_groups"],
                     metrics["clipped_frac"] * 100, metrics["output_len_mean"],
                 )
+                # 六要素事实一致性（mode=fact_judge）单独一行：需求第十二节要的
+                # 均值 + 各档比例都在这。其它模式下这一行不打印。
+                if "mean_fact_reward" in metrics:
+                    ratio = " ".join(
+                        f"{lv}:{metrics.get(f'ratio_score_{lv}', 0.0) * 100:.0f}%"
+                        for lv in range(5)
+                    )
+                    logger.info(
+                        "  └ 事实一致性 fact_reward %.4f | 结果分 %.3f | 最低分 %.3f | "
+                        "档位 %s",
+                        metrics["mean_fact_reward"],
+                        metrics.get("mean_judgment_result_score", 0.0),
+                        metrics.get("mean_min_element_score", 0.0),
+                        ratio,
+                    )
                 if self.tracker is not None:
                     self.tracker.log(metrics, self.state.step)
 

@@ -145,7 +145,7 @@ def test_一步训练能跑完并返回全部指标(tmp_path):
     metrics = trainer.step(make_prompts())
 
     for key in ("loss", "reward_mean", "rouge_l", "fact_score", "fact_precision",
-                "semantic", "kept_groups", "total_groups", "gating_rate",
+                "semantic", "semantic_group_std", "kept_groups", "total_groups", "gating_rate",
                 "output_len_mean", "clipped_frac", "anchor_filtered"):
         assert key in metrics, f"训练日志缺少指标 {key}"
     assert metrics["loss"] == metrics["loss"]          # 不是 nan
@@ -177,6 +177,8 @@ def test_gated_judge模式的奖励有方差(tmp_path):
     metrics = trainer.step(make_prompts())
     assert metrics["reward_std"] > 0
     assert metrics["kept_groups"] > 0, "有方差的组不该被过滤掉"
+    # 语义项自己的组内方差：均值好看但组内没方差，等于白接一个裁判
+    assert metrics["semantic_group_std"] > 0
 
 
 def test_train_能跑到最后并保存(tmp_path):

@@ -226,21 +226,18 @@ class SemanticScorer:
         raise NotImplementedError
 
 
-class LocalJudgeScorer(SemanticScorer):
-    """本地 transformers 裁判。
+class _LocalChatModel:
+    """本地 HF 模型的加载与生成，点式裁判和排序裁判共用。
 
     逐条生成而不是批处理：批处理要左 padding，而带自定义 cache 的模型
     （ChatGLM3 那一类）在 padding 下会崩，见 `models/compat.py`。
     裁判模型通常是标准架构，批处理是安全的，但收益不值得这份复杂度 ——
-    裁判只在 RL 的 rollout 上跑，G=8、每步 32 条，逐条完全够。
+    裁判只在 RL 的 rollout 上跑，逐条完全够。
     """
-
-    name = "judge_local"
 
     def __init__(
         self,
         model_path: str,
-        rubric: Optional[Dict[str, Any]] = None,
         device: str = "cuda:0",
         dtype: str = "bfloat16",
         load_in_4bit: bool = False,
@@ -251,8 +248,6 @@ class LocalJudgeScorer(SemanticScorer):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self.rubric = rubric or load_rubric()
-        self.scale = int(self.rubric.get("scale", 100))
         self.samples = samples
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
@@ -283,7 +278,7 @@ class LocalJudgeScorer(SemanticScorer):
         self.n_truncated = 0     # 被 max_new_tokens 截断而丢弃的次数，CLI 会报告
         self.last_raw: List[List[str]] = []   # 每条样本的裁判原文，供人工核查
 
-    def _render(self, prompt: str) -> str:
+    def render(self, prompt: str) -> str:
         if getattr(self.tokenizer, "chat_template", None):
             return self.tokenizer.apply_chat_template(
                 [{"role": "user", "content": prompt}],
@@ -292,12 +287,12 @@ class LocalJudgeScorer(SemanticScorer):
             )
         return prompt
 
-    def _one(self, prompt: str) -> List[float]:
+    def generate_texts(self, prompt: str) -> List[str]:
+        """采样 samples 次，返回**正常结尾**的生成结果（截断的丢掉）。"""
         torch = self._torch
-        text = self._render(prompt)
+        text = self.render(prompt)
         ids = self.tokenizer(text, return_tensors="pt").to(self.model.device)
-        out: List[float] = []
-        raws: List[str] = []
+        out: List[str] = []
         eos = self.tokenizer.eos_token_id
         with torch.no_grad():
             for _ in range(self.samples):
@@ -311,17 +306,24 @@ class LocalJudgeScorer(SemanticScorer):
                 )
                 new_ids = gen[0][ids["input_ids"].shape[1]:]
                 decoded = self.tokenizer.decode(new_ids, skip_special_tokens=True)
-                raws.append(decoded)
                 # 截断即丢弃：被截断时最后一行往往是维度分，正则会把维度分
                 # 当总分抄走 —— 错误分数比没有分数危险得多（实现时踩过）。
                 if not len(new_ids) or int(new_ids[-1]) != eos:
                     self.n_truncated += 1
                     continue
-                score = parse_judge_score(decoded, self.scale)
-                if score is not None:
-                    out.append(score)
-        self.last_raw.append(raws)
+                out.append(decoded)
         return out
+
+
+class LocalJudgeScorer(SemanticScorer, _LocalChatModel):
+    """本地 transformers 点式裁判：每条候选独立给 0-100。"""
+
+    name = "judge_local"
+
+    def __init__(self, model_path: str, rubric: Optional[Dict[str, Any]] = None, **kw: Any) -> None:
+        _LocalChatModel.__init__(self, model_path, **kw)
+        self.rubric = rubric or load_rubric()
+        self.scale = int(self.rubric.get("scale", 100))
 
     def score_batch(self, items: Sequence[Dict[str, Any]]) -> List[Optional[float]]:
         self.last_raw = []
@@ -331,8 +333,143 @@ class LocalJudgeScorer(SemanticScorer):
             prompt = build_judge_prompt(
                 self.rubric, it["reference"], it["candidate"], it["source"]
             )
-            got = self._one(prompt)
-            results.append(st.mean(got) if got else None)
+            raws = self.generate_texts(prompt)
+            self.last_raw.append(raws)
+            scores = [s for s in (parse_judge_score(t, self.scale) for t in raws) if s is not None]
+            results.append(st.mean(scores) if scores else None)
+        return results
+
+
+# ---------------------------------------------------------------------------
+# 组内排序裁判
+# ---------------------------------------------------------------------------
+RANK_LETTERS = "ABCDEFGHIJKLMNOP"
+
+
+def build_rank_prompt(
+    rubric: Dict[str, Any],
+    reference: str,
+    candidates: Sequence[str],
+    source: Optional[str] = None,
+) -> str:
+    """把 G 条候选编号后填进排序模板。"""
+    block = "\n\n".join(
+        f"[{RANK_LETTERS[i]}] {c.strip()}" for i, c in enumerate(candidates)
+    )
+    key = "template_with_source" if source else "template"
+    tpl = rubric.get(key) or rubric["template"]
+    return (
+        tpl.replace("{reference}", (reference or "").strip())
+        .replace("{candidates}", block)
+        .replace("{n}", str(len(candidates)))
+        .replace("{source}", (source or "").strip())
+    )
+
+
+def parse_ranking(text: str, n: int) -> Optional[List[int]]:
+    """从裁判输出里抠出排序，返回 `order[k] = 第 k 名对应的候选下标`。
+
+    从**最后一行往前**找：rubric 要求"先写理由，最后一行只输出排好的字母"。
+    一行里必须恰好出现 n 个互不相同的合法字母才算数 —— 否则理由里
+    随手提到的一个字母就会被误当成排序。
+    """
+    valid = set(RANK_LETTERS[:n])
+    for line in reversed((text or "").strip().splitlines()):
+        seen, order = set(), []
+        for tok in re.findall(r"[A-Z]", line.upper()):
+            if tok in valid and tok not in seen:
+                seen.add(tok)
+                order.append(tok)
+        if len(order) == n:
+            return [RANK_LETTERS.index(t) for t in order]
+    return None
+
+
+class ListwiseRankScorer(SemanticScorer, _LocalChatModel):
+    """把同一 prompt 的 G 条候选一起给裁判，让它排序。
+
+    ============================ 为什么是排序 ============================
+    点式打分试了三版都栽在同一个地方（裁判以候选为锚点，算的是 precision
+    而不是 recall，见 `configs/judge_rank_rubric.yaml`）。排序没有"拆要素"
+    这个可走捷径的中间环节。
+
+    而且 **GRPO 本来就只需要组内相对分数**：
+
+        A_i = (r_i - mean_j r_j) / std_j r_j
+
+    给整组同加一个常数、或换一套绝对标定，A_i 完全不变。所以"谁比谁好"
+    就是全部所需的信息，绝对分数是多余的。
+
+    ============================ 三处工程细节 ============================
+    1. **位置偏置**：靠前的候选容易被排高。所以用 `repeat` 个不同顺序各排
+       一次，名次取平均。顺序固定的话，偏置会和采样顺序相关，等于给随机
+       顺序付钱。
+    2. **分组契约**：输入的 items 必须是"每个 prompt 连续 G 条"。
+       rollout 里的 `prompt_index = arange(P).repeat_interleave(G)` 保证了这点。
+       长度不是 G 的整数倍就直接报错 —— 宁可不打分，也不要错位打分。
+    3. **名字到分数的换算**：第 k 名（0 起）得 `100 × (G-1-k)/(G-1)`，
+       和点式裁判的量程一致（0-100），奖励那边不用改。
+    """
+
+    name = "judge_rank"
+
+    def __init__(
+        self,
+        model_path: str,
+        group_size: int,
+        rubric: Optional[Dict[str, Any]] = None,
+        repeat: int = 2,
+        seed: int = 0,
+        **kw: Any,
+    ) -> None:
+        if group_size < 2:
+            raise ValueError(f"排序裁判至少要 2 条候选才能排序，收到 group_size={group_size}")
+        _LocalChatModel.__init__(self, model_path, **kw)
+        self.group_size = group_size
+        self.rubric = rubric or load_rubric("configs/judge_rank_rubric.yaml")
+        self.scale = int(self.rubric.get("scale", 100))
+        self.repeat = repeat
+        self.seed = seed
+
+    def _order_for(self, round_index: int, n: int) -> List[int]:
+        import random
+
+        order = list(range(n))
+        if round_index == 0:
+            return order                      # 第一轮固定正序，保证可复现
+        random.Random(self.seed + round_index).shuffle(order)
+        return order
+
+    def score_batch(self, items: Sequence[Dict[str, Any]]) -> List[Optional[float]]:
+        g = self.group_size
+        if len(items) % g:
+            raise ValueError(
+                f"排序裁判要求输入是每 {g} 条一组（同一 prompt 的候选连续排列），"
+                f"收到 {len(items)} 条。检查调用方是不是把 baseline 那种"
+                f"每 prompt 一条的列表也传进来了。"
+            )
+        self.last_raw = []
+        results: List[Optional[float]] = []
+        for start in range(0, len(items), g):
+            chunk = [normalize_item(it) for it in items[start:start + g]]
+            reference = chunk[0]["reference"]
+            source = chunk[0]["source"]
+            total = [0.0] * g
+            rounds = 0
+            for r in range(self.repeat):
+                order = self._order_for(r, g)
+                shown = [chunk[i]["candidate"] for i in order]
+                prompt = build_rank_prompt(self.rubric, reference, shown, source)
+                raws = self.generate_texts(prompt)
+                ranking = parse_ranking(raws[0], g) if raws else None
+                self.last_raw.append(raws)
+                if ranking is None:
+                    continue
+                for rank_pos, shown_idx in enumerate(ranking):
+                    orig = order[shown_idx]
+                    total[orig] += self.scale * (g - 1 - rank_pos) / (g - 1)
+                rounds += 1
+            results.extend([t / rounds if rounds else None for t in total])
         return results
 
 
@@ -450,13 +587,20 @@ class CachedJudgeScorer(SemanticScorer):
 
 
 def build_scorer(cfg: Optional[Dict[str, Any]], override: Optional[str] = None) -> Optional[SemanticScorer]:
-    """按配置构造裁判后端。`override` 可以强制指定后端（"api"/"local"/"none"）。"""
+    """按配置构造裁判后端。`override` 可以强制指定后端（"api"/"rank"/"fact"/"none"）。"""
     spec = dict(cfg or {})
     backend = override or spec.get("backend", "none")
     if backend in ("none", "", None):
         return None
 
-    rubric = load_rubric(spec.get("rubric_file"))
+    # 六要素事实一致性 Judge 有自己的数据结构（SixElements / JudgeResult），
+    # 不吃 rubric，所以在构造 rubric 之前单独分流 —— 否则会白读一个 yaml。
+    if backend in ("fact", "six", "fact_consistency"):
+        return _build_fact_consistency_scorer(spec)
+
+    # 排序裁判有自己的一份标准（不含逐条抄录那套），不要默认套点式的
+    default_rubric = "configs/judge_rank_rubric.yaml" if backend == "rank" else None
+    rubric = load_rubric(spec.get("rubric_file") or default_rubric)
     common = {
         "rubric": rubric,
         "samples": int(spec.get("samples", 1)),
@@ -468,6 +612,21 @@ def build_scorer(cfg: Optional[Dict[str, Any]], override: Optional[str] = None) 
             raise ValueError("semantic.backend=local 需要 semantic.model 指向裁判模型目录")
         return LocalJudgeScorer(
             model_path=model,
+            device=spec.get("device", "cuda:0"),
+            dtype=spec.get("dtype", "bfloat16"),
+            load_in_4bit=bool(spec.get("load_in_4bit", False)),
+            max_new_tokens=int(spec.get("max_new_tokens", 512)),
+            **common,
+        )
+    if backend == "rank":
+        model = spec.get("model")
+        if not model:
+            raise ValueError("semantic.backend=rank 需要 semantic.model 指向裁判模型目录")
+        return ListwiseRankScorer(
+            model_path=model,
+            group_size=int(spec.get("group_size", 8)),
+            repeat=int(spec.get("repeat", 2)),
+            seed=int(spec.get("seed", 0)),
             device=spec.get("device", "cuda:0"),
             dtype=spec.get("dtype", "bfloat16"),
             load_in_4bit=bool(spec.get("load_in_4bit", False)),
@@ -490,4 +649,33 @@ def build_scorer(cfg: Optional[Dict[str, Any]], override: Optional[str] = None) 
         if not files:
             raise ValueError("semantic.backend=cache 需要 semantic.cache_files")
         return CachedJudgeScorer(files)
-    raise ValueError(f"未知的 semantic.backend：{backend}（可选 local / api / cache / none）")
+    raise ValueError(
+        f"未知的 semantic.backend：{backend}"
+        "（可选 local / rank / fact / api / cache / none）"
+    )
+
+
+def _build_fact_consistency_scorer(spec: Dict[str, Any]) -> SemanticScorer:
+    """构造六要素事实一致性裁判（`semantic.backend=fact`）。
+
+    延迟 import：`sfzy.judge` 会带上 torch 的数据结构，而 A1/A2/A3 对照组
+    根本不该为它付导入代价。
+    """
+    from sfzy.judge.judge import FactConsistencyJudge
+    from sfzy.judge.scorer import FactConsistencyScorer
+
+    model = spec.get("model")
+    if not model:
+        raise ValueError("semantic.backend=fact 需要 semantic.model 指向裁判模型目录")
+    judge = FactConsistencyJudge(
+        model_path=model,
+        device=spec.get("device", "cuda:1"),
+        dtype=spec.get("dtype", "bfloat16"),
+        max_batch_size=int(spec.get("max_batch_size", 8)),
+        extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
+        weights=spec.get("weights"),
+        min_document_elements=int(spec.get("min_document_elements", 2)),
+        judge_variant=spec.get("judge_variant", "spec"),
+        doc_fallback=bool(spec.get("doc_fallback", True)),
+    )
+    return FactConsistencyScorer(judge)

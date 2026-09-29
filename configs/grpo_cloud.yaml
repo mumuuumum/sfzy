@@ -72,7 +72,13 @@ rl:
 # 和 rl.reward.mode 配套：只有 gated_judge 或显式 --judge-backend 才会加载。
 # 裁判模型放在**卡 1**（策略吃满卡 0）。用 API 后端则不占显存。
 semantic:
-  backend: local               # local | api | cache | none
+  # local —— 点式打分（每条候选独立给 0-100）。试了三版都不行，见
+  #          configs/judge_rank_rubric.yaml 顶部的事故记录。
+  # rank  —— 组内排序（G 条候选一起给裁判排序）。**当前推荐**：
+  #          没有"拆要素"这个可走捷径的中间环节，且和 GRPO 只需要相对分数
+  #          天然对齐，成本还低 8 倍（1 次调用/组）。
+  # api / cache / none 见 docs/semantic_metrics.md
+  backend: local               # local | rank | api | cache | none
   model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
   rubric_file: configs/judge_rubric_v1.yaml   # 进奖励的 rubric
   device: cuda:1
@@ -81,6 +87,13 @@ semantic:
   samples: 1                   # 1 条就够；要测裁判自噪声时才调大
   temperature: 0.7
   max_new_tokens: 512          # 逐维度写理由，给小了会被截断（截断样本按失败丢弃）
+
+  # ---- backend=rank 时用 ----
+  # repeat 是"换几个随机顺序各排一次取平均"，用来消位置偏置。
+  # 1 次太受顺序影响，3 次以上边际收益很小且线性涨价。
+  repeat: 2
+  # group_size 不用写：train_grpo.py 会自动对齐到 rl.group_size，
+  # 不一致会导致不同 prompt 的候选被排到一起（不报错，只是全错）。
 
   # ---- backend=api 时用 ----
   base_url: https://api.deepseek.com/v1

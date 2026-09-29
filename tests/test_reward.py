@@ -330,6 +330,49 @@ def test_非judge模式也记录裁判分但不计分():
     assert s_with == pytest.approx(s_without)
 
 
+# ---------------------------------------------------------------- fact_judge 模式
+
+def test_fact_judge模式_事实项来自裁判而不是规则():
+    """需求要求事实一致性完全交给 Judge：金额/日期/法条一律不做规则匹配。
+
+    证据：`REF` 里明明有金额（规则口径会抽到事实），但 fact_judge 模式下
+    `n_ref_facts == 0` —— 规则提取根本没跑，事实项只认裁判分。
+    """
+    cfg = {"mode": "fact_judge", "weights": {"rouge_l": 0.3, "fact": 0.7}}
+    _, bd = compute_reward(REF, REF, cfg=cfg, semantic=0.8)
+    assert bd.n_ref_facts == 0
+    assert bd.fact_score == 1.0            # 空 kinds，规则项退化成中性值
+    assert bd.fact_judge == pytest.approx(0.8)
+    assert bd.total == pytest.approx(0.3 * bd.rouge_l + 0.7 * 0.8)
+
+
+def test_fact_judge模式_不做量纲换算():
+    """裁判返回的 weighted_reward 本就是 [0,1]，不能再按 0-100 除一遍。
+    配错量纲不会报错，只会让事实项缩水 100 倍 —— 必须钉住。"""
+    cfg = {"mode": "fact_judge", "semantic_scale": 100.0}
+    _, bd = compute_reward(REF, REF, cfg=cfg, semantic=0.8)
+    assert bd.fact_judge == pytest.approx(0.8)          # 不是 0.008
+
+
+def test_fact_judge模式_裁判分越高奖励越高():
+    cfg = {"mode": "fact_judge"}
+    s_low, _ = compute_reward(REF, REF, cfg=cfg, semantic=0.0)
+    s_high, _ = compute_reward(REF, REF, cfg=cfg, semantic=1.0)
+    assert s_high > s_low
+
+
+def test_fact_judge模式_被门控时总分0():
+    _, bd = compute_reward("太短", REF, cfg={"mode": "fact_judge"}, semantic=1.0)
+    assert bd.gated is True
+    assert bd.total == 0.0
+
+
+def test_fact_judge模式_缺裁判分要报错():
+    """和 gated_judge 一样：静默降级只会让你以为在跑 Judge，其实没有。"""
+    with pytest.raises(ValueError, match="fact_judge"):
+        compute_reward(REF, REF, cfg={"mode": "fact_judge"})
+
+
 # ---------------------------------------------------------------- 批量与统计
 
 def test_批量打分():

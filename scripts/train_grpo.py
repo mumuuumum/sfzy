@@ -79,7 +79,7 @@ def main() -> None:
                         help="允许 4-bit 量化加载。默认关闭 —— 策略精度必须和 SFT "
                              "训练时一致，只有显存真的不够才开")
     parser.add_argument("--judge-backend", default=None,
-                        choices=["local", "api", "cache", "none"],
+                        choices=["local", "rank", "fact", "api", "cache", "none"],
                         help="覆盖 semantic.backend：临时换成 API 裁判 / 临时关掉")
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
@@ -174,8 +174,17 @@ def main() -> None:
     # 只有真的要裁判时才加载它 —— 一个 7B 裁判白占 15G 显存，
     # 跑 A1/A2/A3 对照组时不该付这个代价。
     reward_mode = (rl_cfg.get("reward") or {}).get("mode", "gated")
-    want_judge = reward_mode == "gated_judge" or args.judge_backend not in (None, "none")
-    scorer = build_scorer(cfg.get("semantic"), override=args.judge_backend) if want_judge else None
+    # gated_judge 用点式/排序裁判，fact_judge 用六要素事实一致性裁判 —— 两种
+    # 模式都要把裁判加载起来，漏掉 fact_judge 会让它在没有裁判的情况下启动。
+    want_judge = (
+        reward_mode in ("gated_judge", "fact_judge")
+        or args.judge_backend not in (None, "none")
+    )
+    semantic_cfg = dict(cfg.get("semantic") or {})
+    # 排序裁判的分组必须和 rollout 的 G 一致 —— 不一致会静默错位打分
+    # （把不同 prompt 的候选排到一起），所以这里以 rl.group_size 为准。
+    semantic_cfg["group_size"] = rl_cfg.get("group_size", 8)
+    scorer = build_scorer(semantic_cfg, override=args.judge_backend) if want_judge else None
     if scorer is not None:
         logger.info(
             "语义裁判: %s（backend=%s）",

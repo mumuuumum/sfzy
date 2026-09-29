@@ -12,15 +12,20 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 import pytest
 
 from sfzy.eval.metrics import (
     CachedJudgeScorer,
+    ListwiseRankScorer,
     build_judge_prompt,
+    build_rank_prompt,
+    build_scorer,
     load_rubric,
     normalize_item,
     parse_judge_score,
+    parse_ranking,
     verify_judge_output,
 )
 
@@ -207,6 +212,121 @@ def test_质检_没有抄录时返回None不报错():
     assert a["n_quotes"] == 0 and a["quote_hit_rate"] is None
 
 
+# ---------------------------------------------------------------- 组内排序裁判
+
+def test_排序解析_取最后一行的字母序列():
+    text = "理由：C 的判决结果与参考一致。\nA 太长了。\n\nC A F B D E G H"
+    assert parse_ranking(text, 8) == [2, 0, 5, 1, 3, 4, 6, 7]
+
+
+def test_排序解析_字母不全不算数():
+    """理由里随口提到一个字母，不能被当成排序结果。"""
+    assert parse_ranking("A 比 B 好，所以选 A。", 5) is None
+
+
+def test_排序解析_没有输出返回None():
+    assert parse_ranking("", 5) is None
+
+
+def test_排序解析_忽略无关字母():
+    """解释性文字里的大写英文单词不该污染结果。"""
+    text = "理由：OK，C 覆盖了全部要素。\n\nC A F B D E G H"
+    assert parse_ranking(text, 8) is not None
+
+
+def test_排序提示词_包含全部候选和字母():
+    rubric = load_rubric("configs/judge_rank_rubric.yaml")
+    cands = ["候选一的内容", "候选二的内容", "候选三的内容", "候选四的内容", "候选五的内容"]
+    p = build_rank_prompt(rubric, "参考", cands, "原文")
+    for i, c in enumerate(cands):
+        assert f"[{'ABCDE'[i]}] {c}" in p
+    assert "{candidates}" not in p and "{n}" not in p
+
+
+def test_排序提示词_强调参考覆盖而不是候选精确率():
+    """点式裁判栽在算 precision（候选→参考）而不是 recall（参考→候选）。
+    排序版必须把这一点写死在标准里。"""
+    tpl = load_rubric("configs/judge_rank_rubric.yaml")["template_with_source"]
+    assert "参考里有的有没有被写出来" in tpl
+    assert "不要因为某条更长或更短就排前" in tpl
+
+
+class _FakeRankScorer(ListwiseRankScorer):
+    """不加载模型：按预设顺序返回生成结果，用来验证名次→分数的换算。"""
+
+    def __init__(self, ranking_text: str, group_size: int, repeat: int = 1, **kw: Any):
+        self.group_size = group_size
+        self.repeat = repeat
+        self.seed = 0
+        self.rubric = load_rubric("configs/judge_rank_rubric.yaml")
+        self.scale = 100
+        self._text = ranking_text
+        self.samples = 1
+        self.n_truncated = 0
+        self.last_raw = []
+
+    def generate_texts(self, prompt: str):
+        return [self._text]
+
+
+def test_排序裁判_名次换算成分数():
+    # 固定输出 "A B C D E"：A 最好 → 100 分，E 最差 → 0 分
+    scorer = _FakeRankScorer("理由…\nA B C D E", group_size=5)
+    scores = scorer.score_batch([{"candidate": f"c{i}", "reference": "r"} for i in range(5)])
+    assert scores == [100.0, 75.0, 50.0, 25.0, 0.0]
+
+
+def test_排序裁判_倒数第一名拿零分():
+    scorer = _FakeRankScorer("理由…\nE D C B A", group_size=5)
+    scores = scorer.score_batch([{"candidate": f"c{i}", "reference": "r"} for i in range(5)])
+    assert scores == [0.0, 25.0, 50.0, 75.0, 100.0]
+
+
+def test_排序裁判_多组各自排名():
+    scorer = _FakeRankScorer("A B C D E", group_size=5)
+    items = [{"candidate": f"c{i}", "reference": "r"} for i in range(10)]
+    scores = scorer.score_batch(items)
+    assert scores[:5] == [100.0, 75.0, 50.0, 25.0, 0.0]
+    assert scores[5:] == scores[:5]
+
+
+def test_排序裁判_条数不是整数倍要报错():
+    """错位分组会把不同 prompt 的候选排到一起，宁可不打分。"""
+    scorer = _FakeRankScorer("A B C D E", group_size=5)
+    with pytest.raises(ValueError, match="每 5 条一组"):
+        scorer.score_batch([{"candidate": "c", "reference": "r"}] * 7)
+
+
+def test_排序裁判_解析失败给None而不是猜():
+    scorer = _FakeRankScorer("我不知道怎么排", group_size=5)
+    assert scorer.score_batch([{"candidate": f"c{i}", "reference": "r"} for i in range(5)]) == [None] * 5
+
+
+def test_排序裁判_组太小要报错():
+    with pytest.raises(ValueError, match="至少要 2 条"):
+        ListwiseRankScorer(model_path="x", group_size=1)
+
+
 def test_rubric_载入不存在的文件要报错():
     with pytest.raises(FileNotFoundError):
         load_rubric("configs/不存在.yaml")
+
+
+# ---------------------------------------------------------------- build_scorer 分流
+
+def test_build_scorer_none后端返回None():
+    assert build_scorer({"backend": "none"}) is None
+    assert build_scorer(None) is None
+
+
+def test_build_scorer_fact后端缺模型给明确报错():
+    """fact 后端不吃 rubric，走的是六要素 Judge 那条路。
+    没给模型时必须当场报错，而不是构造出一个跑不了的裁判。"""
+    with pytest.raises(ValueError, match="backend=fact"):
+        build_scorer({"backend": "fact"})
+
+
+def test_build_scorer_未知后端的提示里列出fact():
+    """后端名写错时要能一眼看出可选项 —— fact 必须出现在提示里。"""
+    with pytest.raises(ValueError, match="fact"):
+        build_scorer({"backend": "不存在的后端"})

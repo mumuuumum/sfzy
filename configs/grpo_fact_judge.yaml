@@ -1,0 +1,44 @@
+defaults: grpo_cloud
+
+# GRPO：事实一致性 Judge 作奖励（需求文档对应的配置）。
+#
+# 和默认的 grpo_cloud.yaml 只差两处，其余（rollout、KL、门控、ROUGE）全部继承：
+#
+#   1. rl.reward.mode = fact_judge
+#      事实项不再用金额/日期/法条的规则匹配，而是六要素 Judge 的加权分
+#      （weighted_reward ∈ [0,1]，权重 0.05/0.15/0.10/0.25/0.15/0.30）。
+#
+#   2. semantic.backend = fact
+#      裁判换成 `sfzy/judge/` 那套六要素 Judge（提取 + 逐要素判定共用同一个
+#      Qwen Instruct 模型），不再用点式 0-100 裁判。
+#
+# 上线前务必先过验收：
+#   python scripts/judge_probe.py  --model /path/Qwen2.5-1.5B-Instruct --device cuda:1
+#   python scripts/judge_test.py   --model /path/Qwen2.5-1.5B-Instruct --device cuda:1 \
+#       --cases data/judge/fact_cases.jsonl
+# 三条判据（good > bad > core、每个文档内 A/B 都高于 C~G）全过才接 GRPO，
+# 否则奖励只是噪声。模型选型与踩坑记录见 docs/fact_judge.md。
+
+rl:
+  reward:
+    mode: fact_judge
+    weights:
+      rouge_l: 0.3             # 保持和官方评测口径的锚
+      fact: 0.7                # ★ 六要素事实一致性 Judge，主信号
+      semantic: 0.0            # fact_judge 不额外挂点式裁判
+      length: 0.0              # 长度项只在 flat 模式下生效
+
+semantic:
+  backend: fact
+  # 需求指定 Qwen 1.5B 级别 Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct；
+  # 云上把它换成实际路径即可。
+  model: models/Qwen2.5-1.5B-Instruct
+  device: cuda:1               # 策略吃满卡 0，裁判在卡 1
+  dtype: bfloat16              # T4 上要改 fp16
+
+  # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
+  max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限
+  extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
+  min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
+  judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot
+  doc_fallback: true           # 要素抽空时拿整篇原文兜底判定，避免反向梯度

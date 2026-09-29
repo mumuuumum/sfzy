@@ -28,6 +28,9 @@
   flat          所有项加权求和，长度是正向项。可补偿，对照组
   gated         门控 → 不通过直接 0；通过后 事实 F1 + ROUGE-L
   gated_judge   gated 再加上生成式语义分（LLM 裁判），本次的主方案
+  fact_judge    门控 + **六要素事实一致性 Judge**（Qwen）+ ROUGE-L。
+                事实项换成 Judge 的加权分，完全不跑金额/日期/法条规则匹配，
+                见 `sfzy/judge/`。判据、权重、空字段规则都在需求里写死。
 
 ================================ 为什么事实项换成对称 F1 ================================
 旧的 `fact_coverage` 在"参考里没有事实"时返回 0 —— 那些样本占 61.7%。
@@ -86,7 +89,7 @@ ARTICLE_RE = re.compile(r"第\s*\d+\s*条")
 RESULT_MARKERS = ("判决如下", "判令", "驳回", "本院认为", "判决", "裁定")
 
 DEFAULT_REWARD_CFG: Dict[str, Any] = {
-    # rouge_only | flat | gated | gated_judge，见模块 docstring
+    # rouge_only | flat | gated | gated_judge | fact_judge，见模块 docstring
     "mode": "gated",
     # weights 的键是"项名"。事实项的键叫 fact（不叫 fact_coverage），
     # 因为它乘的到底是 coverage 还是 f1 由 fact_term 决定。
@@ -117,6 +120,7 @@ class RewardBreakdown:
     rouge_l: float = 0.0
     fact_coverage: float = 0.0
     fact_score: float = 0.0
+    fact_judge: float = 0.0
     fact_precision: float = 0.0
     semantic: float = 0.0
     length_ratio: float = 0.0
@@ -129,6 +133,7 @@ class RewardBreakdown:
             "reward_rouge_l": self.rouge_l,
             "reward_fact_coverage": self.fact_coverage,
             "reward_fact_score": self.fact_score,
+            "reward_fact_judge": self.fact_judge,
             "reward_semantic": self.semantic,
             "fact_precision": self.fact_precision,
             "length_ratio": self.length_ratio,
@@ -309,21 +314,33 @@ def compute_reward(
 ) -> Tuple[float, RewardBreakdown]:
     """算一条样本的奖励，返回 (总分, 分项明细)。
 
-    `semantic` 是裁判给出的原始分（默认量程 0-100），只有 `gated_judge`
-    模式会用到它；其余模式即使传了也只记录进明细，不参与总分 ——
-    这样"同一个 checkpoint 用不同奖励口径离线重打分"是免费的。
+    `semantic` 是裁判给出的原始分。量纲随模式而定：
+
+      gated_judge   点式/排序裁判的 0-100 综合分，按 `semantic_scale` 归一
+      fact_judge    六要素事实一致性 Judge 的加权分，**本来就是 [0,1]**，
+                    不做 `semantic_scale` 换算（见 `bd.fact_judge`）
+
+    其余模式即使传了也只记录进明细，不参与总分 —— 这样"同一个 checkpoint
+    用不同奖励口径离线重打分"是免费的。
 
     四种模式的差别只在最后几行，**分项计算完全共用**，所以 A1/A2/A4 的
     对比是干净的单变量。
     """
     full_cfg = _merge_cfg(cfg)
     weights = full_cfg["weights"]
-    kinds = full_cfg["fact_kinds"]
     term = full_cfg["fact_term"]
     mode = full_cfg["mode"]
+    fact_judge_mode = mode == "fact_judge"
+    # fact_judge 模式下事实项完全来自 Qwen Judge，**不跑任何规则匹配** ——
+    # 需求明确要求金额/日期/法条/主体的判断全部交给裁判，不写额外 checker。
+    # 空 kinds 让下面三条规则函数直接返回中性值，不产生误导性的日志字段。
+    kinds = [] if fact_judge_mode else full_cfg["fact_kinds"]
 
     bd = RewardBreakdown()
     bd.semantic = 0.0 if semantic is None else float(semantic) / full_cfg["semantic_scale"]
+    # 事实一致性分单独存一份：它是 [0,1]，和 semantic 的 0-100 量纲不同，
+    # 混在一起会差 100 倍 —— 这是最容易悄悄写错的一处。
+    bd.fact_judge = 0.0 if semantic is None else float(semantic)
     bd.rouge_l = score_pair(
         candidate.strip(), reference.strip(), mode=full_cfg["rouge_mode"]
     )["rouge-l-f"]
@@ -355,6 +372,18 @@ def compute_reward(
         bd.gate_reason = reason
         bd.total = 0.0
         return 0.0, bd
+
+    # ---- 事实一致性主方案：门控 + 六要素 Judge 加权分 + ROUGE-L ----
+    if fact_judge_mode:
+        if semantic is None:
+            # 和 gated_judge 同样的理由：静默降级只会让你以为在跑 Judge，其实没有。
+            raise ValueError(
+                "mode=fact_judge 需要每条样本都有六要素事实一致性分，收到 None。"
+                "检查 semantic.backend=fact 的裁判是否传给了 compute_rewards，"
+                "以及脚本启动日志里的 '语义裁判' 行。"
+            )
+        bd.total = weights["rouge_l"] * bd.rouge_l + weights["fact"] * bd.fact_judge
+        return bd.total, bd
 
     # ---- 主方案：门控 + 事实 F1 + ROUGE-L（+ 可选的裁判语义分）----
     bd.total = weights["rouge_l"] * bd.rouge_l + weights["fact"] * bd.fact_value(term)
