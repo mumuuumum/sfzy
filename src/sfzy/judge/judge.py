@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -47,6 +48,9 @@ from sfzy.judge.schema import (
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.S)
 _KEY_RE = re.compile(r'"?([a-z_]+)"?\s*[:：]')
+
+# 调试开关：设置环境变量 JUDGE_VERBOSE=1 即可打印模型输入/输出
+_VERBOSE = os.environ.get("JUDGE_VERBOSE", "0") == "1"
 
 
 class ExtractionFailure(RuntimeError):
@@ -189,8 +193,26 @@ class FactConsistencyJudge:
         prompts = [
             self.runtime.render(build_extract_messages(t)) for t in texts
         ]
+        # === 调试：打印提取阶段的输入 Prompt ===
+        if _VERBOSE:
+            for i, (t, p) in enumerate(zip(texts, prompts)):
+                print(f"\n{'='*20} [Extract] 样本 {i+1} 输入 {'='*20}")
+                print(f"原始文本（前300字）: {t[:300]}...")
+                print(f"构造的完整 Prompt:\n{p}\n")
+        # ====================================
+
         raws = self.runtime.generate_batch(prompts, max_new_tokens=max_new_tokens)
         parsed = [parse_six_json_debug(r) for r in raws]
+
+        # === 调试：打印提取阶段的模型输出与解析结果 ===
+        if _VERBOSE:
+            for i, (raw, (el, mode)) in enumerate(zip(raws, parsed)):
+                print(f"\n{'='*20} [Extract] 样本 {i+1} 输出 {'='*20}")
+                print(f"模型原始输出:\n{raw}\n")
+                print(f"解析方式: {mode}")
+                print(f"解析出的六要素: {el.to_dict()}\n")
+        # ============================================
+
         return [p[0] for p in parsed], [p[1] for p in parsed]
 
     def extract_six_elements_batch(self, texts: Sequence[str]) -> List[SixElements]:
@@ -271,7 +293,30 @@ class FactConsistencyJudge:
             self.runtime.render(build_judge_messages(name, doc, cand, variant=self.judge_variant))
             for name, doc, cand in pairs
         ]
-        return self.runtime.score_digits_batch(prompts)
+
+        # === 调试：打印判定阶段的输入 Prompt ===
+        if _VERBOSE:
+            for i, ((name, doc, cand), p) in enumerate(zip(pairs, prompts)):
+                print(f"\n{'='*20} [Judge] Pair {i+1} 输入 {'='*20}")
+                print(f"要素名称: {name}")
+                print(f"原文要素: {doc}")
+                print(f"候选要素: {cand}")
+                print(f"构造的完整 Prompt:\n{p}\n")
+        # =======================================
+
+        scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
+
+        # === 调试：打印判定阶段的模型输出与分数 ===
+        if _VERBOSE:
+            for i, (s, pm, pr) in enumerate(zip(scores, pmaxs, probs)):
+                print(f"\n{'='*20} [Judge] Pair {i+1} 输出 {'='*20}")
+                print(f"解析得分: {s}")
+                print(f"最大概率 (pmax): {pm:.4f}")
+                print(f"各数字概率分布: {pr}")
+                print()
+        # ==========================================
+
+        return scores, pmaxs, probs
 
     def judge_elements_batch(
         self, pairs: Sequence[Tuple[str, str, str]]
