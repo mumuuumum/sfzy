@@ -19,7 +19,13 @@ defaults: base
 model:
   model_name_or_path: models/Qwen2.5-7B-Instruct
   trust_remote_code: false
-  load_in_4bit: false
-  torch_dtype: bfloat16
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: float16
+  torch_dtype: float16
   device_map: null
   max_length: 4096
+  device_map:
+    "": 0
+
