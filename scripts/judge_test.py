@@ -2,14 +2,24 @@
 
 先跑这个，再决定要不要接进 GRPOTrainer。
 
-============================ 两种用法 ============================
-    # 单条：看完整的中间过程（六要素、六项原始分、归一化分、加权分）
-    python scripts/judge_test.py --model models/Qwen2.5-0.5B-Instruct --device cpu \
-        --cases data/judge/fact_cases.jsonl --only d1_A-verbose
+============================ 用法 ============================
+模型默认从**配置文件**加载（我们现在统一用 Qwen2.5-7B-Instruct）：
 
     # 固定测试集：跑 A~G 七类案例，看能不能排出正确的顺序
-    python scripts/judge_test.py --model models/Qwen2.5-0.5B-Instruct --device cpu \
-        --cases data/judge/fact_cases.jsonl
+    python scripts/judge_test.py --model-config configs/model_qwen25_7b.yaml \
+        --device cuda:1 --cases data/judge/fact_cases.jsonl
+
+    # 单条：看完整的中间过程（六要素、六项原始分、归一化分、加权分）
+    python scripts/judge_test.py --model-config configs/model_qwen25_7b.yaml \
+        --device cuda:1 --cases data/judge/fact_cases.jsonl --only d1_A
+
+`--model` 走原生 transformers 加载，给了它就覆盖 `--model-config`：
+
+    python scripts/judge_test.py --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+        --device cuda:1 --cases data/judge/fact_cases.jsonl
+
+`--adapter` 载入 LoRA 后再测（同源自评检验：微调过的模型判得是不是比底座差）。
+两条加载路径和 `scripts/judge_probe.py` 完全一致。
 
 ============================ 验收线 ============================
 需求要求"重点确认 C、D、E、F、G 能显著低于 A、B"，并且希望看到
@@ -37,17 +47,95 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from sfzy.config import load_config                         # noqa: E402
 from sfzy.judge import (                                   # noqa: E402
     ELEMENTS,
     ELEMENT_ZH,
     FactConsistencyJudge,
     SixElements,
 )
+from sfzy.judge.runtime import TorchRuntime                # noqa: E402
 
 
 def resolve(path: str | Path) -> Path:
     p = Path(path)
     return p if p.is_absolute() else ROOT / p
+
+
+def build_model(args):
+    """两条加载路径，和 `scripts/judge_probe.py` 保持一致：
+
+      --model        原生 transformers（普通 HF 目录 / hub id）
+      --model-config 走项目自己的加载器（读 model.* 那一节配置）
+
+    `--model` 优先：它给了就用它，否则用配置文件。默认是配置文件里的
+    Qwen2.5-7B-Instruct —— 现在裁判统一用它。
+    """
+    if args.model:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        dtype = {
+            "bfloat16": torch.bfloat16,
+            "float16": torch.float16,
+            "float32": torch.float32,
+        }[args.dtype]
+        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=dtype, trust_remote_code=True
+        ).to(args.device)
+        return model, tokenizer
+
+    if not args.model_config:
+        raise SystemExit("要么 --model，要么 --model-config")
+
+    from sfzy.models.loader import build_quant_config, load_model, load_tokenizer
+
+    cfg = load_config(resolve(args.model_config))
+    model_cfg = dict(cfg.get("model") or {})
+    name = model_cfg.get("model_name_or_path", "")
+    # 相对路径按项目根解析；hub id（Qwen/...）原样保留。
+    if name:
+        local = resolve(name)
+        if local.exists():
+            model_cfg["model_name_or_path"] = str(local)
+    tokenizer = load_tokenizer(model_cfg)
+    model = load_model(
+        model_cfg,
+        quant_config=build_quant_config(model_cfg),
+        gradient_checkpointing=False,      # 只做推理，不开检查点
+    )
+    # device_map 已经在配置里指定放置时不要再 .to()，否则会和多卡切分打架。
+    if model_cfg.get("device_map") in (None, "", "none"):
+        model = model.to(args.device)
+    return model, tokenizer
+
+
+def build_judge(args) -> FactConsistencyJudge:
+    """模型 + tokenizer → 冻结的 TorchRuntime → 六要素 Judge。"""
+    model, tokenizer = build_model(args)
+
+    if args.adapter:
+        from sfzy.models.lora import inject_lora, mark_only_lora_trainable
+        from sfzy.sft.checkpoint import load_checkpoint
+
+        cfg = load_config(resolve(args.model_config)) if args.model_config else {}
+        lora_cfg = (cfg.get("lora") or {}) if cfg else {}
+        inject_lora(
+            model,
+            target_modules=lora_cfg.get("target_modules", []),
+            r=lora_cfg.get("r", 8), alpha=lora_cfg.get("alpha", 16),
+            dropout=0.0,
+        )
+        mark_only_lora_trainable(model)
+        load_checkpoint(resolve(args.adapter), model=model)
+        print("已载入 adapter —— 测的是微调过的模型")
+
+    runtime = TorchRuntime(
+        model=model, tokenizer=tokenizer, device=args.device,
+        max_batch_size=args.batch_size,
+    )
+    return FactConsistencyJudge(runtime=runtime, judge_variant=args.judge_variant)
 
 
 def load_documents() -> dict:
@@ -175,10 +263,18 @@ def run_cases(judge: FactConsistencyJudge, cases: list, docs: dict, verbose: boo
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="六要素事实一致性 Judge 测试")
-    ap.add_argument("--model", default="models/Qwen2.5-0.5B-Instruct")
-    ap.add_argument("--device", default="auto")
+    ap.add_argument("--model", default=None,
+                    help="HF 模型路径（原生加载）。给了它就覆盖 --model-config")
+    ap.add_argument("--model-config", default="configs/model_qwen25_7b.yaml",
+                    help="模型配置 yaml（走项目加载器）。默认 configs/model_qwen25_7b.yaml"
+                         "（Qwen2.5-7B-Instruct）")
+    ap.add_argument("--adapter", default=None,
+                    help="可选：载入 LoRA 后再测（同源自评检验）")
+    ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
-    ap.add_argument("--batch-size", type=int, default=4,
+    ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"],
+                    help="判定 Prompt 版本。小模型上先试 fewshot")
+    ap.add_argument("--batch-size", type=int, default=8,
                     help="本地内存小就调小；服务器上可以调到 16")
     ap.add_argument("--cases", default="data/judge/fact_cases.jsonl")
     ap.add_argument("--only", default=None, help="只跑某个案例 id（单条详细模式）")
@@ -188,6 +284,9 @@ def main() -> None:
     ap.add_argument("--verbose", action="store_true", help="打印每个文档的六要素")
     ap.add_argument("--stats", action="store_true", help="打印 0-4 各档比例")
     args = ap.parse_args()
+
+    if not args.model and not args.model_config:
+        raise SystemExit("要么 --model，要么 --model-config")
 
     docs = load_documents()
     cases = [json.loads(l) for l in open(resolve(args.cases), encoding="utf-8") if l.strip()]
@@ -200,12 +299,11 @@ def main() -> None:
         if not cases:
             raise SystemExit(f"没有 id 为 {args.only} 的案例")
 
-    print(f"模型 {args.model}   设备 {args.device}   dtype {args.dtype}   "
-          f"batch {args.batch_size}")
-    judge = FactConsistencyJudge(
-        model_path=args.model, device=args.device, dtype=args.dtype,
-        max_batch_size=args.batch_size,
-    )
+    tag = args.model or args.model_config
+    print(f"模型来源 {tag}   设备 {args.device}   batch {args.batch_size}"
+          f"   judge_variant {args.judge_variant}"
+          + (f"   adapter {args.adapter}" if args.adapter else ""))
+    judge = build_judge(args)
 
     if args.only:
         c = cases[0]
