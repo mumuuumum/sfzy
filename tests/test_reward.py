@@ -373,6 +373,13 @@ def test_fact_judge模式_缺裁判分要报错():
         compute_reward(REF, REF, cfg={"mode": "fact_judge"})
 
 
+def test_fact_judge模式_接到0到100量纲的裁判要报错():
+    """把 local/rank/api（0-100）接到 fact_judge 上，事实项会凭空大 100 倍，
+    把 ROUGE 压成噪声 —— 而且不报错。护栏必须拦住。"""
+    with pytest.raises(ValueError, match="量纲|不在 \\[0,1\\]"):
+        compute_reward(REF, REF, cfg={"mode": "fact_judge"}, semantic=80.0)
+
+
 # ---------------------------------------------------------------- 批量与统计
 
 def test_批量打分():

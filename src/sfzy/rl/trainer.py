@@ -46,6 +46,7 @@ from sfzy.rl.reward import (
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sfzy.sft.infer import generate_batch
 from sfzy.utils.logging import get_logger
+from sfzy.utils.tracking import group_metrics
 
 logger = get_logger("grpo")
 
@@ -54,9 +55,16 @@ logger = get_logger("grpo")
 class RLState:
     step: int = 0
     history: List[Dict[str, float]] = field(default_factory=list)
+    # 实验跟踪的 run_id。存进 checkpoint 才能在续训时接回 swanlab 上原来那条
+    # 曲线；不存的话一次断点重启就会在面板上多出一条断掉的新曲线。
+    tracker_run_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"step": self.step, "history": self.history}
+        return {
+            "step": self.step,
+            "history": self.history,
+            "tracker_run_id": self.tracker_run_id,
+        }
 
 
 class GRPOTrainer:
@@ -119,6 +127,7 @@ class GRPOTrainer:
         self.baseline_rewards: Dict[str, float] = {}
 
         mode = (self.reward_cfg or {}).get("mode", "gated")
+        self.reward_mode = mode
         if mode in ("gated_judge", "fact_judge") and self.scorer is None:
             raise ValueError(
                 f"reward.mode={mode} 但没传裁判（scorer）。\n"
@@ -404,7 +413,10 @@ class GRPOTrainer:
                 kl_value = float(kl_term.detach())
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(
+        # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
+        # 单一信号：突然窜到几十说明这一步的 advantage 尺度失控（常见于
+        # 奖励被噪声污染、或被裁剪的 ratio 占了大头）。
+        grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
         )
         self.optimizer.step()
@@ -412,6 +424,7 @@ class GRPOTrainer:
         gate_stats = summarize_gate_reasons(breakdowns)
         metrics = {
             "loss": float(loss.detach()),
+            "grad_norm": float(grad_norm),
             "reward_mean": float(rewards.mean()),
             "reward_std": float(rewards.std(unbiased=False)),
             "advantage_abs_mean": float(advantages.abs().mean()),
@@ -419,11 +432,18 @@ class GRPOTrainer:
             "kl": kl_value,
             "kept_groups": int(keep.sum()),
             "total_groups": len(prompts),
+            "kept_ratio": int(keep.sum()) / max(len(prompts), 1),
             "anchor_filtered": anchor_filtered,
             "judge_missing": judge_missing,
             "gating_rate": gate_stats.get("gated", 0) / max(gate_stats.get("total", 1), 1),
             "output_len_mean": float(lengths.mean()),
         }
+        # reward_std 是整个 batch 的标准差，只有在 prompts_per_step=1 时才等于
+        # 组内标准差。GRPO 真正要的是**组内**方差（组间差异会被归一化消掉），
+        # 所以它单独算一份，不管每步几个 prompt 都成立。
+        metrics["reward_group_std"] = float(
+            rewards.std(dim=-1, unbiased=False).mean()
+        )
         # 事实覆盖和 ROUGE 的分项也该看 —— 只盯总分判断不出"好在哪"
         metrics["fact_coverage"] = float(
             sum(b.fact_coverage for b in breakdowns) / len(breakdowns)
@@ -435,6 +455,14 @@ class GRPOTrainer:
         metrics["fact_judge"] = float(
             sum(b.fact_judge for b in breakdowns) / len(breakdowns)
         )
+        # 事实项的**组内**标准差 —— 和语义项同一个道理：均值好看但组内没方
+        # 差，归一化之后就是常数，等于白接一套裁判。
+        fj = torch.tensor(
+            [b.fact_judge for b in breakdowns], dtype=torch.float32, device=self.device
+        )
+        metrics["fact_judge_group_std"] = float(
+            fj.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
+        )
         metrics["fact_precision"] = float(
             sum(b.fact_precision for b in breakdowns) / len(breakdowns)
         )
@@ -443,7 +471,9 @@ class GRPOTrainer:
         )
         # 语义项的**组内标准差**：这才是它在 GRPO 里有没有用的判据。
         # 均值好看但组内没方差 → 归一化后是常数 → 白接一个裁判。
-        sem = torch.tensor([b.semantic for b in breakdowns], dtype=torch.float32)
+        sem = torch.tensor(
+            [b.semantic for b in breakdowns], dtype=torch.float32, device=self.device
+        )
         metrics["semantic_group_std"] = float(
             sem.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
         )
@@ -474,33 +504,11 @@ class GRPOTrainer:
 
             if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
                 self.state.history.append({"step": self.state.step, **metrics})
-                logger.info(
-                    "step %d/%d | reward %.4f±%.4f | ROUGE-L %.4f | 事实F1 %.4f | "
-                    "裁判 %.3f(σ%.3f) | 门控 %.1f%% | 保留组 %d/%d | clip %.1f%% | len %.0f",
-                    self.state.step, n_steps, metrics["reward_mean"], metrics["reward_std"],
-                    metrics["rouge_l"], metrics["fact_score"], metrics["semantic"],
-                    metrics["semantic_group_std"],
-                    metrics["gating_rate"] * 100,
-                    metrics["kept_groups"], metrics["total_groups"],
-                    metrics["clipped_frac"] * 100, metrics["output_len_mean"],
-                )
-                # 六要素事实一致性（mode=fact_judge）单独一行：需求第十二节要的
-                # 均值 + 各档比例都在这。其它模式下这一行不打印。
-                if "mean_fact_reward" in metrics:
-                    ratio = " ".join(
-                        f"{lv}:{metrics.get(f'ratio_score_{lv}', 0.0) * 100:.0f}%"
-                        for lv in range(5)
-                    )
-                    logger.info(
-                        "  └ 事实一致性 fact_reward %.4f | 结果分 %.3f | 最低分 %.3f | "
-                        "档位 %s",
-                        metrics["mean_fact_reward"],
-                        metrics.get("mean_judgment_result_score", 0.0),
-                        metrics.get("mean_min_element_score", 0.0),
-                        ratio,
-                    )
+                self._log_step(self.state.step, n_steps, metrics)
                 if self.tracker is not None:
-                    self.tracker.log(metrics, self.state.step)
+                    # 上报名带 `/<分组>` 前缀（见 tracking.GRPO_METRICS），
+                    # 面板上按 reward/group/judge 分块；history 里仍是原始键名。
+                    self.tracker.log(group_metrics(metrics), self.state.step)
 
             if self.is_main_process and self.state.step % self.save_every_n_steps == 0:
                 self.save()
@@ -510,12 +518,73 @@ class GRPOTrainer:
         return self.state
 
     # ------------------------------------------------------------------
+    def _log_step(self, step: int, n_steps: int, m: Dict[str, float]) -> None:
+        """打这一步的日志。
+
+        **两种奖励模式打印的列不一样，这是必须的**：fact_judge 模式下
+        `fact_score` 恒为 1（规则项被清空）、`semantic` 是 fact_reward/100
+        （量纲是 0-100 的残留），照原样打印会让人读出完全错的结论 ——
+        以为"事实 F1 满分""裁判分只有 0.008"。
+        """
+        head = (
+            f"step {step}/{n_steps} | "
+            f"reward {m['reward_mean']:.4f}±{m['reward_std']:.4f}"
+            f"(组内σ{m['reward_group_std']:.4f}) | ROUGE-L {m['rouge_l']:.4f}"
+        )
+        if self.reward_mode == "fact_judge":
+            head += (
+                f" | 事实一致性 {m['fact_judge']:.4f}"
+                f"(组内σ{m['fact_judge_group_std']:.4f})"
+                f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
+            )
+        else:
+            head += (
+                f" | 事实F1 {m['fact_score']:.4f}"
+                f" | 裁判 {m['semantic']:.3f}(σ{m['semantic_group_std']:.3f})"
+                f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
+            )
+        head += (
+            f" | 门控 {m['gating_rate'] * 100:.1f}%"
+            f" | 保留组 {m['kept_groups']}/{m['total_groups']}"
+            f" | clip {m['clipped_frac'] * 100:.1f}%"
+            f" | |g| {m['grad_norm']:.2f} | len {m['output_len_mean']:.0f}"
+        )
+        logger.info(head)
+
+        # 六要素的逐项明细（需求第十二节）：均值 + 0-4 各档比例。
+        # 只有事实一致性后端会产出这些键，其它模式这一行不打印。
+        if "mean_fact_reward" in m:
+            ratio = " ".join(
+                f"{lv}:{m.get(f'ratio_score_{lv}', 0.0) * 100:.0f}%" for lv in range(5)
+            )
+            logger.info(
+                "  └ 事实一致性 fact_reward %.4f | 结果分 %.3f | 最低分 %.3f | 档位 %s",
+                m["mean_fact_reward"],
+                m.get("mean_judgment_result_score", 0.0),
+                m.get("mean_min_element_score", 0.0),
+                ratio,
+            )
+
+        # 裁判整组失败时光看比例没法排查 —— 把最后一条异常打出来。
+        # 实测最常见的两种：某篇文书六要素抽不到 2 项（ExtractionFailure），
+        # 或者裁判侧那一批前向 OOM。
+        errors = getattr(self.scorer, "last_errors", None)
+        if m.get("judge_missing", 0.0) > 0 and errors:
+            logger.warning(
+                "  裁判有 %.0f%% 的组失败，最近一条：%s",
+                m["judge_missing"] * 100, str(errors[-1])[:300],
+            )
+
+    # ------------------------------------------------------------------
     def save(self, tag: str = "last") -> Path:
         if not self.is_main_process:
             return Path()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         path = (self.output_dir / "best.pt" if tag == "best"
                 else self.output_dir / f"step_{self.state.step:06d}.pt")
+        self.state.tracker_run_id = (
+            self.tracker.run_id if self.tracker is not None else None
+        )
         save_checkpoint(path=path, model=self.model, optimizer=self.optimizer,
                         state=self.state, only_trainable=True)
         prune_checkpoints(ckpt_dir=self.output_dir, keep_last_n=self.keep_last_n)

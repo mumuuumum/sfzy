@@ -382,6 +382,15 @@ def compute_reward(
                 "检查 semantic.backend=fact 的裁判是否传给了 compute_rewards，"
                 "以及脚本启动日志里的 '语义裁判' 行。"
             )
+        # 量纲护栏。fact_judge 的分数是 [0,1]，而 local/rank/api 三个后端给的是
+        # 0-100 —— 接错了**不报错**，只是事实项凭空大 100 倍、把 ROUGE 压成噪声。
+        if not 0.0 <= bd.fact_judge <= 1.0 + 1e-6:
+            raise ValueError(
+                f"mode=fact_judge 收到的事实一致性分 {bd.fact_judge} 不在 [0,1]。"
+                "多半是把 0-100 量纲的裁判（semantic.backend=local/rank/api）"
+                "接到了 fact_judge 模式上 —— 这个模式只接受六要素 Judge 的"
+                "weighted_reward（semantic.backend=fact）。"
+            )
         bd.total = weights["rouge_l"] * bd.rouge_l + weights["fact"] * bd.fact_judge
         return bd.total, bd
 

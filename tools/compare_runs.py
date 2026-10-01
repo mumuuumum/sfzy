@@ -50,6 +50,11 @@ CRITERIA = [
     ("数字级漏掉比例", "missed_ratio", "-", 0.55, "越低越好"),
     ("事实精确率", "fact_precision", "+", 0.99, None),
     ("长度比中位数", "len_ratio", "-", 1.15, None),
+    # 六要素事实一致性（tools/score_fact_judge.py 产出）。和上面的"事实覆盖率"
+    # 不是一回事：覆盖率是**规则口径**（金额/日期有没有抄到，只看参考），
+    # 这一项是**裁判口径**（候选说的能不能被原文支持）。两个都看才分得清
+    # "漏写"和"写错"。
+    ("事实一致性（Judge）", "fact_judge", "=", None, "不跌即守，要的是涨"),
     ("裁判分（汇报用）", "judge", "=", None, "不跌即算守住，要的是涨"),
 ]
 
@@ -111,7 +116,8 @@ def fmt(x: Optional[float], nd: int = 4) -> str:
 
 
 def section(title: str, a: Dict[str, dict], b: Dict[str, dict],
-            ids: List[str], judge_a: Dict, judge_b: Dict) -> None:
+            ids: List[str], judge_a: Dict, judge_b: Dict,
+            fact_a: Optional[Dict] = None, fact_b: Optional[Dict] = None) -> None:
     print(f"\n{'='*78}\n{title}（{len(ids)} 条）\n{'='*78}")
     if not ids:
         print("  没有可比样本")
@@ -124,6 +130,9 @@ def section(title: str, a: Dict[str, dict], b: Dict[str, dict],
         if judge_a and judge_b and rid in judge_a and rid in judge_b:
             ma["judge"] = judge_a[rid]["score"]
             mb["judge"] = judge_b[rid]["score"]
+        if fact_a and fact_b and rid in fact_a and rid in fact_b:
+            ma["fact_judge"] = fact_a[rid]["score"]
+            mb["fact_judge"] = fact_b[rid]["score"]
         rows.append((ma, mb))
 
     print(f"{'指标':<18}{'A':>10}{'B':>10}{'Δ':>10}{'改进占比':>10}{'t':>8}")
@@ -183,6 +192,9 @@ def main() -> None:
     ap.add_argument("--b", required=True, help="对比三元组 jsonl（glob）")
     ap.add_argument("--a-judge", default=None, help="基线裁判分 jsonl")
     ap.add_argument("--b-judge", default=None, help="对比裁判分 jsonl")
+    ap.add_argument("--a-fact", default=None,
+                    help="基线的事实一致性 jsonl（tools/score_fact_judge.py 产出）")
+    ap.add_argument("--b-fact", default=None, help="对比的事实一致性 jsonl")
     ap.add_argument("--a-name", default="A")
     ap.add_argument("--b-name", default="B")
     args = ap.parse_args()
@@ -191,6 +203,8 @@ def main() -> None:
     b = load_jsonl(args.b)
     judge_a = load_jsonl(args.a_judge, key="judge_score") if args.a_judge else {}
     judge_b = load_jsonl(args.b_judge, key="judge_score") if args.b_judge else {}
+    fact_a = load_jsonl(args.a_fact, key="fact_reward") if args.a_fact else {}
+    fact_b = load_jsonl(args.b_fact, key="fact_reward") if args.b_fact else {}
 
     common = sorted(set(a) & set(b))
     print(f"{args.a_name}: {len(a)} 条   {args.b_name}: {len(b)} 条   "
@@ -205,10 +219,16 @@ def main() -> None:
     has = [r for r in common if extract_facts(a[r]["reference"])]
     no = [r for r in common if not extract_facts(a[r]["reference"])]
     rows_all = [(metrics_for(a[r]), metrics_for(b[r])) for r in common]
+    # 判据表也要能看到事实一致性 —— 它不在 metrics_for 里（那是纯规则口径），
+    # 分数来自 tools/score_fact_judge.py 的离线输出。
+    for rid, (ma, mb) in zip(common, rows_all):
+        if fact_a and fact_b and rid in fact_a and rid in fact_b:
+            ma["fact_judge"] = fact_a[rid]["score"]
+            mb["fact_judge"] = fact_b[rid]["score"]
 
-    section("整体", a, b, common, judge_a, judge_b)
-    section("参考含事实（事实信号有效的子集）", a, b, has, judge_a, judge_b)
-    section("参考无事实（事实项是常数的子集）", a, b, no, judge_a, judge_b)
+    section("整体", a, b, common, judge_a, judge_b, fact_a, fact_b)
+    section("参考含事实（事实信号有效的子集）", a, b, has, judge_a, judge_b, fact_a, fact_b)
+    section("参考无事实（事实项是常数的子集）", a, b, no, judge_a, judge_b, fact_a, fact_b)
     verdicts(rows_all, args.a_name, args.b_name)
 
     print("\n注：'改进占比' 是 B 优于 A 的样本比例。均值涨但占比接近 50%，"

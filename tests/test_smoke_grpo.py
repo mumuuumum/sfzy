@@ -69,6 +69,23 @@ class StubScorer(SemanticScorer):
         return [_stub_score(i["candidate"]) for i in items]
 
 
+class FactStubScorer(SemanticScorer):
+    """给 `mode=fact_judge` 用的桩：**量纲必须是 [0,1]**。
+
+    和 StubScorer 的 0-100 不同 —— fact_judge 模式把裁判分当加权事实一致性分
+    直接乘进奖励，量纲接错会被 reward.py 的护栏当场拦下。
+    """
+
+    name = "judge_fact_stub"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def score_batch(self, items):
+        self.calls += 1
+        return [min(1.0, 0.1 + 0.01 * len(i["candidate"])) for i in items]
+
+
 def _stub_score(text: str) -> float:
     """长度项 + **内容相关的稳定扰动**。
 
@@ -159,7 +176,10 @@ def test_一步训练能跑完并返回全部指标(tmp_path):
 
     for key in ("loss", "reward_mean", "rouge_l", "fact_score", "fact_precision",
                 "semantic", "semantic_group_std", "kept_groups", "total_groups", "gating_rate",
-                "output_len_mean", "clipped_frac", "anchor_filtered"):
+                "output_len_mean", "clipped_frac", "anchor_filtered",
+                # swanlab 面板要用的那几项；少一个就在面板上少一根曲线
+                "grad_norm", "kept_ratio", "reward_group_std",
+                "fact_judge", "fact_judge_group_std", "judge_missing"):
         assert key in metrics, f"训练日志缺少指标 {key}"
     assert metrics["loss"] == metrics["loss"]          # 不是 nan
 
@@ -258,6 +278,38 @@ def test_rollout生成时必须切到_eval_模式(tmp_path, monkeypatch):
     trainer.step(make_prompts())
 
     assert seen["training"] is False, "生成必须显式 eval，不能靠模型当前模式"
+
+
+# ---------------------------------------------------------------- 日志列
+
+def test_fact_judge模式打印的是事实一致性而不是被误读的两列(tmp_path, caplog):
+    """fact_judge 模式下 `fact_score` 恒为 1（规则项被清空）、`semantic` 是
+    fact_reward/100 —— 照原样打印会让人以为"事实 F1 满分、裁判分只有 0.008"。
+    这个模式必须换一套列。"""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="sfzy.grpo"):
+        trainer = make_trainer(tmp_path, mode="fact_judge", scorer=FactStubScorer())
+        trainer.train(make_prompts(2))
+
+    text = " ".join(r.message for r in caplog.records)
+    assert "事实一致性" in text
+    assert "裁判缺失" in text
+    assert "组内σ" in text
+    assert "事实F1" not in text, "fact_judge 模式下不该再打印规则口径的列"
+
+
+def test_非fact_judge模式仍打印原来那两列(tmp_path, caplog):
+    """对照组不能被顺手改掉：gated 模式下 fact_score / semantic 是有意义的。"""
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="sfzy.grpo"):
+        trainer = make_trainer(tmp_path, mode="gated")
+        trainer.train(make_prompts(2))
+
+    text = " ".join(r.message for r in caplog.records)
+    assert "事实F1" in text and "裁判" in text
+    assert "裁判缺失" in text          # 这个字段两种模式都要有
 
 
 # ---------------------------------------------------------------- 裁判接线

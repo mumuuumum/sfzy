@@ -45,7 +45,9 @@ from sfzy.utils.distributed import (                      # noqa: E402
 )
 from sfzy.utils.logging import get_logger                 # noqa: E402
 from sfzy.utils.seed import set_seed                      # noqa: E402
-from sfzy.utils.tracking import build_tracker, make_run_name  # noqa: E402
+from sfzy.utils.tracking import (                         # noqa: E402
+    build_tracker, flatten_config, make_run_name, metric_columns,
+)
 
 logger = get_logger("train_grpo")
 
@@ -223,10 +225,30 @@ def main() -> None:
         logger.info("未启用语义裁判（reward.mode 不含 judge 时这是正常的）")
 
     # ---------------- tracker ----------------
+    # 续训时要接回 swanlab 上原来那条 run，否则一次 11 小时的训练被掐断后
+    # 重启，面板上会多出一条断掉的曲线，而你会以为训练从零开始了。
+    # run_id 存在 checkpoint 的 state 里，所以这里先把它读出来。
+    resume_id = None
+    if args.resume:
+        try:
+            resume_id = (load_checkpoint(resolve(args.resume)).get("state") or {}).get(
+                "tracker_run_id"
+            )
+            if resume_id:
+                logger.info("接回实验跟踪的 run: %s", resume_id)
+        except Exception as exc:  # noqa: BLE001 — 读不到就当新建一条，不该拦住训练
+            logger.warning("读 resume checkpoint 的 tracker run_id 失败（将新建 run）: %s", exc)
+
     tracker_cfg = cfg.get("tracking", {})
     tracker = build_tracker(
         backend=tracker_cfg.get("backend", "none"),
         project=tracker_cfg.get("project", "sfzy"),
+        resume_id=resume_id,
+        # 超参写进面板：事后看一条曲线时，"这组数到底是什么配置跑出来的"
+        # 只能从 run 记录里找，日志文件经常已经滚没了。
+        config=flatten_config(cfg),
+        # 预声明 GRPO 的列（swanlab 专用），面板分组和中文名固定下来。
+        columns=metric_columns(),
         run_name=make_run_name(
             f"sfzy-grpo-{rl_cfg.get('reward', {}).get('mode', 'gated')}",
             G=rl_cfg.get("group_size"), kl=rl_cfg.get("kl_coef"), lr=rl_cfg.get("learning_rate"),
