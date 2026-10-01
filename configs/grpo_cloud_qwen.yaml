@@ -1,4 +1,4 @@
-defaults: grpo_cloud
+defaults: grpo_fact_judge
 
 # GRPO 换 Qwen 的版本。同样只覆盖和底座相关的两项。
 model_config: configs/model_qwen25_7b.yaml

@@ -15,12 +15,9 @@
 六要素也失去批量 —— 需求第十节的"6 要素 × G 候选一次组 batch"直接作废。
 
 ============================ 和其它裁判后端的区别 ============================
-`local` / `rank` / `api` 返回的是 0-100 的综合分；本后端返回的是
-`JudgeResult.weighted_reward`，**已经是 [0,1]**，且它的每一项都来自
-Qwen Judge 对"候选陈述能否被原文支持"的判断，不含任何金额/日期/法条规则匹配。
-
-因此用它时奖励模式要选 `fact_judge` —— 那个模式不做 `semantic_scale` 换算
-（值本来就是 0-1），见 `rl/reward.py`。
+本后端返回的是 `JudgeResult.weighted_reward`，**已经是 [0,1]**，且它的每一项
+都来自 Qwen Judge 对"候选陈述能否被原文支持"的判断，不含任何金额/日期/法条
+规则匹配。`rl/reward.py` 的 `fact_judge` 模式直接用它，不做任何量纲换算。
 """
 
 from __future__ import annotations

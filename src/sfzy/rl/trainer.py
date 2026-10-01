@@ -84,9 +84,8 @@ class GRPOTrainer:
         """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
         关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
 
-        `scorer` 是裁判（`sfzy.eval.metrics.SemanticScorer` 或
-        `sfzy.judge.scorer.FactConsistencyScorer`）。传了就用，没传就在
-        `gated_judge` / `fact_judge` 模式下直接报错 —— 配置说要接裁判却没有
+        `scorer` 是裁判（`sfzy.judge.scorer.FactConsistencyScorer`）。现在只有
+        `fact_judge` 一种奖励模式，没有裁判直接报错 —— 配置说要接裁判却没有
         裁判，静默降级是最坏的结果。
         """
         self.model = model
@@ -126,29 +125,16 @@ class GRPOTrainer:
         self.anchor_slack = float(anchor.get("slack", 0.05))
         self.baseline_rewards: Dict[str, float] = {}
 
-        mode = (self.reward_cfg or {}).get("mode", "gated")
+        mode = (self.reward_cfg or {}).get("mode", "fact_judge")
         self.reward_mode = mode
-        if mode in ("gated_judge", "fact_judge") and self.scorer is None:
+        if mode != "fact_judge":
             raise ValueError(
-                f"reward.mode={mode} 但没传裁判（scorer）。\n"
-                "  要么在配置里写 semantic.backend"
-                "（gated_judge 用 local/rank/api，fact_judge 用 fact），"
-                "要么改成 mode=gated 跑对照组。"
+                f"未知的 reward.mode={mode!r}：现在只支持 fact_judge。"
             )
-        # 排序裁判按"每个 prompt 连续 G 条"分组，而基线锚是每 prompt 一条
-        # （SFT 的输出）。两种输入形态混在一起会错位打分 —— 直接拦住。
-        if self.anchor_enabled and getattr(self.scorer, "name", "") == "judge_rank":
+        if self.scorer is None:
             raise ValueError(
-                "anchor.enabled=true 与排序裁判（semantic.backend=rank）不兼容：\n"
-                "  排序裁判要求输入是每 G 条一组，基线锚是每 prompt 一条 SFT 输出。\n"
-                "  要么关掉 anchor，要么把裁判换成点式（backend=local）。"
-            )
-        # 排序裁判的分组必须和 rollout 的 G 一致，否则会把不同 prompt 的候选
-        # 排到一起 —— 不报错，只是分数全错。train_grpo.py 会自动对齐，这里是兜底。
-        if getattr(self.scorer, "group_size", None) not in (None, self.group_size):
-            raise ValueError(
-                f"排序裁判的 group_size={self.scorer.group_size} 与 "
-                f"rl.group_size={self.group_size} 不一致。"
+                "reward.mode=fact_judge 但没传裁判（scorer）。\n"
+                "  在配置里写 semantic.backend=fact。"
             )
 
         trainable = [p for p in model.parameters() if p.requires_grad]
@@ -444,38 +430,17 @@ class GRPOTrainer:
         metrics["reward_group_std"] = float(
             rewards.std(dim=-1, unbiased=False).mean()
         )
-        # 事实覆盖和 ROUGE 的分项也该看 —— 只盯总分判断不出"好在哪"
-        metrics["fact_coverage"] = float(
-            sum(b.fact_coverage for b in breakdowns) / len(breakdowns)
-        )
-        metrics["fact_score"] = float(
-            sum(b.fact_score for b in breakdowns) / len(breakdowns)
-        )
-        # 六要素事实一致性分（mode=fact_judge 时的主信号，其它模式恒为 0）
+        # 事实一致性和 ROUGE 的分项也该看 —— 只盯总分判断不出"好在哪"
         metrics["fact_judge"] = float(
             sum(b.fact_judge for b in breakdowns) / len(breakdowns)
         )
-        # 事实项的**组内**标准差 —— 和语义项同一个道理：均值好看但组内没方
-        # 差，归一化之后就是常数，等于白接一套裁判。
+        # 事实项的**组内**标准差：均值好看但组内没方差，归一化之后就是常数，
+        # 等于白接一套裁判。
         fj = torch.tensor(
             [b.fact_judge for b in breakdowns], dtype=torch.float32, device=self.device
         )
         metrics["fact_judge_group_std"] = float(
             fj.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
-        )
-        metrics["fact_precision"] = float(
-            sum(b.fact_precision for b in breakdowns) / len(breakdowns)
-        )
-        metrics["semantic"] = float(
-            sum(b.semantic for b in breakdowns) / len(breakdowns)
-        )
-        # 语义项的**组内标准差**：这才是它在 GRPO 里有没有用的判据。
-        # 均值好看但组内没方差 → 归一化后是常数 → 白接一个裁判。
-        sem = torch.tensor(
-            [b.semantic for b in breakdowns], dtype=torch.float32, device=self.device
-        )
-        metrics["semantic_group_std"] = float(
-            sem.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
         )
         metrics["rouge_l"] = float(sum(b.rouge_l for b in breakdowns) / len(breakdowns))
         # 六要素裁判自己汇报的统计量（需求第十二节）：mean_fact_reward、
@@ -519,30 +484,17 @@ class GRPOTrainer:
 
     # ------------------------------------------------------------------
     def _log_step(self, step: int, n_steps: int, m: Dict[str, float]) -> None:
-        """打这一步的日志。
-
-        **两种奖励模式打印的列不一样，这是必须的**：fact_judge 模式下
-        `fact_score` 恒为 1（规则项被清空）、`semantic` 是 fact_reward/100
-        （量纲是 0-100 的残留），照原样打印会让人读出完全错的结论 ——
-        以为"事实 F1 满分""裁判分只有 0.008"。
-        """
+        """打这一步的日志。奖励只有 fact_judge 一种，列固定。"""
         head = (
             f"step {step}/{n_steps} | "
             f"reward {m['reward_mean']:.4f}±{m['reward_std']:.4f}"
             f"(组内σ{m['reward_group_std']:.4f}) | ROUGE-L {m['rouge_l']:.4f}"
         )
-        if self.reward_mode == "fact_judge":
-            head += (
-                f" | 事实一致性 {m['fact_judge']:.4f}"
-                f"(组内σ{m['fact_judge_group_std']:.4f})"
-                f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
-            )
-        else:
-            head += (
-                f" | 事实F1 {m['fact_score']:.4f}"
-                f" | 裁判 {m['semantic']:.3f}(σ{m['semantic_group_std']:.3f})"
-                f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
-            )
+        head += (
+            f" | 事实一致性 {m['fact_judge']:.4f}"
+            f"(组内σ{m['fact_judge_group_std']:.4f})"
+            f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
+        )
         head += (
             f" | 门控 {m['gating_rate'] * 100:.1f}%"
             f" | 保留组 {m['kept_groups']}/{m['total_groups']}"
@@ -552,7 +504,6 @@ class GRPOTrainer:
         logger.info(head)
 
         # 六要素的逐项明细（需求第十二节）：均值 + 0-4 各档比例。
-        # 只有事实一致性后端会产出这些键，其它模式这一行不打印。
         if "mean_fact_reward" in m:
             ratio = " ".join(
                 f"{lv}:{m.get(f'ratio_score_{lv}', 0.0) * 100:.0f}%" for lv in range(5)

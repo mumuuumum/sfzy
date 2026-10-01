@@ -172,7 +172,7 @@ def make_run_name(prefix: str = "sfzy", **hyperparams: Any) -> str:
 #   2. 用一句话写清**这个指标该怎么读** —— 这份表同时就是"GRPO 要看什么"的清单。
 #
 # 注意：**只改上报名，不改 checkpoint history 里的原始键**。history 是给
-# 离线分析（tools/compare_runs.py 之类）读的，键名一旦跟着后端走就锁死了。
+# 离线分析读的，键名一旦跟着后端走就锁死了。
 GRPO_METRICS: Dict[str, Tuple[str, str]] = {
     # ---- 策略优化健康度：先看这四根，判断"训练有没有在正常进行" ----
     "loss": ("train/loss", "GRPO 损失（-min(ratio·A, clip(ratio)·A) 的均值）"),
@@ -186,9 +186,6 @@ GRPO_METRICS: Dict[str, Tuple[str, str]] = {
     "rouge_l": ("reward/rouge_l", "ROUGE-L（官方口径的锚）"),
     "fact_judge": ("reward/fact_judge", "六要素事实一致性奖励（fact_judge 模式的主信号）"),
     "fact_judge_group_std": ("reward/fact_judge_group_std", "★ 事实项的组内标准差"),
-    "fact_score": ("reward/fact_f1", "规则事实 F1；fact_judge 模式下恒为 1，别读"),
-    "fact_coverage": ("reward/fact_coverage", "事实覆盖率；只在参考含事实时有定义"),
-    "fact_precision": ("reward/fact_precision", "事实精确率；掉 = 在堆数字"),
     "gating_rate": ("reward/gate_rate", "被门控拦下的比例；高 = 问题在生成不在奖励"),
     # ---- 组与优势：GRPO 特有的诊断 ----
     "advantage_abs_mean": ("group/advantage_abs_mean", "|优势| 均值；≈0 = 整组没方差"),

@@ -1,25 +1,15 @@
-defaults: grpo_cloud
+defaults: sft_cloud
 
-# GRPO：事实一致性 Judge 作奖励（需求文档对应的配置）—— **双卡分居方案**。
+# GRPO：事实一致性 Judge 作奖励 —— **双卡分居方案**。
 #
 #   RTX 4090 #0（24GB）  策略：ChatGLM3-6B 4-bit NF4 冻结 + 可训练 LoRA
 #                        + 优化器 + 激活 + rollout
 #   RTX 4090 #1（24GB）  裁判：Qwen2.5-7B-Instruct 4-bit NF4，完全冻结
 #                        只做 inference，批量评价 candidate
 #
-# 和默认的 grpo_cloud.yaml 只差四处，其余（rollout、KL、门控）全部继承：
-#
-#   1. rl.reward.mode = fact_judge
-#      事实项不再用金额/日期/法条的规则匹配，而是六要素 Judge 的加权分
-#      （weighted_reward ∈ [0,1]，权重 0.05/0.15/0.10/0.25/0.15/0.30）。
-#
-#   2. semantic.backend = fact
-#      裁判换成 `sfzy/judge/` 那套六要素 Judge（提取 + 逐要素判定共用同一个
-#      Qwen Instruct 模型），不再用点式 0-100 裁判。裁判 4-bit、放卡 1。
-#
-#   3. model_config = 4-bit NF4 的 ChatGLM3 底座（rl.quantize: true 驱动）
-#
-#   4. rl.quantize = true —— 让"策略 4-bit"变成配置的一部分，不用记着传 --quantize
+# 这是 GRPO 唯一的奖励口径：`rl.reward.mode = fact_judge`
+# （门控 + 六要素 Judge 加权分 + ROUGE-L）。rouge_only / flat / gated /
+# gated_judge 四种旧模式与点式/排序/API/缓存裁判后端均已删除。
 #
 # 上线前务必先过验收：
 #   python scripts/judge_probe.py  --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
@@ -28,11 +18,15 @@ defaults: grpo_cloud
 #       --device cuda:1 --load-in-4bit \
 #       --cases data/judge/fact_cases.jsonl
 # 三条判据（good > bad > core、每个文档内 A/B 都高于 C~G）全过才接 GRPO，
-# 否则奖励只是噪声。模型选型与踩坑记录见 docs/fact_judge.md。
+# 否则奖励只是噪声。
 
 model_config: configs/model_chatglm3_6b_nf4.yaml
 
 rl:
+  output_dir: outputs/grpo_chatglm3
+  prompt_style: structured
+  prompt_file: data/splits/rl_prompts.jsonl
+
   # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
   # 等价于在命令行加 --quantize，但写进配置更不容易忘。
   quantize: true
@@ -82,8 +76,6 @@ rl:
     weights:
       rouge_l: 0.3             # 保持和官方评测口径的锚
       fact: 0.7                # ★ 六要素事实一致性 Judge，主信号
-      semantic: 0.0            # fact_judge 不额外挂点式裁判
-      length: 0.0              # 长度项只在 flat 模式下生效
 
   # SFT 基线锚：需要 prompt 池带 sft_output，现在的 rl_prompts.jsonl 没有，
   # 保持关闭；要开就先按 tools/select_rl_prompts.py --triples 重新生成池子。

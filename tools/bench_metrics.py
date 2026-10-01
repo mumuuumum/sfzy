@@ -215,8 +215,8 @@ class EmbeddingMetric:
 class JudgeCmdMetric:
     """把 (candidate, reference) 逐行喂给外部命令，读回一行一个分数。
 
-    服务器上跑大模型 judge 时用这个，本地不需要装模型：
-        --judge-cmd "python scripts/judge_score.py --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct"
+    服务器上跑大模型 judge 时用这个，本地不需要装模型。命令需要支持
+    stdin 收 JSONL（每行 {candidate, reference}）、stdout 每行回一个分数。
     """
 
     def __init__(self, name: str, cmd: str):

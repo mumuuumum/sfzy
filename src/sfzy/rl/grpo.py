@@ -175,8 +175,8 @@ def kl_penalty(
 
     **KL 系数在我们的场景里要谨慎调。** SFT 本身就有"漏事实"的习惯，
     而 KL 惩罚会**保护这个错误行为** —— 它把策略往 SFT 拉，而 SFT 就是
-    要改进的对象。所以 configs/grpo_cloud.yaml 里准备了 0 / 0.01 / 0.05
-    三档做对照，不能照抄论文默认值。
+    要改进的对象。所以 kl_coef 要当成一个要做对照的超参（0 / 0.01 / 0.05
+    各跑一遍），不能照抄论文默认值。
     """
     log_ratio = reference_logprobs - policy_logprobs
     return coef * (log_ratio.exp() - log_ratio - 1.0).mean()

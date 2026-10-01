@@ -8,11 +8,11 @@ rl/trainer.py 只管训练循环。
 
 用法：
     # 最小闭环：先确认能跑（约 10 分钟）
-    python scripts/train_grpo.py --config configs/grpo_cloud.yaml \
+    python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
         --sft-adapter outputs/sft_chatglm3/best.pt --limit-prompts 8
 
     # 正式
-    python scripts/train_grpo.py --config configs/grpo_cloud.yaml \
+    python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
         --sft-adapter outputs/sft_chatglm3/best.pt
 """
 
@@ -77,7 +77,7 @@ def apply_overrides(cfg, pairs) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO 训练")
-    parser.add_argument("--config", default="configs/grpo_cloud.yaml")
+    parser.add_argument("--config", default="configs/grpo_fact_judge.yaml")
     parser.add_argument("--sft-adapter", required=True,
                         help="SFT 阶段产出的 LoRA checkpoint（GRPO 的起点）")
     parser.add_argument("--limit-prompts", type=int, default=None,
@@ -86,9 +86,8 @@ def main() -> None:
     parser.add_argument("--quantize", action="store_true",
                         help="允许 4-bit 量化加载。默认关闭 —— 策略精度必须和 SFT "
                              "训练时一致，只有显存真的不够才开")
-    parser.add_argument("--judge-backend", default=None,
-                        choices=["local", "rank", "fact", "api", "cache", "none"],
-                        help="覆盖 semantic.backend：临时换成 API 裁判 / 临时关掉")
+    parser.add_argument("--judge-backend", default=None, choices=["fact", "none"],
+                        help="覆盖 semantic.backend：fact（六要素事实一致性裁判）/ none（关掉）")
     parser.add_argument("--override", action="append", default=[], metavar="KEY=VALUE")
     args = parser.parse_args()
 
@@ -172,7 +171,7 @@ def main() -> None:
             f"当前配置的 LoRA 是 r={lora_cfg.get('r')} alpha={lora_cfg.get('alpha')}，"
             f"target={lora_cfg.get('target_modules')}。\n"
             "**GRPO 的 LoRA 结构必须和 SFT 阶段完全一致** —— "
-            "检查 configs/grpo_cloud.yaml 的 defaults 是否指向了 SFT 实际用的那份配置。\n"
+            "检查 configs/grpo_fact_judge.yaml 的 defaults 是否指向了 SFT 实际用的那份配置。\n"
             f"原始错误：{exc}"
         ) from exc
     logger.info("已载入 SFT 权重作为策略起点: %s", adapter)
@@ -200,20 +199,11 @@ def main() -> None:
 
     # ---------------- 语义裁判 ----------------
     # 裁判是独立模型，和策略**分卡放**：策略吃满卡 0，裁判在卡 1。
-    # 用 API 后端的话不占显存，但每次 rollout 都要等网络。
-    # 只有真的要裁判时才加载它 —— 一个 7B 裁判白占 15G 显存，
-    # 跑 A1/A2/A3 对照组时不该付这个代价。
-    reward_mode = (rl_cfg.get("reward") or {}).get("mode", "gated")
-    # gated_judge 用点式/排序裁判，fact_judge 用六要素事实一致性裁判 —— 两种
-    # 模式都要把裁判加载起来，漏掉 fact_judge 会让它在没有裁判的情况下启动。
-    want_judge = (
-        reward_mode in ("gated_judge", "fact_judge")
-        or args.judge_backend not in (None, "none")
-    )
+    # 奖励只有 fact_judge 一种，事实项完全由这个裁判产出，所以默认就要加载它；
+    # 只有显式 --judge-backend none 才会跳过（那会导致 trainer 启动即报错）。
+    reward_mode = (rl_cfg.get("reward") or {}).get("mode", "fact_judge")
+    want_judge = reward_mode == "fact_judge" and args.judge_backend != "none"
     semantic_cfg = dict(cfg.get("semantic") or {})
-    # 排序裁判的分组必须和 rollout 的 G 一致 —— 不一致会静默错位打分
-    # （把不同 prompt 的候选排到一起），所以这里以 rl.group_size 为准。
-    semantic_cfg["group_size"] = rl_cfg.get("group_size", 8)
     scorer = build_scorer(semantic_cfg, override=args.judge_backend) if want_judge else None
     if scorer is not None:
         logger.info(
@@ -222,7 +212,9 @@ def main() -> None:
             args.judge_backend or cfg.path_("semantic.backend"),
         )
     else:
-        logger.info("未启用语义裁判（reward.mode 不含 judge 时这是正常的）")
+        logger.warning(
+            "未启用语义裁判：fact_judge 模式需要它，trainer 启动时会直接报错。"
+        )
 
     # ---------------- tracker ----------------
     # 续训时要接回 swanlab 上原来那条 run，否则一次 11 小时的训练被掐断后
@@ -250,7 +242,7 @@ def main() -> None:
         # 预声明 GRPO 的列（swanlab 专用），面板分组和中文名固定下来。
         columns=metric_columns(),
         run_name=make_run_name(
-            f"sfzy-grpo-{rl_cfg.get('reward', {}).get('mode', 'gated')}",
+            f"sfzy-grpo-{rl_cfg.get('reward', {}).get('mode', 'fact_judge')}",
             G=rl_cfg.get("group_size"), kl=rl_cfg.get("kl_coef"), lr=rl_cfg.get("learning_rate"),
         ),
         enabled=is_main_process(),
