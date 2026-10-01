@@ -16,9 +16,36 @@ defaults: base
 #     位置只能在加载时由 device_map 决定；
 #   * 写 "auto" 会把 6B 摊到两张卡做模型并行，卡 1 就不是"留给裁判"了。
 
+
+
+
+
+# model:
+#   # AutoDL 上的实际路径；换机器改这里，或软链到 models/chatglm3-6b。
+#   model_name_or_path: /root/autodl-tmp/chatglm3-6b
+#   # ChatGLM3 自带建模代码，必须开启
+#   trust_remote_code: true
+
+#   # ---- QLoRA：4-bit NF4，底座冻结、只训 LoRA ----
+#   load_in_4bit: true
+#   bnb_4bit_quant_type: nf4
+#   bnb_4bit_use_double_quant: true
+#   bnb_4bit_compute_dtype: bfloat16
+#   torch_dtype: bfloat16
+
+#   # 策略钉在卡 0。量化模型的位置只能在这里定，加载后不接受 .to()。
+#   device_map:
+#     "": 0
+
+#   max_length: 4096
+
+
+
+
+
 model:
   # AutoDL 上的实际路径；换机器改这里，或软链到 models/chatglm3-6b。
-  model_name_or_path: /root/autodl-tmp/chatglm3-6b
+  model_name_or_path: THUDM/chatglm3-6b
   # ChatGLM3 自带建模代码，必须开启
   trust_remote_code: true
 
@@ -26,8 +53,8 @@ model:
   load_in_4bit: true
   bnb_4bit_quant_type: nf4
   bnb_4bit_use_double_quant: true
-  bnb_4bit_compute_dtype: bfloat16
-  torch_dtype: bfloat16
+  bnb_4bit_compute_dtype: float16
+  torch_dtype: float16
 
   # 策略钉在卡 0。量化模型的位置只能在这里定，加载后不接受 .to()。
   device_map:
