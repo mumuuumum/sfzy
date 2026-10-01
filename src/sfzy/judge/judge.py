@@ -151,6 +151,9 @@ class FactConsistencyJudge:
         runtime: Optional[TorchRuntime] = None,
         judge_variant: str = "spec",
         doc_fallback: bool = True,
+        load_in_4bit: bool = False,
+        bnb_4bit_compute_dtype: Optional[str] = None,
+        trust_remote_code: bool = True,
     ) -> None:
         """`runtime` 和 `model_path` 二选一。
 
@@ -167,6 +170,9 @@ class FactConsistencyJudge:
                 dtype=dtype,
                 max_batch_size=max_batch_size,
                 max_input_tokens=max_input_tokens,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+                trust_remote_code=trust_remote_code,
             )
         self.runtime = runtime
         self.weights = dict(weights or DEFAULT_WEIGHTS)

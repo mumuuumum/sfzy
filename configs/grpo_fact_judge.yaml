@@ -1,8 +1,13 @@
 defaults: grpo_cloud
 
-# GRPO：事实一致性 Judge 作奖励（需求文档对应的配置）。
+# GRPO：事实一致性 Judge 作奖励（需求文档对应的配置）—— **双卡分居方案**。
 #
-# 和默认的 grpo_cloud.yaml 只差两处，其余（rollout、KL、门控、ROUGE）全部继承：
+#   RTX 4090 #0（24GB）  策略：ChatGLM3-6B 4-bit NF4 冻结 + 可训练 LoRA
+#                        + 优化器 + 激活 + rollout
+#   RTX 4090 #1（24GB）  裁判：Qwen2.5-7B-Instruct 4-bit NF4，完全冻结
+#                        只做 inference，批量评价 candidate
+#
+# 和默认的 grpo_cloud.yaml 只差四处，其余（rollout、KL、门控）全部继承：
 #
 #   1. rl.reward.mode = fact_judge
 #      事实项不再用金额/日期/法条的规则匹配，而是六要素 Judge 的加权分
@@ -10,16 +15,27 @@ defaults: grpo_cloud
 #
 #   2. semantic.backend = fact
 #      裁判换成 `sfzy/judge/` 那套六要素 Judge（提取 + 逐要素判定共用同一个
-#      Qwen Instruct 模型），不再用点式 0-100 裁判。
+#      Qwen Instruct 模型），不再用点式 0-100 裁判。裁判 4-bit、放卡 1。
+#
+#   3. model_config = 4-bit NF4 的 ChatGLM3 底座（rl.quantize: true 驱动）
+#
+#   4. rl.quantize = true —— 让"策略 4-bit"变成配置的一部分，不用记着传 --quantize
 #
 # 上线前务必先过验收：
-#   python scripts/judge_probe.py  --model /path/Qwen2.5-1.5B-Instruct --device cuda:1
-#   python scripts/judge_test.py   --model /path/Qwen2.5-1.5B-Instruct --device cuda:1 \
+#   python scripts/judge_probe.py  --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+#       --device cuda:1 --load-in-4bit
+#   python scripts/judge_test.py   --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+#       --device cuda:1 --load-in-4bit \
 #       --cases data/judge/fact_cases.jsonl
 # 三条判据（good > bad > core、每个文档内 A/B 都高于 C~G）全过才接 GRPO，
 # 否则奖励只是噪声。模型选型与踩坑记录见 docs/fact_judge.md。
 
+model_config: configs/model_chatglm3_6b_nf4.yaml
+
 rl:
+  # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
+  # 等价于在命令行加 --quantize，但写进配置更不容易忘。
+  quantize: true
   reward:
     mode: fact_judge
     weights:
@@ -30,14 +46,19 @@ rl:
 
 semantic:
   backend: fact
-  # 需求指定 Qwen 1.5B 级别 Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct；
-  # 云上把它换成实际路径即可。
-  model: models/Qwen2.5-1.5B-Instruct
-  device: cuda:1               # 策略吃满卡 0，裁判在卡 1
-  dtype: bfloat16              # T4 上要改 fp16
+  # 裁判模型：Qwen2.5-7B-Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct，
+  # 想先用小模型验接线就换成它（判定力较弱，见 docs/fact_judge.md 第 2 节）。
+  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
+  device: cuda:1               # ★ 裁判钉卡 1，策略吃卡 0
+  dtype: bfloat16              # 4090 支持 bf16；T4（Turing）要改 float16
+
+  # ---- 裁判侧 4-bit NF4（完全冻结、只做 inference）----
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: bfloat16
+  trust_remote_code: false     # Qwen2.5 是官方架构，不需要远程代码
 
   # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
-  max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限
+  max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限（一次前向）
   extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
   min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
   judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot

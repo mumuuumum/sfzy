@@ -268,11 +268,20 @@ class _LocalChatModel:
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
+            # 量化模型的设备只能在加载时用 device_map 定死（加载后不能 .to()）。
+            from sfzy.models.loader import resolve_device_index
+
+            idx = resolve_device_index(device)
+            if idx is not None:
+                kwargs["device_map"] = {"": idx}
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         self.model = AutoModelForCausalLM.from_pretrained(model_path, **kwargs)
-        if not load_in_4bit:
-            self.model = self.model.to(device)
+        # 量化模型（配置写了 4-bit，或模型目录里自带 quantization_config）
+        # 都不能 .to()，见 sfzy/models/loader.py 的说明。
+        from sfzy.models.loader import move_model_to_device
+
+        self.model = move_model_to_device(self.model, device)
         self.model.eval()
         self._torch = torch
         self.n_truncated = 0     # 被 max_new_tokens 截断而丢弃的次数，CLI 会报告
@@ -677,5 +686,10 @@ def _build_fact_consistency_scorer(spec: Dict[str, Any]) -> SemanticScorer:
         min_document_elements=int(spec.get("min_document_elements", 2)),
         judge_variant=spec.get("judge_variant", "spec"),
         doc_fallback=bool(spec.get("doc_fallback", True)),
+        # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，且位置由
+        # device_map 定在 semantic.device 指的卡上，与策略分居两卡。
+        load_in_4bit=bool(spec.get("load_in_4bit", False)),
+        bnb_4bit_compute_dtype=spec.get("bnb_4bit_compute_dtype"),
+        trust_remote_code=bool(spec.get("trust_remote_code", True)),
     )
     return FactConsistencyScorer(judge)

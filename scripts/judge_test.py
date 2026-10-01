@@ -62,6 +62,32 @@ def resolve(path: str | Path) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
+def quiet_transformers() -> None:
+    """把 transformers 的日志压回默认的 WARNING。
+
+    加载 Qwen2.5 的 tokenizer 时，transformers 会在 INFO 级别打印
+
+        Special tokens have been added in the vocabulary, make sure the
+        associated word embeddings are fine-tuned or trained.
+
+    它来自 `tokenization_utils_base.py` 里一句判断：tokenizer 的 added token
+    id（151665）超过了基础词表大小（vocab_size=151643）。**这是 tokenizer
+    文件里本来就有的既有事实**（`<|im_start|>` / `<|end_of_text|>` 这些
+    special token 的 id 一直排在 BPE 词表之后），不是我们把词表改大了，
+    也不会触发 `resize_token_embeddings` —— 词表长度前后完全一致，无需重训
+    嵌入。T4 上看不到它，只是因为那次跑的是别的模型/别的日志级别。
+
+    压回 WARNING 只是让这条无害的 INFO 不再混进判分输出；真正的告警
+    （WARNING/ERROR）照常打印。
+    """
+    try:
+        from transformers.utils import logging as hf_logging
+
+        hf_logging.set_verbosity_warning()
+    except Exception:  # noqa: BLE001 - 日志配置失败不该影响判分
+        pass
+
+
 def build_model(args):
     """两条加载路径，和 `scripts/judge_probe.py` 保持一致：
 
@@ -70,50 +96,47 @@ def build_model(args):
 
     `--model` 优先：它给了就用它，否则用配置文件。默认是配置文件里的
     Qwen2.5-7B-Instruct —— 现在裁判统一用它。
+
+    两条路径都返回 `(model, tokenizer, device)`，`device` 是模型**实际**
+    所在设备。**4/8-bit 量化模型的设备由 `device_map` 决定**，加载后不能
+    再 `.to()`（transformers 会抛 `.to() is not supported for ... bitsandbytes
+    models`），所以这里统一走 `load_inference_model`，由它把 `--device`
+    翻译成 `{"": 卡号}` 再加载。
     """
+    from sfzy.models.loader import load_inference_model
+
     if args.model:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        model_cfg = {
+            "model_name_or_path": args.model,
+            "trust_remote_code": True,          # 普通 HF 目录也走同一条路
+            "torch_dtype": args.dtype,
+            "load_in_4bit": bool(args.load_in_4bit),
+            # T4 不支持 bf16，量化计算精度跟随 --dtype 更安全
+            "bnb_4bit_compute_dtype": args.dtype,
+        }
+    else:
+        if not args.model_config:
+            raise SystemExit("要么 --model，要么 --model-config")
+        cfg = load_config(resolve(args.model_config))
+        model_cfg = dict(cfg.get("model") or {})
+        name = model_cfg.get("model_name_or_path", "")
+        # 相对路径按项目根解析；hub id（Qwen/...）原样保留。
+        if name:
+            local = resolve(name)
+            if local.exists():
+                model_cfg["model_name_or_path"] = str(local)
 
-        dtype = {
-            "bfloat16": torch.bfloat16,
-            "float16": torch.float16,
-            "float32": torch.float32,
-        }[args.dtype]
-        tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-        model = AutoModelForCausalLM.from_pretrained(
-            args.model, torch_dtype=dtype, trust_remote_code=True
-        ).to(args.device)
-        return model, tokenizer
-
-    if not args.model_config:
-        raise SystemExit("要么 --model，要么 --model-config")
-
-    from sfzy.models.loader import build_quant_config, load_model, load_tokenizer
-
-    cfg = load_config(resolve(args.model_config))
-    model_cfg = dict(cfg.get("model") or {})
-    name = model_cfg.get("model_name_or_path", "")
-    # 相对路径按项目根解析；hub id（Qwen/...）原样保留。
-    if name:
-        local = resolve(name)
-        if local.exists():
-            model_cfg["model_name_or_path"] = str(local)
-    tokenizer = load_tokenizer(model_cfg)
-    model = load_model(
+    return load_inference_model(
         model_cfg,
-        quant_config=build_quant_config(model_cfg),
-        gradient_checkpointing=False,      # 只做推理，不开检查点
+        device=args.device,
+        load_in_4bit=args.load_in_4bit,
+        gradient_checkpointing=False,          # 只做推理，不开检查点
     )
-    # device_map 已经在配置里指定放置时不要再 .to()，否则会和多卡切分打架。
-    if model_cfg.get("device_map") in (None, "", "none"):
-        model = model.to(args.device)
-    return model, tokenizer
 
 
 def build_judge(args) -> FactConsistencyJudge:
     """模型 + tokenizer → 冻结的 TorchRuntime → 六要素 Judge。"""
-    model, tokenizer = build_model(args)
+    model, tokenizer, device = build_model(args)
 
     if args.adapter:
         from sfzy.models.lora import inject_lora, mark_only_lora_trainable
@@ -132,7 +155,9 @@ def build_judge(args) -> FactConsistencyJudge:
         print("已载入 adapter —— 测的是微调过的模型")
 
     runtime = TorchRuntime(
-        model=model, tokenizer=tokenizer, device=args.device,
+        # 用模型**实际**设备，不要用命令行传的那个 —— 量化模型经 device_map
+        # 放置后可能和 --device 的写法不同（"cuda" vs "cuda:0"）
+        model=model, tokenizer=tokenizer, device=device,
         max_batch_size=args.batch_size,
     )
     return FactConsistencyJudge(runtime=runtime, judge_variant=args.judge_variant)
@@ -272,6 +297,13 @@ def main() -> None:
                     help="可选：载入 LoRA 后再测（同源自评检验）")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
+    # 量化开关：默认跟随配置（model_qwen25_7b.yaml 是 4-bit）。
+    # 4090（24GB）上 7B bf16 装得下，想绕开 bitsandbytes 就加 --no-4bit；
+    # T4 只有 16GB，必须留在 4-bit。
+    ap.add_argument("--load-in-4bit", dest="load_in_4bit", action="store_true",
+                    default=None, help="强制开启 4-bit（默认跟随配置）")
+    ap.add_argument("--no-4bit", dest="load_in_4bit", action="store_false",
+                    help="关掉 4-bit，走配置里的 bf16/fp16")
     ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"],
                     help="判定 Prompt 版本。小模型上先试 fewshot")
     ap.add_argument("--batch-size", type=int, default=8,
@@ -287,6 +319,8 @@ def main() -> None:
 
     if not args.model and not args.model_config:
         raise SystemExit("要么 --model，要么 --model-config")
+
+    quiet_transformers()
 
     docs = load_documents()
     cases = [json.loads(l) for l in open(resolve(args.cases), encoding="utf-8") if l.strip()]

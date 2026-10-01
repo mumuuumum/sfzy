@@ -31,7 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                        # noqa: E402
-from sfzy.models.loader import build_quant_config, load_model, load_tokenizer  # noqa: E402
+from sfzy.models.loader import (                          # noqa: E402
+    build_quant_config,
+    load_model,
+    load_tokenizer,
+    move_model_to_device,
+)
 from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
 from sfzy.sft.checkpoint import load_checkpoint            # noqa: E402
 from sfzy.sft.dataset import load_records                  # noqa: E402
@@ -205,7 +210,8 @@ def main() -> None:
     # 生成速度慢几十倍，而且日志里看不出来（只会觉得"怎么这么慢"）。
     if model_cfg.get("device_map") in (None, "", "none"):
         device = pick_device(cfg.get("device", "auto"))
-        model = model.to(device)
+        # 量化模型不能 .to()：设备由 device_map 决定。见 loader.move_model_to_device
+        model = move_model_to_device(model, device)
         logger.info("模型已搬到 %s", device)
     replaced = inject_lora(model, target_modules=load_config(
         resolve(args.config)).path_("lora.target_modules", []),

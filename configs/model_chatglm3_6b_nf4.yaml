@@ -1,0 +1,36 @@
+defaults: base
+
+# RTX 4090 #0 上的**策略底座**：ChatGLM3-6B，4-bit NF4，冻结。
+#
+# 这是"双卡分居"方案的策略那一半：
+#   卡 0：4-bit 底座（约 3.5GB 权重）+ 可训练 LoRA + 优化器 + 激活 + rollout
+#   卡 1：Qwen2.5-7B 裁判（4-bit，约 6GB），完全冻结 —— 见 grpo_fact_judge.yaml
+#
+# 和 model_chatglm3_6b.yaml（Kaggle T4）的唯一区别是**计算精度**：
+#   T4 是 Turing，不支持 bf16 → bnb_4bit_compute_dtype 必须 float16
+#   4090 是 Ada，原生支持 bf16   → 这里用 bfloat16，绕开 fp16 + GradScaler 那一类坑
+#
+# device_map 必须写死成 {"": 0}：
+#   * 4-bit 量化模型**加载后不能再 .to()**（transformers 直接抛
+#     ".to() is not supported for 4/8-bit bitsandbytes models"），
+#     位置只能在加载时由 device_map 决定；
+#   * 写 "auto" 会把 6B 摊到两张卡做模型并行，卡 1 就不是"留给裁判"了。
+
+model:
+  # AutoDL 上的实际路径；换机器改这里，或软链到 models/chatglm3-6b。
+  model_name_or_path: /root/autodl-tmp/chatglm3-6b
+  # ChatGLM3 自带建模代码，必须开启
+  trust_remote_code: true
+
+  # ---- QLoRA：4-bit NF4，底座冻结、只训 LoRA ----
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+  torch_dtype: bfloat16
+
+  # 策略钉在卡 0。量化模型的位置只能在这里定，加载后不接受 .to()。
+  device_map:
+    "": 0
+
+  max_length: 4096

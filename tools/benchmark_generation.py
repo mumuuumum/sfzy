@@ -35,7 +35,12 @@ import torch                                              # noqa: E402
 
 from sfzy.config import load_config                       # noqa: E402
 from sfzy.data.prompts import build_messages              # noqa: E402
-from sfzy.models.loader import build_quant_config, load_model, load_tokenizer  # noqa: E402
+from sfzy.models.loader import (                          # noqa: E402
+    build_quant_config,
+    load_model,
+    load_tokenizer,
+    move_model_to_device,
+)
 from sfzy.sft.infer import generate_batch, generate_one   # noqa: E402
 from sfzy.utils.distributed import pick_device            # noqa: E402
 
@@ -51,7 +56,8 @@ def load_setup(config_path: str):
     model = load_model(model_cfg, quant_config=build_quant_config(model_cfg),
                        gradient_checkpointing=False)
     if model_cfg.get("device_map") in (None, "", "none"):
-        model = model.to(pick_device(cfg.get("device", "auto")))
+        # 量化模型不能 .to()：设备由 device_map 决定。见 loader.move_model_to_device
+        model = move_model_to_device(model, pick_device(cfg.get("device", "auto")))
     model.eval()
     # 截断长度和训练/推理保持一致，否则量的不是真实场景
     max_length = cfg.path_("sft.max_length") or model_cfg.get("max_length")

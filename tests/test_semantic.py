@@ -330,3 +330,27 @@ def test_build_scorer_未知后端的提示里列出fact():
     """后端名写错时要能一眼看出可选项 —— fact 必须出现在提示里。"""
     with pytest.raises(ValueError, match="fact"):
         build_scorer({"backend": "不存在的后端"})
+
+
+def test_build_scorer_fact后端把4bit和设备传下去(monkeypatch):
+    """裁判 Qwen2.5-7B 要能 4-bit NF4 放卡 1：设备、量化开关都得传到底。"""
+    import sfzy.judge.judge as J
+
+    captured = {}
+
+    class _FakeJudge:
+        def __init__(self, **kw):
+            captured.update(kw)
+
+    monkeypatch.setattr(J, "FactConsistencyJudge", _FakeJudge)
+    scorer = build_scorer({
+        "backend": "fact",
+        "model": "/path/Qwen2.5-7B-Instruct",
+        "device": "cuda:1",
+        "load_in_4bit": True,
+        "bnb_4bit_compute_dtype": "bfloat16",
+    })
+    assert scorer is not None
+    assert captured["device"] == "cuda:1"
+    assert captured["load_in_4bit"] is True
+    assert captured["bnb_4bit_compute_dtype"] == "bfloat16"

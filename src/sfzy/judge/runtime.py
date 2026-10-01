@@ -239,24 +239,43 @@ def build_runtime(
     dtype: str = "bfloat16",
     max_batch_size: int = 8,
     max_input_tokens: int = 4096,
+    load_in_4bit: bool = False,
+    bnb_4bit_compute_dtype: Optional[str] = None,
+    trust_remote_code: bool = True,
 ) -> TorchRuntime:
-    """便捷函数：加载一个独立的 HF 模型当裁判。"""
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    """便捷函数：加载一个独立的 HF 模型当裁判（Qwen2.5-7B 放卡 1 就是这条）。
 
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-    torch_dtype = {
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }[dtype]
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path, torch_dtype=torch_dtype, trust_remote_code=True
-    ).to(device)
+    **4-bit（NF4）走 `sfzy.models.loader.load_inference_model`**，而不是
+    `from_pretrained(...).to(device)`。原因只有一个，但会让 24GB 的卡当场崩：
+
+        `.to()` is not supported for 4/8-bit bitsandbytes models
+
+    量化权重的位置只能在**加载时**用 `device_map` 决定。`load_inference_model`
+    把 `device`（`"cuda:1"`）翻译成 `{"": 1}` 再加载，加载完一个字都不搬 ——
+    这正是"裁判放卡 1、策略吃卡 0"能成立的前提。它同时接上了 ChatGLM3 那类
+    远程代码的兼容补丁，所以这里不重复造轮子。
+
+    运行时用模型**实际**所在的设备（量化后可能与传入写法不同，例如
+    `"cuda"` vs `"cuda:0"`），避免输入张量送错卡。
+    """
+    from sfzy.models.loader import load_inference_model
+
+    model_cfg = {
+        "model_name_or_path": model_path,
+        "trust_remote_code": trust_remote_code,
+        "torch_dtype": dtype,
+        "load_in_4bit": bool(load_in_4bit),
+        "bnb_4bit_quant_type": "nf4",
+        "bnb_4bit_use_double_quant": True,
+        # 4-bit 的计算精度默认跟随 dtype：T4 必须 float16，4090 上
+        # bfloat16 / float16 都行。不量化时这一项被 loader 忽略。
+        "bnb_4bit_compute_dtype": bnb_4bit_compute_dtype or dtype,
+    }
+    model, tokenizer, real_device = load_inference_model(
+        model_cfg, device=device, gradient_checkpointing=False,
+    )
     return TorchRuntime(
-        model=model, tokenizer=tokenizer, device=device,
+        model=model, tokenizer=tokenizer, device=real_device,
         max_batch_size=max_batch_size, max_input_tokens=max_input_tokens,
     )
 

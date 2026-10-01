@@ -182,6 +182,51 @@ python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
 `configs/grpo_fact_judge.yaml` 只覆盖两处（`rl.reward.mode=fact_judge`、
 `semantic.backend=fact`），其余全部继承 `grpo_cloud.yaml`。
 
+### 4-bit 与设备（4090 / T4 的差异）
+
+`configs/model_qwen25_7b.yaml` 默认开着 `load_in_4bit`。这带来一条硬约束：
+
+> **bitsandbytes 4/8-bit 量化模型不能调 `.to()`。** transformers 会直接抛
+> `ValueError: .to() is not supported for 4/8-bit bitsandbytes models`，
+> 因为量化权重是 int8/uint8 + 分片 metadata，搬动会破坏它。设备位置只能在
+> `from_pretrained` 时用 `device_map` 定死。
+
+所以 `judge_test.py` / `judge_probe.py`（以及训练、三元组、基准脚本）现在统一
+走 `sfzy.models.loader.load_inference_model`：它把 `--device` 翻译成
+`{"": 卡号}` 再加载，加载完一个字都不搬。
+
+```bash
+# 4090（24GB）：7B bf16 装得下，绕开 bitsandbytes 更省心
+python scripts/judge_test.py --model-config configs/model_qwen25_7b.yaml \
+    --device cuda:1 --no-4bit
+
+# T4（16GB）：必须留在 4-bit
+python scripts/judge_test.py --model-config configs/model_qwen25_7b.yaml \
+    --device cuda:0 --dtype float16
+```
+
+这条差异正是"T4 能跑、4090 崩"的来源：两边跑的不是同一个配置（一个没量化、
+一个量化），而旧的 `device_map in (None, "", "none")` 判断不看"是否量化",
+在 device_map 写成 null 的配置上会把 `.to()` 放行。
+
+### 关于 "Special tokens have been added in the vocabulary"
+
+加载 Qwen2.5 的 tokenizer 时 transformers 会打这一行（INFO 级别）：
+
+```
+Special tokens have been added in the vocabulary, make sure the associated word embeddings are fine-tuned or trained.
+```
+
+**它无害，也不需要做任何事。** 触发条件在 `tokenization_utils_base.py`：
+tokenizer 的 added token id（151665）超过了基础 BPE 词表大小（`vocab_size=151643`）。
+Qwen2.5 的 `<|im_start|>`、`<|end_of_text|>` 这些 special token 的 id 本来就排在
+BPE 词表之后，是 tokenizer 文件里的既有事实 —— 加载前后 `len(tokenizer)` 完全一致，
+没有触发 `resize_token_embeddings`，模型的嵌入矩阵本来就有这么多行。
+
+T4 上看不到，只是因为那次日志级别不是 INFO（或跑的是别的 tokenizer）。两个脚本现在
+在启动时把 transformers 的日志压回默认的 WARNING，这条 INFO 不再混进判分输出，
+真正的 WARNING/ERROR 照常打印。
+
 ### 训练日志里能看到的（需求第十二节）
 
 每个优化步打印一行：
@@ -211,3 +256,82 @@ trainer 只要 `hasattr(scorer, "summarize_last")` 就合并进 metrics ——
 总分上的，不是加在 Judge 上的** —— 一组采样若全长太短，会被整组拦下、
 advantage 恒 0。真遇到这种情况，先放宽 `gate.length_ratio_range`，
 而不是去动 Judge。
+
+---
+
+## 7. 双卡分居部署（2× RTX 4090 24GB）
+
+```
+RTX 4090 #0（24GB）                     RTX 4090 #1（24GB）
+├── ChatGLM3-6B Base：4bit NF4，冻结      └── Qwen2.5-7B-Instruct Judge
+├── SFT LoRA：可训练                        ├── 4bit NF4
+├── GRPO optimizer / activations            ├── 完全冻结、inference_mode
+└── rollout / candidate generation          └── 批量评价 candidate
+```
+
+**单进程**跑，两张卡各司其职 —— 不要用 `torchrun`（DDP 会给每张卡各放一份
+策略，卡 1 就装不下裁判了）。
+
+### 配置：一份文件搞定
+
+`configs/grpo_fact_judge.yaml` 就是这套布局，关键四项：
+
+```yaml
+model_config: configs/model_chatglm3_6b_nf4.yaml   # 策略：4bit 钉卡 0
+rl:
+  quantize: true                                   # 让"策略 4bit"写进配置
+  reward: { mode: fact_judge }
+semantic:
+  backend: fact
+  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
+  device: cuda:1                                   # ★ 裁判钉卡 1
+  load_in_4bit: true
+  bnb_4bit_compute_dtype: bfloat16
+```
+
+策略侧底座见 `configs/model_chatglm3_6b_nf4.yaml`：`load_in_4bit: true` +
+`device_map: {"": 0}`。**`device_map` 必须显式写**，因为 4bit 模型加载后
+不能 `.to()`，位置只能在加载时定死；写 `"auto"` 会把 6B 摊到两张卡。
+
+启动：
+
+```bash
+python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
+    --sft-adapter outputs/sft_chatglm3/step_000336.pt
+```
+
+### 两个开关的语义（易踩）
+
+| 开关 | 作用 | 坑 |
+|---|---|---|
+| `rl.quantize: true` / `--quantize` | 策略底座走 4bit | 配置里写了 `load_in_4bit: true` 但没开这个，脚本会**静默降级成 bf16**（原设计是为了和 bf16 SFT 对齐），只在日志的"策略精度"行看得出来 |
+| `semantic.load_in_4bit: true` | 裁判走 4bit | 走 `load_inference_model`：`device=cuda:1` 被翻译成 `device_map={"":1}`，加载后不搬 |
+
+启动日志里会有两行确认，先看它们再去泡茶：
+
+```
+策略精度: 4-bit nf4（量化=True，device_map={'': 0}）
+语义裁判: judge_fact（backend=fact）
+```
+
+### 显存与调参
+
+* 卡 0 的大头不是权重（4bit 约 3.5GB），是**词表投影**：ChatGLM3 的
+  vocab=65024，一次前向里 fp16 logits + fp32 副本 + 梯度约 `B×L×0.9MB`。
+  G=8、L≈2432 时这一项就 17GB 左右，是最可能 OOM 的地方。先跑
+  `python scripts/check_memory.py` 量一遍，撑不住就按顺序降
+  `rl.max_new_tokens` → `rl.max_length` → `rl.group_size`。
+* 卡 1 的裁判 7B 4bit 约 5~6GB，48 个 pair 组 batch 前向也很快；
+  真紧张就把 `semantic.max_batch_size` 从 8 调到 4。
+
+### 上线前的两步验收（都在卡 1，不接 GRPO）
+
+```bash
+python scripts/judge_probe.py --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+    --device cuda:1 --load-in-4bit
+python scripts/judge_test.py  --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
+    --device cuda:1 --load-in-4bit --cases data/judge/fact_cases.jsonl
+```
+
+三条判据全过（好的四条 ≥3、坏的六条 ≤1、每个文档内 A/B 都高于 C~G）
+才接 GRPO；否则奖励只是噪声，跑到一半才发现就晚了。

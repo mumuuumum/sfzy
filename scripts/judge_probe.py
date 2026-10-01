@@ -58,36 +58,54 @@ def resolve(path: str | Path) -> Path:
     return p if p.is_absolute() else ROOT / p
 
 
-def build_model(args):
-    """两条加载路径：项目自己的（带 ChatGLM3 兼容补丁）/ 原生 transformers。"""
-    if args.model_config:
-        from sfzy.models.loader import build_quant_config, load_model, load_tokenizer
+def quiet_transformers() -> None:
+    """把 transformers 的日志压回默认的 WARNING。理由见 `judge_test.py`
+    里的同名函数：Qwen2.5 的 "Special tokens have been added..." 是
+    tokenizer 文件里既有的 special token id 超过基础词表导致的无害 INFO，
+    不需要重训嵌入，也和我们加载模型的方式无关。"""
+    try:
+        from transformers.utils import logging as hf_logging
 
+        hf_logging.set_verbosity_warning()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def build_model(args):
+    """两条加载路径，和 `scripts/judge_test.py` 保持一致：
+
+      --model        原生 HF 目录 / hub id（走项目加载器，普通架构不加补丁）
+      --model-config 读 model.* 那一节配置（支持 4-bit）
+
+    返回 `(model, tokenizer, device)`，`device` 是模型**实际**设备。
+    4/8-bit 量化模型的设备由 `device_map` 决定，加载后不能 `.to()` —— 详见
+    `sfzy/models/loader.py` 里 `move_model_to_device` 的说明。
+    """
+    from sfzy.models.loader import load_inference_model
+
+    if args.model_config:
         cfg = load_config(resolve(args.model_config))
         model_cfg = dict(cfg.get("model") or {})
         name = model_cfg.get("model_name_or_path", "")
-        local = resolve(name)
-        if local.exists():
-            model_cfg["model_name_or_path"] = str(local)
-        tokenizer = load_tokenizer(model_cfg)
-        model = load_model(
-            model_cfg,
-            quant_config=build_quant_config(model_cfg),
-            gradient_checkpointing=False,      # 只做推理，不开检查点
-        )
-        if model_cfg.get("device_map") in (None, "", "none"):
-            model = model.to(args.device)
-        return model, tokenizer
+        if name:
+            local = resolve(name)
+            if local.exists():
+                model_cfg["model_name_or_path"] = str(local)
+    else:
+        model_cfg = {
+            "model_name_or_path": args.model,
+            "trust_remote_code": True,
+            "torch_dtype": args.dtype,
+            "load_in_4bit": bool(args.load_in_4bit),
+            "bnb_4bit_compute_dtype": args.dtype,
+        }
 
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
-    tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=dtype, trust_remote_code=True
-    ).to(args.device)
-    return model, tokenizer
+    return load_inference_model(
+        model_cfg,
+        device=args.device,
+        load_in_4bit=args.load_in_4bit,
+        gradient_checkpointing=False,
+    )
 
 
 def main() -> None:
@@ -98,6 +116,12 @@ def main() -> None:
     ap.add_argument("--adapter", default=None, help="可选：载入 LoRA 后再测（同源自评检验）")
     ap.add_argument("--device", default="cuda")
     ap.add_argument("--dtype", default="bfloat16")
+    # 量化开关：默认跟随配置。4090 上 7B bf16 够用，可加 --no-4bit 绕开
+    # bitsandbytes；T4 只有 16GB，必须留在 4-bit。
+    ap.add_argument("--load-in-4bit", dest="load_in_4bit", action="store_true",
+                    default=None, help="强制开启 4-bit（默认跟随配置）")
+    ap.add_argument("--no-4bit", dest="load_in_4bit", action="store_false",
+                    help="关掉 4-bit，走配置里的 bf16/fp16")
     ap.add_argument("--probes", default="data/judge/probe_cases.jsonl")
     ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"],
                     help="判定 Prompt 版本。小模型上先试 fewshot")
@@ -106,9 +130,11 @@ def main() -> None:
     if not args.model and not args.model_config:
         raise SystemExit("要么 --model，要么 --model-config")
 
+    quiet_transformers()
+
     tag = args.model_config or args.model
     print(f"模型来源 {tag}   设备 {args.device}" + (f"   adapter {args.adapter}" if args.adapter else ""))
-    model, tokenizer = build_model(args)
+    model, tokenizer, device = build_model(args)
 
     if args.adapter:
         from sfzy.models.lora import inject_lora, mark_only_lora_trainable
@@ -126,7 +152,8 @@ def main() -> None:
         load_checkpoint(resolve(args.adapter), model=model)
         print("已载入 adapter —— 测的是微调过的模型")
 
-    runtime = TorchRuntime(model=model, tokenizer=tokenizer, device=args.device)
+    # 用模型**实际**设备，避免量化模型经 device_map 放置后与 --device 错位
+    runtime = TorchRuntime(model=model, tokenizer=tokenizer, device=device)
     judge = FactConsistencyJudge(runtime=runtime, judge_variant=args.judge_variant)
 
     probes = [json.loads(l) for l in open(resolve(args.probes), encoding="utf-8") if l.strip()]

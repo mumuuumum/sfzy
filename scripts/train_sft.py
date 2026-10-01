@@ -31,6 +31,7 @@ from sfzy.models.loader import (                         # noqa: E402
     describe_model,
     load_model,
     load_tokenizer,
+    move_model_to_device,
 )
 from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
 from sfzy.sft.dataset import SFTDataset, load_records    # noqa: E402
@@ -157,7 +158,8 @@ def main() -> None:
     # 其余情况（device_map="auto" 或 DDP）模型已经被 accelerate 放好了，
     # 再调 .to() 会直接报错。
     if local_rank < 0 and model_cfg.get("device_map") in (None, "", "none"):
-        model = model.to(device)
+        # 量化模型不能 .to()：设备由 device_map 决定。见 loader.move_model_to_device
+        model = move_model_to_device(model, device)
 
     replaced = inject_lora(
         model,

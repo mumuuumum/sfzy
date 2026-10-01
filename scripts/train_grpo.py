@@ -30,7 +30,13 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                       # noqa: E402
 from sfzy.eval.metrics import build_scorer                # noqa: E402
-from sfzy.models.loader import build_quant_config, load_model, load_tokenizer  # noqa: E402
+from sfzy.models.loader import (                          # noqa: E402
+    build_quant_config,
+    load_model,
+    load_tokenizer,
+    move_model_to_device,
+    resolve_device_index,
+)
 from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
 from sfzy.rl.trainer import GRPOTrainer                   # noqa: E402
 from sfzy.sft.checkpoint import load_checkpoint           # noqa: E402
@@ -110,17 +116,39 @@ def main() -> None:
     # 和 generate_triples.py 同一条约束：**策略模型的精度必须和 SFT 一致**。
     # LoRA adapter 是在非量化底座上训出来的，换成 4-bit 底座会引入量化误差；
     # 而 RL 阶段是在这个（已经带误差的）策略上继续优化，误差会被放大。
-    if model_cfg.get("load_in_4bit") and not args.quantize:
+    # 量化开关有两个来源：命令行 --quantize，或配置里的 rl.quantize。
+    # 后者让"4-bit 策略"成为配置的一部分 —— 否则配置写着 load_in_4bit=true
+    # 却因为忘了加 --quantize 而静默跑成 bf16，只在显存日志里看得出来。
+    want_quant = bool(args.quantize or rl_cfg.get("quantize", False))
+    if model_cfg.get("load_in_4bit") and not want_quant:
         logger.warning(
             "模型配置里 load_in_4bit=True，但 GRPO 默认强制关闭量化："
-            "SFT 用的是非量化底座，策略必须一致。确实需要 4-bit 请显式传 --quantize"
+            "SFT 用的是非量化底座，策略必须一致。确实需要 4-bit 请显式传 --quantize，"
+            "或在配置里写 rl.quantize: true"
         )
         model_cfg = {**model_cfg, "load_in_4bit": False}
+    elif want_quant and not model_cfg.get("load_in_4bit"):
+        # 反向的坑：配置没写 load_in_4bit 但传了 --quantize，量化不会发生，
+        # 而你以为开了。这里补上，保持两个开关语义一致。
+        model_cfg = {**model_cfg, "load_in_4bit": True}
+
+    # 量化模型不能 .to()：位置必须在加载时用 device_map 定死（见 loader 的说明）。
+    # 策略固定在 cfg.device 指的卡上（单进程双卡方案里就是卡 0，卡 1 留给裁判）。
+    if want_quant and model_cfg.get("device_map") in (None, "", "none"):
+        idx = resolve_device_index(device)
+        if idx is not None:
+            model_cfg = {**model_cfg, "device_map": {"": idx}}
+    logger.info(
+        "策略精度: %s（量化=%s，device_map=%s）",
+        "4-bit nf4" if want_quant else model_cfg.get("torch_dtype", "auto"),
+        want_quant, model_cfg.get("device_map"),
+    )
 
     model = load_model(model_cfg, quant_config=build_quant_config(model_cfg),
                        gradient_checkpointing=rl_cfg.get("gradient_checkpointing", True))
     if model_cfg.get("device_map") in (None, "", "none"):
-        model = model.to(device)
+        # 量化模型不能 .to()：设备由 device_map 决定。见 loader.move_model_to_device
+        model = move_model_to_device(model, device)
 
     replaced = inject_lora(
         model, target_modules=lora_cfg.get("target_modules", []),

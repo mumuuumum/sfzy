@@ -515,3 +515,40 @@ def test_适配器_单组失败只标None不中断训练():
     )
     assert scores == [None]
     assert scorer.last_errors and "RuntimeError" in scorer.last_errors[0]
+
+
+# ---------------------------------------------------------------- 4-bit 裁判加载
+
+def test_build_runtime_把4bit和设备传下去(monkeypatch):
+    """裁判侧 4-bit 必须走 load_inference_model：device 翻译成 device_map，
+    量化模型加载后不搬。写错的表现是 24GB 卡上直接抛
+    ".to() is not supported for 4/8-bit bitsandbytes models"。"""
+    import torch
+
+    import sfzy.judge.runtime as R
+    import sfzy.models.loader as L
+
+    captured = {}
+
+    class _FakeModel:
+        def parameters(self):
+            return iter([torch.zeros(1)])
+
+        def eval(self):
+            return self
+
+    def fake_load(cfg, device="auto", gradient_checkpointing=False):
+        captured["cfg"] = dict(cfg)
+        captured["device"] = device
+        return _FakeModel(), _NativeTokenizer(), "cuda:1"
+
+    monkeypatch.setattr(L, "load_inference_model", fake_load)
+    rt = R.build_runtime(
+        "/path/Qwen2.5-7B-Instruct", device="cuda:1", dtype="bfloat16", load_in_4bit=True
+    )
+    assert captured["device"] == "cuda:1"
+    assert captured["cfg"]["load_in_4bit"] is True
+    assert captured["cfg"]["bnb_4bit_quant_type"] == "nf4"
+    assert captured["cfg"]["bnb_4bit_compute_dtype"] == "bfloat16"
+    # 用模型实际所在设备建运行时，避免输入张量送错卡
+    assert rt.device == "cuda:1"

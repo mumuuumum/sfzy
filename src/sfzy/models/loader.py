@@ -22,7 +22,7 @@ trust_remote_code，而模型的 config 也要读同一个参数。
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional, Tuple
 
 from sfzy.config import Config
 from collections import Counter
@@ -47,6 +47,68 @@ import torch
 from sfzy.utils.logging import get_logger
 
 logger = get_logger("loader")
+
+
+# ---------------------------------------------------------------------------
+# 设备放置：4/8-bit 量化模型不能 .to()
+# ---------------------------------------------------------------------------
+# transformers 的 `PreTrainedModel.to()` 对 bitsandbytes 量化模型直接抛
+#     ValueError: `.to()` is not supported for 4/8-bit bitsandbytes models
+# 因为量化权重是 int8/uint8 + 分布式 metadata，搬动会破坏它们，正确做法是
+# **加载时**用 `device_map` 决定位置。所以"加载后 .to(device)"这条路对量化
+# 模型根本走不通，只能在 load_model 里把 device_map 给对。
+#
+# 踩过的现场：`model_qwen25_7b.yaml` 开着 load_in_4bit，脚本里那句
+# `if device_map in (None, "", "none"): model.to(device)` 在 device_map 写成
+# null 的配置上会放行 → 4090 上直接抛上面的 ValueError；T4 用 0.5B/bf16 的
+# 配置时 device_map 也是 null 但没量化，`.to()` 正常，于是"T4 能跑、4090 崩"。
+_NO_DEVICE_MAP = (None, "", "none")
+
+
+def is_quantized_model(model: Any) -> bool:
+    """模型是不是 bitsandbytes 4/8-bit 量化的。三个属性取或，兼容不同版本。"""
+    if getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False):
+        return True
+    if getattr(model, "is_quantized", False):
+        return True
+    method = getattr(model, "quantization_method", None)
+    if method is None:
+        return False
+    # quantization_method 可能是枚举（QuantizationMethod.BITS_AND_BYTES），
+    # 也可能被字符串化。取 name 再比，别依赖 str() 的分隔符写法。
+    name = getattr(method, "name", None) or str(method)
+    return "BITS_AND_BYTES" in name.upper() or "BITSANDBYTES" in name.upper()
+
+
+def resolve_device_index(device: Any) -> Optional[int]:
+    """把设备串翻译成卡号：'cuda:1' → 1，'cuda' → 0，'cpu'/None/'auto' → None。"""
+    if device is None or isinstance(device, int):
+        return device if isinstance(device, int) else None
+    text = str(device)
+    if not text.startswith("cuda"):
+        return None
+    return int(text.split(":", 1)[1]) if ":" in text else 0
+
+
+def move_model_to_device(model: Any, device: Any) -> Any:
+    """把**非量化**模型搬到 device；量化模型原样返回。
+
+    量化模型的位置已经由加载时的 device_map 定死了，再 `.to()` 会抛
+    `ValueError: .to() is not supported for ... bitsandbytes models`。
+    所有"手动搬运"的地方都该走这个函数，而不是裸 `model.to(...)`。
+    """
+    if is_quantized_model(model):
+        return model
+    return model.to(device)
+
+
+def resolve_model_device(model: Any, fallback: Any = "cuda:0") -> str:
+    """模型实际落在哪个设备上。用来给运行时/tokenizer 对齐设备，避免
+    "模型在 cuda:0、输入张量送到 cuda:1"这种静默错位。"""
+    try:
+        return str(next(model.parameters()).device)
+    except (StopIteration, AttributeError):
+        return str(fallback)
 
 
 def build_quant_config(model_cfg: Dict[str, Any]) -> Any:
@@ -261,6 +323,63 @@ def load_model(
 
     return model
     
+
+
+def _target_device(device: Any) -> str:
+    """把 'auto'/None 解析成一个具体设备串。"""
+    if device is None or str(device) in ("auto", ""):
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    return str(device)
+
+
+def load_inference_model(
+    model_cfg: Dict[str, Any],
+    device: Any = "auto",
+    load_in_4bit: Optional[bool] = None,
+    gradient_checkpointing: bool = False,
+) -> Tuple[Any, Any, str]:
+    """纯推理加载：tokenizer + model，并**正确处理 4/8-bit 的设备放置**。
+
+    返回 `(model, tokenizer, device_str)`。`device_str` 是模型**实际**所在的
+    设备，调用方应该拿它建运行时，而不要再用手写的 `--device` —— 量化模型的
+    位置由 `device_map` 决定，两者可能不一致，错位后报的是"张量不在同一设备"，
+    根因却在这里。
+
+    和 `load_model` 的区别只有一条，但很关键：
+    **量化模型不能 `.to()`**，只能用 `device_map` 在加载时放好。所以这里的
+    做法是先把 `--device`（或 `auto`）翻译成 `{"": 卡号}` 再加载，加载完
+    一个字都不搬。非量化模型也走同一条路，行为一致、少一个分支。
+
+    `load_in_4bit` 为 None 时跟随配置；给 True/False 可以强制开关，
+    4090 上跑 7B 时用它关掉量化走 bf16（24GB 装得下）。
+    """
+    cfg = dict(model_cfg)
+    if load_in_4bit is not None:
+        cfg["load_in_4bit"] = bool(load_in_4bit)
+
+    target = _target_device(device)
+    idx = resolve_device_index(target)
+    # 先判设备再构造量化配置：CPU 上构造 BitsAndBytesConfig 本身也会失败
+    # （依赖 bitsandbytes），这里要先给出"4-bit 需要 CUDA"这个可读的错误。
+    wants_quant = bool(cfg.get("load_in_4bit") or cfg.get("load_in_8bit"))
+    if wants_quant and idx is None:
+        raise ValueError(
+            f"load_in_4bit=True 需要 CUDA 设备，但解析出的设备是 {target!r}。"
+            " 要么 --device cuda:N，要么关掉 4-bit（--no-4bit）改走 bf16/fp16。"
+        )
+    quant = build_quant_config(cfg)
+
+    # 推理固定单卡：不做模型并行分片，位置完全可预测。
+    cfg["device_map"] = {"": idx} if idx is not None else None
+
+    tokenizer = load_tokenizer(cfg)
+    model = load_model(
+        cfg, quant_config=quant, gradient_checkpointing=gradient_checkpointing
+    )
+    # device_map 已经把模型放好了；CPU 分支再兜一次底（from_pretrained(None) 默认 CPU）。
+    if idx is None:
+        model = move_model_to_device(model, target)
+    return model, tokenizer, resolve_model_device(model, fallback=target)
 
 
 def describe_model(model: Any) -> Dict[str, Any]:
