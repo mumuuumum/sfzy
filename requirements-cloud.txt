@@ -21,9 +21,10 @@
 # 上限 <5.0 是硬约束：ChatGLM3 的远程代码是 2023 年写的，
 # transformers 5.x 的接口变更让它大概率加载不了。
 # 具体哪个版本能跑，以 scripts/check_model.py 的验证结果为准。
-transformers>=4.40,<5.0
-
-accelerate>=0.30
+transformers==4.40.2
+bitsandbytes>=0.46.1
+accelerate==1.0.1
+peft==0.13.0
 datasets>=2.18
 jieba>=0.42
 pyyaml>=6.0
