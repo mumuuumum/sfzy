@@ -37,40 +37,6 @@ model_config: configs/model_chatglm3_6b_nf4.yaml
 
 
 
-# rl:
-#   # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
-#   # 等价于在命令行加 --quantize，但写进配置更不容易忘。
-#   quantize: true
-#   reward:
-#     mode: fact_judge
-#     weights:
-#       rouge_l: 0.3             # 保持和官方评测口径的锚
-#       fact: 0.7                # ★ 六要素事实一致性 Judge，主信号
-#       semantic: 0.0            # fact_judge 不额外挂点式裁判
-#       length: 0.0              # 长度项只在 flat 模式下生效
-
-# semantic:
-#   backend: fact
-#   # 裁判模型：Qwen2.5-7B-Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct，
-#   # 想先用小模型验接线就换成它（判定力较弱，见 docs/fact_judge.md 第 2 节）。
-#   model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
-#   device: cuda:1               # ★ 裁判钉卡 1，策略吃卡 0
-#   dtype: bfloat16              # 4090 支持 bf16；T4（Turing）要改 float16
-
-#   # ---- 裁判侧 4-bit NF4（完全冻结、只做 inference）----
-#   load_in_4bit: true
-#   bnb_4bit_compute_dtype: bfloat16
-#   trust_remote_code: false     # Qwen2.5 是官方架构，不需要远程代码
-
-#   # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
-#   max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限（一次前向）
-#   extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
-#   min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
-#   judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot
-#   doc_fallback: true           # 要素抽空时拿整篇原文兜底判定，避免反向梯度
-
-
-
 rl:
   # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
   # 等价于在命令行加 --quantize，但写进配置更不容易忘。
@@ -87,18 +53,52 @@ semantic:
   backend: fact
   # 裁判模型：Qwen2.5-7B-Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct，
   # 想先用小模型验接线就换成它（判定力较弱，见 docs/fact_judge.md 第 2 节）。
-  model: Qwen/Qwen2.5-7B-Instruct
+  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
   device: cuda:1               # ★ 裁判钉卡 1，策略吃卡 0
-  dtype: float16              # 4090 支持 bf16；T4（Turing）要改 float16
+  dtype: bfloat16              # 4090 支持 bf16；T4（Turing）要改 float16
 
   # ---- 裁判侧 4-bit NF4（完全冻结、只做 inference）----
   load_in_4bit: true
-  bnb_4bit_compute_dtype: float16
+  bnb_4bit_compute_dtype: bfloat16
   trust_remote_code: false     # Qwen2.5 是官方架构，不需要远程代码
 
   # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
-  max_batch_size: 4            # 6 要素 × G 候选组成的 batch 上限（一次前向）
+  max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限（一次前向）
   extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
   min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
   judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot
   doc_fallback: true           # 要素抽空时拿整篇原文兜底判定，避免反向梯度
+
+
+
+# rl:
+#   # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
+#   # 等价于在命令行加 --quantize，但写进配置更不容易忘。
+#   quantize: true
+#   reward:
+#     mode: fact_judge
+#     weights:
+#       rouge_l: 0.3             # 保持和官方评测口径的锚
+#       fact: 0.7                # ★ 六要素事实一致性 Judge，主信号
+#       semantic: 0.0            # fact_judge 不额外挂点式裁判
+#       length: 0.0              # 长度项只在 flat 模式下生效
+
+# semantic:
+#   backend: fact
+#   # 裁判模型：Qwen2.5-7B-Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct，
+#   # 想先用小模型验接线就换成它（判定力较弱，见 docs/fact_judge.md 第 2 节）。
+#   model: Qwen/Qwen2.5-7B-Instruct
+#   device: cuda:1               # ★ 裁判钉卡 1，策略吃卡 0
+#   dtype: float16              # 4090 支持 bf16；T4（Turing）要改 float16
+
+#   # ---- 裁判侧 4-bit NF4（完全冻结、只做 inference）----
+#   load_in_4bit: true
+#   bnb_4bit_compute_dtype: float16
+#   trust_remote_code: false     # Qwen2.5 是官方架构，不需要远程代码
+
+#   # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
+#   max_batch_size: 4            # 6 要素 × G 候选组成的 batch 上限（一次前向）
+#   extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
+#   min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
+#   judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot
+#   doc_fallback: true           # 要素抽空时拿整篇原文兜底判定，避免反向梯度

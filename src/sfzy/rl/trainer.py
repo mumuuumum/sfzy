@@ -311,12 +311,21 @@ class GRPOTrainer:
         breakdowns = compute_rewards(
             batch["responses"], refs, sources, self.reward_cfg, semantic
         )
-        rewards = torch.tensor([b.total for b in breakdowns], dtype=torch.float32)
+        # ★ 奖励/长度/基线必须建在**模型所在的设备**上。
+        # 默认的 torch.tensor([...]) 建在 CPU；后续 advantages 也就留在 CPU，
+        # 而 logprobs 在 GPU —— grpo_loss 里 `ratio * advantages` 会直接报
+        # "Expected all tensors to be on the same device, but found at least
+        # two devices, cuda:0 and cpu!"。CPU 冒烟测试永远碰不到（两边都是 CPU），
+        # 只有真机跑 GRPO 才会暴露。
+        rewards = torch.tensor(
+            [b.total for b in breakdowns], dtype=torch.float32, device=self.device
+        )
         rewards = rewards.reshape(len(prompts), self.group_size)
 
         # ---- advantage（组内归一化 + 长度归一化 + 组过滤）----
         lengths = torch.tensor(
-            [len(r.strip()) for r in batch["responses"]], dtype=torch.float32
+            [len(r.strip()) for r in batch["responses"]],
+            dtype=torch.float32, device=self.device,
         ).reshape(len(prompts), self.group_size)
         # 基线锚：查不到基线的 prompt 用 -1e9 填充 —— 阈值比较永远成立，
         # 等价于"这一组不参与锚过滤"，不会误伤。
@@ -324,7 +333,7 @@ class GRPOTrainer:
         if self.baseline_rewards:
             baseline = torch.tensor(
                 [self.baseline_rewards.get(str(p.get("id")), -1e9) for p in prompts],
-                dtype=torch.float32,
+                dtype=torch.float32, device=self.device,
             )
         advantages, keep = compute_advantages(
             rewards, lengths, length_mode=self.length_mode,
