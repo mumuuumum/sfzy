@@ -143,13 +143,26 @@ def test_generate_one_按max_length截断并保留尾部():
     assert passed == full[-5:], "截断后应当是原序列的尾部"
 
 
-def test_贪心时不传temperature():
-    """贪心解码传 temperature 会触发 warning，而且没有意义。"""
+def test_贪心时显式清掉temperature():
+    """贪心解码下 temperature/top_p/top_k 没有意义，但**不能只是不传**。
+
+    Qwen2.5 的 `generation_config.json` 自带 temperature=0.7 / top_p=0.8 /
+    top_k=20。只传 `do_sample=False` 的话，transformers 合并配置后会打印
+
+        The following generation flags are not valid and may be ignored:
+        ['temperature', 'top_p', 'top_k']
+
+    所以贪心路径要显式把它们传成 None 清掉（见 compat.greedy_generation_kwargs）。
+    采样路径反之 —— 那时 temperature/top_p 是真正要生效的参数。
+    """
     model, tokenizer = make_model(), FakeTokenizer()
 
     generate_one(model, tokenizer, MESSAGES, do_sample=False)
-    assert "temperature" not in model.calls[-1]["kwargs"]
-    assert model.calls[-1]["kwargs"]["do_sample"] is False
+    kwargs = model.calls[-1]["kwargs"]
+    assert kwargs["do_sample"] is False
+    assert kwargs["temperature"] is None
+    assert kwargs["top_p"] is None
+    assert kwargs["top_k"] is None
 
     generate_one(model, tokenizer, MESSAGES, do_sample=True, temperature=0.9, top_p=0.95)
     assert model.calls[-1]["kwargs"]["temperature"] == 0.9

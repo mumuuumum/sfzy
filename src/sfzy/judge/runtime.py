@@ -55,6 +55,8 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from sfzy.models.compat import greedy_generation_kwargs
+
 ROOT = Path(__file__).resolve().parents[3]
 
 DIGITS = "01234"
@@ -158,6 +160,11 @@ class TorchRuntime:
                     do_sample=False,                 # 需求第 1、2 条：确定性
                     num_beams=1,
                     pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    # 裁判一律贪心。Qwen2.5 的 generation_config 自带
+                    # temperature/top_p/top_k，不显式清掉的话 generate() 会打印
+                    # "generation flags are not valid and may be ignored"。
+                    # 见 compat.greedy_generation_kwargs 的说明。
+                    **greedy_generation_kwargs(),
                 )
                 new = gen[:, input_ids.shape[1]:]
                 out.extend(

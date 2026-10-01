@@ -176,10 +176,15 @@ def main() -> None:
     # 生成和训练走的是两条不同的 transformers 代码路径，两条都要验。
     model.eval()
     with torch.no_grad():
+        from sfzy.models.compat import greedy_generation_kwargs
+
         generated = model.generate(
             **inputs, max_new_tokens=8, do_sample=False,
             pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
+            # 清掉 Qwen2.5 generation_config 里自带的 temperature/top_p/top_k，
+            # 否则贪心解码会打印"generation flags are not valid"的告警
+            **greedy_generation_kwargs(),
         )
     new_tokens = generated.shape[1] - inputs["input_ids"].shape[1]
     print(f"      生成 {new_tokens} 个 token，输出形状 {tuple(generated.shape)}")

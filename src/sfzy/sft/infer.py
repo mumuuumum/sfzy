@@ -17,6 +17,7 @@ import torch
 
 from sfzy.data.prompts import build_messages
 from sfzy.models.chat_template import decode, encode_prompt
+from sfzy.models.compat import greedy_generation_kwargs
 from sfzy.utils.logging import get_logger
 
 logger = get_logger("infer")
@@ -132,6 +133,10 @@ def generate_one(
         # temperature / top_p 只在采样时有意义；贪心时传了会报 warning
         if do_sample:
             gen_kwargs.update(temperature=temperature, top_p=top_p)
+        else:
+            # Qwen2.5 的 generation_config 自带 temperature/top_p/top_k，贪心时
+            # 不清掉会打印 "generation flags are not valid and may be ignored"。
+            gen_kwargs.update(greedy_generation_kwargs())
         with torch.no_grad():
             output = model.generate(input_ids=input_ids, **gen_kwargs)
 
@@ -270,6 +275,9 @@ def generate_batch(
     )
     if do_sample:
         gen_kwargs.update(temperature=temperature, top_p=top_p)
+    else:
+        # 同上：贪心时清掉模型自带的采样参数，避免无意义的告警刷屏
+        gen_kwargs.update(greedy_generation_kwargs())
 
     old_side = tokenizer.padding_side
     tokenizer.padding_side = "left"          # 生成阶段必须是左 padding

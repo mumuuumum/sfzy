@@ -227,6 +227,26 @@ T4 上看不到，只是因为那次日志级别不是 INFO（或跑的是别的
 在启动时把 transformers 的日志压回默认的 WARNING，这条 INFO 不再混进判分输出，
 真正的 WARNING/ERROR 照常打印。
 
+### 关于 "generation flags are not valid and may be ignored"
+
+判分时还会看到这一行：
+
+```
+The following generation flags are not valid and may be ignored:
+['temperature', 'top_p', 'top_k']. Set `TRANSFORMERS_VERBOSITY=info` for more details.
+```
+
+**同样是 warning，不是错误，行为也是对的。** 来源是 Qwen2.5 的
+`generation_config.json` 自带 `temperature=0.7 / top_p=0.8 / top_k=20`：
+裁判走的是确定性生成（`do_sample=False`，需求第 1、2 条），transformers 合并配置后
+发现"关了采样却还带着采样参数"，于是提示这些参数会被忽略 —— 它们**确实**被忽略了，
+贪婪解码本来就不读它们，所以判分结果不受影响。
+
+现在 Judge 的生成路径显式把这七个采样参数传成 `None`（`compat.greedy_generation_kwargs`），
+合并后的配置里它们就不存在了，告警消失、行为不变。`sft/infer.py` 与
+`check_model.py` 的贪心路径同样处理；采样路径（GRPO rollout）不受影响，
+那里 `temperature/top_p` 是真正要生效的参数。
+
 ### 训练日志里能看到的（需求第十二节）
 
 每个优化步打印一行：

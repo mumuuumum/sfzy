@@ -11,8 +11,10 @@ from __future__ import annotations
 from transformers import PreTrainedModel
 
 from sfzy.models.compat import (
+    GREEDY_UNUSED_GENERATION_FLAGS,
     ensure_legacy_cache,
     ensure_tp_plan,
+    greedy_generation_kwargs,
     patch_pretrained_config,
     patch_tied_weights_keys,
     patch_tp_plan_for_quantized_load,
@@ -402,3 +404,23 @@ def test_显式关闭旧版缓存():
 
     assert ensure_legacy_cache(ChatGLMForConditionalGeneration(), force=False) is False
     assert ChatGLMForConditionalGeneration._supports_default_dynamic_cache() is True
+
+
+# ---------------------------------------------------------------- 贪婪解码清参
+
+def test_贪婪解码_七个采样参数都清成None():
+    """Qwen2.5 的 generation_config 自带 temperature/top_p/top_k，
+    `generate(do_sample=False)` 不清掉它们就会打印
+    "The following generation flags are not valid and may be ignored"。
+    这个函数就是把它们显式传成 None 的唯一入口，键名少一个都会漏告警。"""
+    kwargs = greedy_generation_kwargs()
+    assert set(kwargs) == set(GREEDY_UNUSED_GENERATION_FLAGS)
+    assert all(value is None for value in kwargs.values())
+    assert {"temperature", "top_p", "top_k"} <= set(kwargs)
+
+
+def test_贪婪解码_额外参数合并():
+    kwargs = greedy_generation_kwargs(max_new_tokens=4, do_sample=False)
+    assert kwargs["max_new_tokens"] == 4
+    assert kwargs["do_sample"] is False
+    assert kwargs["temperature"] is None

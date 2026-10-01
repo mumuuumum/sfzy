@@ -327,3 +327,38 @@ def describe_gradient_checkpointing(model: Any) -> Dict[str, Any]:
         "encoder_flag": getattr(encoder, "gradient_checkpointing", "（无此属性）")
         if encoder is not None else None,
     }
+
+
+# ---------------------------------------------------------------------------
+# 贪婪解码：清掉模型自带的采样默认值
+# ---------------------------------------------------------------------------
+# Qwen2.5 的 `generation_config.json` 自带 temperature=0.7 / top_p=0.8 / top_k=20。
+# 调 `generate(do_sample=False)` 时 transformers 会把这份配置合并进来，然后
+# `GenerationConfig.validate()` 发现"do_sample=False 却带着采样参数"，于是打印
+#
+#     The following generation flags are not valid and may be ignored:
+#     ['temperature', 'top_p', 'top_k']. Set TRANSFORMERS_VERBOSITY=info …
+#
+# 这是 **warning 不是错误**，参数也确实被忽略了（贪婪解码不读它们）—— 但裁判
+# 每次都走贪婪，每跑一条就刷一行，很干扰，而且容易让人误以为判分逻辑有问题。
+#
+# 修法是把这些参数**显式传成 None**：合并后的配置里它们就不存在了，告警消失，
+# 行为完全不变。注意只对 transformers 原生的 `generate()` 这么做 ——
+# ChatGLM3 那类自带 `stream_generate` 的模型走的是自己的循环，不吃这一套，
+# 硬塞 None 反而可能崩。
+GREEDY_UNUSED_GENERATION_FLAGS = (
+    "temperature", "top_p", "top_k",
+    "min_p", "typical_p", "epsilon_cutoff", "eta_cutoff",
+)
+
+
+def greedy_generation_kwargs(**extra: Any) -> Dict[str, Any]:
+    """贪婪解码（do_sample=False）要一并传进 `generate()` 的 kwargs。
+
+        model.generate(**inputs, do_sample=False, **greedy_generation_kwargs())
+
+    返回值里七个采样参数都是 None，用来覆盖模型 `generation_config` 里的默认值。
+    """
+    kwargs: Dict[str, Any] = {name: None for name in GREEDY_UNUSED_GENERATION_FLAGS}
+    kwargs.update(extra)
+    return kwargs

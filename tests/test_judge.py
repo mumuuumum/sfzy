@@ -331,6 +331,7 @@ class _NativeTokenizer:
 
     pad_token_id = 0
     eos_token_id = 2
+    padding_side = "left"        # 生成路径会临时改它，得先存在
 
     def __call__(self, text=None, return_tensors=None, add_special_tokens=False,
                  padding=False, truncation=False, max_length=None):
@@ -552,3 +553,54 @@ def test_build_runtime_把4bit和设备传下去(monkeypatch):
     assert captured["cfg"]["bnb_4bit_compute_dtype"] == "bfloat16"
     # 用模型实际所在设备建运行时，避免输入张量送错卡
     assert rt.device == "cuda:1"
+
+
+# ---------------------------------------------------------------- 贪婪生成的告警
+
+class _FakeGenModel:
+    """标准 HF 生成路径的假模型：只记录 generate() 收到的 kwargs。"""
+
+    def __init__(self):
+        import torch
+
+        self._torch = torch
+        self.gen_kwargs = None
+
+    def parameters(self):
+        import torch
+
+        return iter([torch.zeros(1)])
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def generate(self, input_ids=None, attention_mask=None, **kwargs):
+        import torch
+
+        self.gen_kwargs = kwargs
+        extra = torch.zeros((input_ids.shape[0], 2), dtype=input_ids.dtype)
+        return torch.cat([input_ids, extra], dim=1)
+
+
+def test_贪婪生成_清掉模型自带的采样参数():
+    """Qwen2.5 的 generation_config 自带 temperature/top_p/top_k。
+
+    judge 走的是贪心（do_sample=False），不显式把它们传成 None 的话，
+    transformers 会打印
+        The following generation flags are not valid and may be ignored:
+        ['temperature', 'top_p', 'top_k']
+    这不是错误（参数确实被忽略），但每次判分都刷一行很干扰。这里钉住
+    judge 的生成路径确实把它们清掉了。
+    """
+    from sfzy.judge.runtime import TorchRuntime
+
+    model = _FakeGenModel()
+    rt = TorchRuntime(model=model, tokenizer=_NativeTokenizer(), device="cpu")
+    assert rt.native is False
+    out = rt.generate_batch(["prompt"], max_new_tokens=2)
+    assert out == ["生成结果"]
+    assert model.gen_kwargs["do_sample"] is False
+    assert model.gen_kwargs["temperature"] is None
+    assert model.gen_kwargs["top_p"] is None
+    assert model.gen_kwargs["top_k"] is None
