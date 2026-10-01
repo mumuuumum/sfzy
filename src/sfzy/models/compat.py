@@ -9,17 +9,21 @@
   * 散在 loader.py 里会慢慢变成"没人知道为什么存在、删了又怕出事"的代码；
   * 每一条都能单独写测试（用假 config 验证回填逻辑，不需要真的加载模型）。
 
-这里集中五件事，对应实际踩过的五个坑：
+这里集中六件事，对应实际踩过的坑：
   1. 新版 transformers 移走的 generation 属性（max_length / use_cache ...）
   2. all_tied_weights_keys 缺失
   3. tokenizer 的 padding 方向
   4. 梯度检查点在 ChatGLM3 上是空实现（见 ensure_gradient_checkpointing）
   5. 没有 TP plan 的模型在新版 transformers 的加载路径里会崩（见
      patch_tp_plan_for_quantized_load）
+  6. 旧模型跳过 generate() 直调生成子方法，而新版 transformers 把
+     `_eos_token_tensor` 这类私有属性只在 generate() 里设（见
+     patch_generation_private_attrs）
 """
 
 from __future__ import annotations
 
+import functools
 import importlib
 from typing import Any, Dict, Optional
 
@@ -120,6 +124,79 @@ def patch_tp_plan_for_quantized_load() -> bool:
     get_total_byte_count._sfzy_patched = True
     modeling_utils.get_total_byte_count = get_total_byte_count
     return True
+
+
+_ABSENT = object()
+
+
+def ensure_eos_token_tensor_attr(generation_config: Any) -> bool:
+    """回填 `_eos_token_tensor`，返回是否真的补了（已存在时返回 False）。
+
+    拆成纯函数是为了能单测 —— 包装函数里那段逻辑拿不到真模型不好验。
+    """
+    if getattr(generation_config, "_eos_token_tensor", _ABSENT) is _ABSENT:
+        generation_config._eos_token_tensor = None
+        return True
+    return False
+
+
+# stream_generate 会按顺序调这两个方法，它们都要读 `_eos_token_tensor`：
+# `_get_stopping_criteria` 必读，`_get_logits_processor` 只在开了
+# suppress_tokens / forced_eos_token_id / min_length 之类开关时才读。
+# 一起补上，省得换个生成配置又崩在另一个方法上。
+_LEGACY_GENERATION_METHODS = ("_get_logits_processor", "_get_stopping_criteria")
+
+
+def patch_generation_private_attrs() -> bool:
+    """补上新版 transformers 的私有属性，让旧模型的 `stream_generate` 能跑。返回是否真的打了补丁。
+
+    报错长这样（ChatGLM3 走它自己的生成循环时必现）：
+
+        File ".../modeling_chatglm.py", line 1167, in stream_generate
+            stopping_criteria = self._get_stopping_criteria(...)
+        File ".../transformers/generation/utils.py", line 1336, in _get_stopping_criteria
+            if generation_config._eos_token_tensor is not None:
+        AttributeError: 'GenerationConfig' object has no attribute '_eos_token_tensor'
+
+    根因是**两段代码对同一个对象的约定不一致**：
+
+      * `GenerationMixin.generate()` 会先调 `_prepare_special_tokens()`，
+        把 `_eos_token_tensor` / `_bos_token_tensor` / `_pad_token_tensor` 这些
+        **私有**属性写到 generation_config 上，之后 `_get_logits_processor()` /
+        `_get_stopping_criteria()` 才去读它们；
+      * ChatGLM3 的 `stream_generate()` 是作者在 2023 年自己写的一套循环，
+        它**跳过了 `generate()`**，直接调上面两个方法，于是这些属性从没被设过，
+        读的时候就 AttributeError。
+
+    为什么补 `None` 而不是补真正的 EOS 张量：`stream_generate` 的循环里
+    已经用 `unfinished_sequences`（基于 `eos_token_id_tensor`）自己处理 EOS 停止了，
+    EosTokenCriteria 对它来说是**冗余**的；补 None 只是让那些 `is not None`
+    判断有东西可判，行为不受影响。正常 `generate()` 路径属性本来就存在，
+    这个补丁对它是彻底的空操作。
+
+    补丁用 `*args/**kwargs` 原样转发，所以不依赖这些方法的签名（各 transformers
+    版本现在就不一样）。旧版没有这些方法时直接返回 False，零副作用。
+    """
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except ImportError:  # pragma: no cover - transformers 一定装得上
+        return False
+
+    patched_any = False
+    for name in _LEGACY_GENERATION_METHODS:
+        original = getattr(GenerationMixin, name, None)
+        if original is None or getattr(original, "_sfzy_patched", False):
+            continue
+
+        @functools.wraps(original)
+        def wrapper(self, generation_config, *args, _original=original, **kwargs):
+            ensure_eos_token_tensor_attr(generation_config)
+            return _original(self, generation_config, *args, **kwargs)
+
+        wrapper._sfzy_patched = True
+        setattr(GenerationMixin, name, wrapper)
+        patched_any = True
+    return patched_any
 
 
 def patch_pretrained_config(config: Any, model_cfg: Optional[Dict[str, Any]] = None) -> None:

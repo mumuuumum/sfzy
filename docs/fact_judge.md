@@ -247,6 +247,30 @@ The following generation flags are not valid and may be ignored:
 `check_model.py` 的贪心路径同样处理；采样路径（GRPO rollout）不受影响，
 那里 `temperature/top_p` 是真正要生效的参数。
 
+### 关于 `AttributeError: 'GenerationConfig' object has no attribute '_eos_token_tensor'`
+
+跑 GRPO rollout（或任何走 ChatGLM3 `stream_generate` 的生成）时会撞到：
+
+```
+File ".../modeling_chatglm.py", line 1167, in stream_generate
+    stopping_criteria = self._get_stopping_criteria(...)
+File ".../transformers/generation/utils.py", line 1336, in _get_stopping_criteria
+    if generation_config._eos_token_tensor is not None:
+AttributeError: 'GenerationConfig' object has no attribute '_eos_token_tensor'
+```
+
+**根因是接口时间差，不是配置错误。** 新版 transformers 的
+`_get_logits_processor()` / `_get_stopping_criteria()` 要读 `_eos_token_tensor`
+这类**私有**属性，而它们只在 `generate()` 的 `_prepare_special_tokens()` 里被写到
+generation_config 上。ChatGLM3 的 `stream_generate()` 是作者自己写的一套循环，
+**跳过了 `generate()`**，于是属性从没被设过。
+
+修法在 `models/compat.patch_generation_private_attrs()`：把这两个方法包一层，
+调用前若属性缺失就补 `None`，随后原样转发（`*args/**kwargs`，不依赖签名）。
+补 `None` 不影响 EOS 停止 —— `stream_generate` 的循环里已用 `unfinished_sequences`
+自己处理了；原来的 `generate()` 路径属性本就存在，补丁对它是彻底空操作。
+补丁在 `load_model` 里加载时自动装上，所以不需要改任何配置或启动命令。
+
 ### 训练日志里能看到的（需求第十二节）
 
 每个优化步打印一行：

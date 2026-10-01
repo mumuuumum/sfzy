@@ -12,9 +12,11 @@ from transformers import PreTrainedModel
 
 from sfzy.models.compat import (
     GREEDY_UNUSED_GENERATION_FLAGS,
+    ensure_eos_token_tensor_attr,
     ensure_legacy_cache,
     ensure_tp_plan,
     greedy_generation_kwargs,
+    patch_generation_private_attrs,
     patch_pretrained_config,
     patch_tied_weights_keys,
     patch_tp_plan_for_quantized_load,
@@ -424,3 +426,41 @@ def test_贪婪解码_额外参数合并():
     assert kwargs["max_new_tokens"] == 4
     assert kwargs["do_sample"] is False
     assert kwargs["temperature"] is None
+
+
+# ---------------------------------------------------------------- stream_generate
+
+def test_补generation私有属性_缺属性时回填None():
+    """ChatGLM3 的 stream_generate 跳过 generate()，直接调
+    `_get_stopping_criteria`，而新版 transformers 该方法要读
+    `generation_config._eos_token_tensor` —— 这个私有属性只有 generate()
+    会设。缺了就 AttributeError，补丁负责把它回填成 None。"""
+
+    class _Cfg:
+        pass
+
+    cfg = _Cfg()
+    assert ensure_eos_token_tensor_attr(cfg) is True
+    assert cfg._eos_token_tensor is None
+
+
+def test_补generation私有属性_已存在时不覆盖():
+    """正常 generate() 会先设好这个属性，补丁必须是空操作，不能把它改掉。"""
+
+    class _Cfg:
+        _eos_token_tensor = "已存在的张量"
+
+    cfg = _Cfg()
+    assert ensure_eos_token_tensor_attr(cfg) is False
+    assert cfg._eos_token_tensor == "已存在的张量"
+
+
+def test_补generation私有属性_两个方法都装上且幂等():
+    """load_model 每次加载都会调，必须幂等，不能层层套娃。"""
+    from transformers.generation.utils import GenerationMixin
+
+    assert patch_generation_private_attrs() is True
+    assert getattr(GenerationMixin._get_stopping_criteria, "_sfzy_patched", False)
+    # `_get_logits_processor` 只在特定开关下才读这个属性，但一样要补
+    assert getattr(GenerationMixin._get_logits_processor, "_sfzy_patched", False)
+    assert patch_generation_private_attrs() is False, "第二次调用应识别出已打过补丁"

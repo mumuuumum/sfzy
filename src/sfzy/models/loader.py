@@ -35,6 +35,7 @@ from transformers import (
 from sfzy.models.compat import (
     ensure_gradient_checkpointing,
     ensure_legacy_cache,
+    patch_generation_private_attrs,
     patch_pretrained_config,
     patch_tied_weights_keys,
     patch_tp_plan_for_quantized_load,
@@ -211,6 +212,12 @@ def load_model(
     # torch.distributed 已初始化（也就是 DDP）时才去读 model.tp_plan，
     # ChatGLM3 没有这个属性 → len(None) 直接崩。
     patch_tp_plan_for_quantized_load()
+    # ChatGLM3 自带的 stream_generate 跳过 generate()，直接调
+    # _get_logits_processor / _get_stopping_criteria，而新版 transformers
+    # 这两个方法要读一个只有
+    # generate() 才会设上的私有属性 _eos_token_tensor → AttributeError。
+    # 补在类上，全局一次即可（幂等）。
+    patch_generation_private_attrs()
 
     config = AutoConfig.from_pretrained(
         model_name,
