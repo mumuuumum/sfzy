@@ -51,7 +51,7 @@ class FakeTokenizer:
 
 
 class StubScorer(SemanticScorer):
-    """假裁判：分数随候选长度单调上升，方便断言"分数真的进了奖励"。
+    """假裁判：分数随候选长度上升，方便断言"分数真的进了奖励"。
 
     同时记录调用次数 —— 没有这条断言，"裁判被调用但结果被丢掉"这种接缝
     bug 会让测试依然通过。
@@ -66,7 +66,20 @@ class StubScorer(SemanticScorer):
     def score_batch(self, items):
         self.calls += 1
         self.seen_items.extend(items)
-        return [min(100.0, 10.0 + 2.0 * len(i["candidate"])) for i in items]
+        return [_stub_score(i["candidate"]) for i in items]
+
+
+def _stub_score(text: str) -> float:
+    """长度项 + **内容相关的稳定扰动**。
+
+    为什么必须带内容：微型随机模型在 eval 模式下（rollout 的正确模式）为同一个
+    prompt 采样的 G 条**长度经常完全相同**（实测 4 条都是 8 个 token），只按长度
+    打分会让奖励在组内变成常数、advantage 全 0 —— 那是夹具退化，不是管线问题。
+
+    用 `sum(map(ord, ...))` 而不是内置 `hash()`：后者受 PYTHONHASHSEED 影响，
+    同一份输入跨进程会给出不同的分，测试就不再可复现。
+    """
+    return min(100.0, 10.0 + 2.0 * len(text) + sum(map(ord, text)) % 5)
 
 
 def tiny_model():
@@ -187,6 +200,64 @@ def test_train_能跑到最后并保存(tmp_path):
     assert state.step == 2                       # 4 个 prompt / 每步 2 个
     assert len(state.history) == 2
     assert (tmp_path / "step_000002.pt").exists()
+
+
+# ---------------------------------------------------------------- train/eval 模式
+
+def test_训练前向必须处在_train_模式(tmp_path, monkeypatch):
+    """回归测试：GRPO 此前从不调 `model.train()`。
+
+    HF 的 `from_pretrained` 结尾会把模型设成 eval，而 ChatGLM3 的梯度检查点
+    条件是 `if self.gradient_checkpointing and self.training:` —— training=False
+    会让整个条件短路，检查点静默失效、激活按「每层完整保存」算，长序列必然
+    OOM，且报错栈里全是 bitsandbytes 的调用，看不出根因。
+
+    这里故意先把模型置成 eval，验证 `step()` 自己会切回 train。
+    """
+    import sfzy.rl.trainer as trainer_mod
+
+    seen: dict = {}
+    real = trainer_mod.sequence_logprob
+
+    def spy(model, *args, **kwargs):
+        seen.setdefault("training", model.training)
+        return real(model, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_mod, "sequence_logprob", spy)
+
+    trainer = make_trainer(tmp_path)
+    trainer.model.eval()                     # from_pretrained 之后就是这个状态
+    trainer.step(make_prompts())
+
+    assert seen["training"] is True, (
+        "带梯度的策略前向必须在 train 模式，否则 ChatGLM3 的梯度检查点不生效"
+    )
+
+
+def test_rollout生成时必须切到_eval_模式(tmp_path, monkeypatch):
+    """生成时必须是 eval。
+
+    ChatGLM3 在 train + 梯度检查点下会把 KV cache 关掉
+    （"`use_cache=True` is incompatible with gradient checkpointing"），
+    自回归生成退化成每个 token 重算整个前缀 —— rollout 是 GRPO 的瓶颈，
+    这个代价受不了。
+    """
+    import sfzy.rl.trainer as trainer_mod
+
+    seen: dict = {}
+    real = trainer_mod.generate_batch
+
+    def spy(model, *args, **kwargs):
+        seen["training"] = model.training
+        return real(model, *args, **kwargs)
+
+    monkeypatch.setattr(trainer_mod, "generate_batch", spy)
+
+    trainer = make_trainer(tmp_path)
+    trainer.model.train()                    # 故意先置成 train
+    trainer.step(make_prompts())
+
+    assert seen["training"] is False, "生成必须显式 eval，不能靠模型当前模式"
 
 
 # ---------------------------------------------------------------- 裁判接线

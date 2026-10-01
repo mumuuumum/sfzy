@@ -10,7 +10,7 @@ SFT 是"给定输入和答案，算 loss 反向传播"；GRPO 要多一步**在�
         4. advantage   —— 组内归一化 + 长度归一化 + 组内过滤
         5. 更新        —— GRPO loss + KL 惩罚，反向传播
 
-============================ 三个工程要点 ============================
+============================ 四个工程要点 ============================
 **一、rollout 必须用批处理。** 实测 batch=8 相对 batch=1 有 5~6 倍加速。
 GRPO 的采样量是 SFT 的 G 倍（G=8），不批处理根本跑不完。
 
@@ -20,6 +20,10 @@ GRPO 的采样量是 SFT 的 G 倍（G=8），不批处理根本跑不完。
 
 **三、组内过滤省的是真实算力。** 奖励全同的组 advantage 恒为 0，
 反向传播纯属浪费。实测里被门控全拦的组会很多，过滤掉能省一大截。
+
+**四、生成用 eval、训练前向用 train。** 见 `rollout()` 和 `step()` 里的说明：
+漏掉 train，ChatGLM3 的梯度检查点会静默失效（激活按「每层完整保存」算，
+长序列必然 OOM）；漏掉 eval，生成会因为 KV cache 被关掉而退化成 O(n²)。
 """
 
 from __future__ import annotations
@@ -231,13 +235,35 @@ class GRPOTrainer:
         messages_list = [build_messages(p["source"], self.cfg.path_("rl.prompt_style", "structured"))
                          for p in prompts]
 
-        # generate_batch 的 num_return_sequences 会为每个 prompt 连续产出 G 条
-        responses = generate_batch(
-            self.model, self.tokenizer, messages_list,
-            max_new_tokens=self.max_new_tokens, max_length=self.max_length,
-            do_sample=True, temperature=self.temperature, top_p=self.top_p,
-            num_return_sequences=self.group_size,
-        )
+        # 生成必须切到 eval，生成完再切回来。
+        #
+        # **为什么生成要 eval。** ChatGLM3 的 GLMTransformer.forward 里是
+        #
+        #     if self.gradient_checkpointing and self.training:
+        #         if use_cache:
+        #             logger.warning_once("`use_cache=True` is incompatible ...")
+        #             use_cache = False
+        #
+        # 也就是说 **train 模式下它会为了梯度检查点把 KV cache 关掉**，
+        # 自回归生成退化成每个 token 重算整个前缀。rollout 是 GRPO 的瓶颈
+        # （G 倍生成量），这个代价受不了。dropout 也顺带在采样时关掉，
+        # 生成的分布更稳定。
+        #
+        # **为什么生成完要切回来。** 见 `step()` 里那段说明：训练前向必须是
+        # train，否则梯度检查点不生效。两个模式各司其职，谁都不能省。
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            # generate_batch 的 num_return_sequences 会为每个 prompt 连续产出 G 条
+            responses = generate_batch(
+                self.model, self.tokenizer, messages_list,
+                max_new_tokens=self.max_new_tokens, max_length=self.max_length,
+                do_sample=True, temperature=self.temperature, top_p=self.top_p,
+                num_return_sequences=self.group_size,
+            )
+        finally:
+            if was_training:
+                self.model.train()
 
         pad_id = self.tokenizer.pad_token_id
         sequences = []
@@ -309,6 +335,25 @@ class GRPOTrainer:
         if baseline is not None:
             has_var = group_mask(rewards)
             anchor_filtered = int((has_var & ~keep).sum())
+
+        # ---- 训练前向必须显式切到 train 模式 ----
+        # HF 的 from_pretrained 结尾会调 model.eval()（它自己的文档里写着
+        # "The model is set in evaluation mode by default"），所以模型拿到手时
+        # 是 eval。而 ChatGLM3 的 GLMTransformer.forward 里是
+        #
+        #     if self.gradient_checkpointing and self.training:
+        #
+        # training=False 会让整个条件短路 —— **梯度检查点设了也不生效**，
+        # 激活值按「每层完整保存」算，长序列必然 OOM，而报错栈里全是
+        # bitsandbytes 的调用，看不出是这里。
+        #
+        # 这不是假设：SFT 训练器踩过同一个坑并修了（见 sft/trainer.py 里
+        # `self.model.train()` 上面那段注释："我们为此查了三轮"）；GRPO 这条
+        # 路径此前漏掉了这一步，于是整个 RL 阶段都在 eval 下跑。
+        #
+        # 放在这里而不是 `__init__`：rollout 会临时切 eval（见 `rollout()`），
+        # 每次进前向都要重新保证一次。dropout 也随之为训练打开。
+        self.model.train()
 
         # ---- old_logprobs：必须在任何参数更新之前算 ----
         with torch.no_grad():
