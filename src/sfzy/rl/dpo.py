@@ -45,6 +45,7 @@ def sequence_logprob(
     labels: torch.Tensor,
     attention_mask: Optional[torch.Tensor] = None,
     shift: bool = True,
+    micro_batch: Optional[int] = None,
 ) -> torch.Tensor:
     """算每条序列上**答案部分**的对数概率之和，返回形状 (B,)。
 
@@ -68,7 +69,30 @@ def sequence_logprob(
 
     `shift=False` 用于生成后的场景：此时 input_ids 已经是
     "prompt + 已生成 token"，labels 与之逐位对齐，不再错开。
+
+    **`micro_batch` 是显存旋钮。** 一次 forward 会在 (B, L, vocab) 上物化完整
+    logits —— ChatGLM3-6B 的 vocab 是 65024，B=8、L≈2400 时 fp16 就有 2.5GB，
+    加上 logsumexp 的中间量，16GB 卡上就爆在这里。切分成 `micro_batch` 条一组
+    后逐组前向、最后 cat 回 (B,)，峰值按组内条数线性下降。
+
+    这样做**不改变数值**：logsumexp 只在最后一维（vocab）上做，每条序列的结果
+    与同批的其它序列无关；拆开算再拼起来，和一次算是同一组数。
+    `None`（默认）＝ 不切分，行为与之前完全一致。
     """
+    if micro_batch is not None and 0 < micro_batch < input_ids.shape[0]:
+        parts = [
+            sequence_logprob(
+                model,
+                input_ids[start:start + micro_batch],
+                labels[start:start + micro_batch],
+                None if attention_mask is None else attention_mask[start:start + micro_batch],
+                shift=shift,
+                micro_batch=None,
+            )
+            for start in range(0, input_ids.shape[0], micro_batch)
+        ]
+        return torch.cat(parts, dim=0)
+
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
     logits = outputs.logits
 

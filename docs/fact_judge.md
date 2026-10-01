@@ -379,3 +379,84 @@ python scripts/judge_test.py  --model /root/autodl-tmp/models/Qwen2.5-7B-Instruc
 
 三条判据全过（好的四条 ≥3、坏的六条 ≤1、每个文档内 A/B 都高于 C~G）
 才接 GRPO；否则奖励只是噪声，跑到一半才发现就晚了。
+
+---
+
+## 8. 单卡 16GB 的冒烟与显存
+
+§7 的规模（G=8 / max_length=2048 / max_new_tokens=384）是按 **24GB 卡**估的。
+如果卡 0 只有 14~16GB，跑默认配置会在策略前向的 logits 上 OOM：
+
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 1.44 GiB.
+GPU 0 has a total capacity of 14.56 GiB ...
+```
+
+### 显存花在哪
+
+权重不是大头（4-bit 的 6B 约 3.5GB）。真正按 `N × L × vocab` 涨的是
+**前向 logits**：
+
+```
+logits ≈ N × L × vocab × 2 字节        # ChatGLM3 vocab = 65024
+默认：8 × 2432 × 65024 × 2 ≈ 2.5GB     # 还要再算 logsumexp 的中间量
+冒烟：2 × 1216 × 65024 × 2 ≈ 0.32GB
+```
+
+`N = prompts_per_step × group_size`，`L = max_length + max_new_tokens`。
+权重、优化器、KV cache 都远小于这一项。
+
+### 三个杠杆（按性价比排序）
+
+| 杠杆 | 默认 → 冒烟 | 代价 |
+|---|---|---|
+| `rl.group_size` | 8 → 2 | 组内基线更抖，advantage 噪声变大 |
+| `rl.max_length` | 2048 → 1024 | prompt 截断更多（保留尾部，仍含"判决如下"） |
+| `rl.max_new_tokens` | 384 → 192 | 输出被截断；压太狠会因长度比 < 0.5 撞门控 |
+| `rl.logprob_micro_batch` | 不设 → 1 | 多几次前向，慢一点；**数值不变** |
+
+`logprob_micro_batch` 是 `sequence_logprob` 的批内切分：把 N 条序列分成几组
+分别前向、最后 `cat` 回 `(N,)`。logsumexp 只在 vocab 一维上做，每条序列的结果
+与同批其它序列无关，所以拆开算和一次算是同一组数（有对拍测试钉住）。
+
+### 冒烟怎么跑
+
+```bash
+PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+python scripts/train_grpo.py --config configs/grpo_smoke_fact_judge.yaml \
+    --sft-adapter outputs/sft_chatglm3/step_000336.pt --limit-prompts 4
+```
+
+`configs/grpo_smoke_fact_judge.yaml` 只覆盖规模相关的项，其余继承
+`grpo_fact_judge.yaml`（奖励口径、门控、裁判后端都不变）。看四件事：
+
+1. 启动两行：`策略精度: 4-bit nf4（device_map={'': 0}）` / `语义裁判: judge_fact`
+2. 每步 `reward_std ≠ 0` —— 奖励在组内有区分度，否则 advantage 恒 0
+3. 事实一致性那一行的**档位分布不是 100% 落在 4** —— 裁判真的在判
+4. `judge_missing ≈ 0`、卡 0 峰值离 14.5G 还留 ≥1G
+
+四条都过再回到 `grpo_fact_judge.yaml` 逐项放大，**一次只放大一个**：
+先后 `group_size` 4→8，再 `max_length` 1024→2048，最后 `max_new_tokens`。
+
+### 如果继续 OOM
+
+按顺序试：`prompts_per_step` 保持 1 → `max_length` 降到 768 →
+`group_size` 降到 2 → 关掉 KL（`kl_coef: 0` 本就不建参考模型前向）→
+换更小的策略模型先验接线。**不要**把裁判挪回卡 0 —— 那会把两份模型挤在
+同一张卡上，必爆。
+
+### jieba 的告警已经修掉
+
+跑 GRPO 时会看到这样几行（现在不会再出现）：
+
+```
+jieba/__init__.py:44: SyntaxWarning: invalid escape sequence '\.'
+jieba/_compat.py:18: UserWarning: pkg_resources is deprecated as an API
+Building prefix dict ... Loading model cost 0.796 seconds ...
+```
+
+前两类是 jieba **自己源码**的问题（Py3.12 起对非原始字符串发 SyntaxWarning；
+`_compat.py` import 了已弃用的 `pkg_resources`），第三类是 jieba 首次分词时
+打的 DEBUG 日志。修法在 `sfzy.eval.rouge._jieba_module`：把 `import jieba`
+包在一个临时告警抑制窗口里，并 `setLogLevel(WARNING)` —— 窗口只包住这一次
+import，不动第三方代码，也不放宽项目自己代码的告警。

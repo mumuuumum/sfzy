@@ -27,6 +27,17 @@ def test_tokenize_jieba_可运行():
     assert all(isinstance(t, str) for t in tokens)
 
 
+def test_jieba_模块被缓存():
+    """jieba 的 import 外面套了告警抑制（Py3.12 下它会因自身源码发
+    SyntaxWarning，并 import pkg_resources 触发弃用告警），用 lru_cache 保证
+    只走一次 —— 重复进出 catch_warnings 会白白多写一次全局告警状态。
+    """
+    from sfzy.eval.rouge import _jieba_module
+
+    assert _jieba_module() is _jieba_module()
+    assert _jieba_module().lcut("原告与被告") == ["原告", "与", "被告"]
+
+
 def test_tokenize_未知模式应报错():
     with pytest.raises(ValueError):
         tokenize("abc", mode="不存在的模式")

@@ -19,6 +19,8 @@ ROUGE-2 与 ROUGE-L 各占 0.4，权重明显高于 ROUGE-1 —— 这意味着
 
 from __future__ import annotations
 
+import warnings
+from functools import lru_cache
 from typing import Dict, List, Sequence, Tuple
 
 OFFICIAL_WEIGHTS: Dict[str, float] = {
@@ -28,12 +30,42 @@ OFFICIAL_WEIGHTS: Dict[str, float] = {
 }
 
 
+@lru_cache(maxsize=1)
+def _jieba_module():
+    """导入 jieba，并把它的三类噪声压掉。
+
+    Python 3.12 起，jieba 源码里的 `"\u4E00-\u9FD5a-zA-Z0-9+#&\\._%\\-"` 这类
+    非原始字符串会触发 SyntaxWarning —— 它在**编译模块时**发出，也就是
+    `import jieba` 的那一刻；jieba 的 `_compat.py` 还会 import `pkg_resources`
+    触发弃用 UserWarning。两者都是**第三方库自身的问题**（jieba 已多年未更新），
+    不是我们的调用错，改不了源码。
+
+    做法是在 import 周围临时过滤：窗口只包住这一次 import，既不动第三方代码，
+    也不会放宽我们自己代码里的任何告警。`lru_cache` 保证只走一次 —— 重复
+    import 是空操作，但重复进出 catch_warnings 会白白多线程不安全一次。
+
+    顺带 `setLogLevel(WARNING)`：jieba 首次分词会以 INFO/DEBUG 打印
+    "Building prefix dict / Dumping model to file cache / Loading model cost /
+    Prefix dict has been built successfully"，混进训练日志里像报错。
+    """
+    import logging
+
+    with warnings.catch_warnings():
+        # 只忽略第三方库在自己源码里产生的告警；简单起见对整个 import 窗口生效
+        # （窗口内不会执行我们的任何代码）。
+        warnings.simplefilter("ignore")
+        import jieba
+
+    jieba.setLogLevel(logging.WARNING)
+    return jieba
+
+
 def tokenize(text: str, mode: str = "char") -> List[str]:
     """分词。
 
     mode="char"  ：按字符切，**丢弃空白字符**。中文 ROUGE 的常用做法。
                    "a b c" 与 "abc" 必须得到相同结果（有测试）。
-    mode="jieba" ：用 jieba 分词，需 `import jieba` 后 `jieba.lcut`。
+    mode="jieba" ：用 jieba 分词，走 `_jieba_module()`（带告警抑制）。
                    注意 jieba 首次调用会构建前缀词典，比较慢，
                    可以缓存分词器实例来避免重复初始化。
 
@@ -44,8 +76,7 @@ def tokenize(text: str, mode: str = "char") -> List[str]:
     if mode=="char":
         return [c for c in text if not c.isspace()]
     elif mode == "jieba":
-        import jieba
-        return jieba.lcut(text)
+        return _jieba_module().lcut(text)
     else:
         raise ValueError(f"不支持mode：{mode}")
 

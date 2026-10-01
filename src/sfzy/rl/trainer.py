@@ -95,6 +95,10 @@ class GRPOTrainer:
         self.clip_ratio = rl.get("clip_ratio", 0.2)
         self.kl_coef = rl.get("kl_coef", 0.0)
         self.length_mode = rl.get("length_norm", "sqrt")
+        # logprob 前向的批内切分。None = 一次算完（默认，行为和以前一致）；
+        # 设成 1~4 能把 (N, L, vocab) 的 logits 峰值按比例压下来 ——
+        # 16GB 卡上 G=8 时这是最有效的一个显存旋钮，且不改变数值。
+        self.logprob_micro_batch = rl.get("logprob_micro_batch") or None
         self.prompts_per_step = rl.get("prompts_per_step", 4)
         self.accum_steps = rl.get("grad_accum_steps", 1)
         self.max_grad_norm = rl.get("max_grad_norm", 1.0)
@@ -309,12 +313,16 @@ class GRPOTrainer:
         # ---- old_logprobs：必须在任何参数更新之前算 ----
         with torch.no_grad():
             old_logprobs = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"]
+                self.model, batch["input_ids"], batch["labels"],
+                micro_batch=self.logprob_micro_batch,
             ).detach()
 
         # ---- 策略 logprob（带梯度）----
         self.optimizer.zero_grad(set_to_none=True)
-        logprobs = sequence_logprob(self.model, batch["input_ids"], batch["labels"])
+        logprobs = sequence_logprob(
+            self.model, batch["input_ids"], batch["labels"],
+            micro_batch=self.logprob_micro_batch,
+        )
         loss, clipped_frac = grpo_loss(
             logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
         )
@@ -334,7 +342,8 @@ class GRPOTrainer:
                 with torch.no_grad():
                     with (ctx if hasattr(ctx, "__enter__") else torch.no_grad()):
                         ref_logprobs = sequence_logprob(
-                            ref_model, batch["input_ids"], batch["labels"]
+                            ref_model, batch["input_ids"], batch["labels"],
+                            micro_batch=self.logprob_micro_batch,
                         ).detach()
                 kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
                 loss = loss + kl_term

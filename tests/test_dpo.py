@@ -99,3 +99,34 @@ def test_批量形状正确():
     input_ids = torch.randint(1, 64, (4, 9))
     out = sequence_logprob(model, input_ids, input_ids.clone())
     assert out.shape == (4,)
+
+
+# ---------------------------------------------------------------- 批内切分
+
+def test_批内切分不改变结果():
+    """`micro_batch` 是显存旋钮，**不许改变数值**。
+
+    写错的后果不是报错，而是 old_logprob 和策略 logprob 对不上 —— GRPO
+    的 ratio 不再从 1 出发，裁剪一直生效、梯度几乎失效，日志里看不出来。
+    """
+    model = tiny_model()
+    input_ids = torch.randint(1, 64, (5, 9))
+    labels = input_ids.clone()
+    labels[:, :3] = -100                      # 前 3 个当 prompt
+    full = sequence_logprob(model, input_ids, labels)
+    assert full.shape == (5,)
+    for mb in (1, 2, 4, 8):                   # 8 > B：退化成不切分
+        part = sequence_logprob(model, input_ids, labels, micro_batch=mb)
+        assert torch.allclose(full, part, atol=1e-5), f"micro_batch={mb}"
+
+
+def test_批内切分保留梯度():
+    """切分后要 torch.cat 拼回 (B,) —— 忘了 cat 的 grad 路径会让策略 logprob
+    变成叶子张量，反传到不了 LoRA 参数。"""
+    model = tiny_model()
+    input_ids = torch.randint(1, 64, (3, 7))
+    labels = input_ids.clone()
+    out = sequence_logprob(model, input_ids, labels, micro_batch=1)
+    out.sum().backward()
+    assert out.requires_grad
+    assert any(p.grad is not None and p.grad.abs().sum() > 0 for p in model.parameters())

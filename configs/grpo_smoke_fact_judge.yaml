@@ -1,0 +1,52 @@
+defaults: grpo_fact_judge
+
+# 小规模冒烟：**只验证接线通不通、会不会 OOM**，不看效果。
+#
+# 适用场景：单卡显存 14~16GB（例如 16GB 的 4090/4080/4060Ti），而
+# grpo_fact_judge.yaml 的默认规模（G=8, max_length=2048, max_new_tokens=384）
+# 是按 24GB 卡估的 —— 直接跑会在策略前向的 logits 上 OOM：
+#
+#     logits 大小 ≈ N × L × vocab × 2 字节
+#     默认：8 × 2432 × 65024 × 2 ≈ 2.5GB（还要再算 logsumexp 的中间量）
+#     冒烟：2 × 1216 × 65024 × 2 ≈ 0.32GB
+#
+# 三个杠杆按"效果/代价"排序：
+#   group_size      8 → 2    峰值按 N 线性下降；代价是组内基线更抖
+#   max_length      2048 → 1024   激活与 logits 同时下降
+#   max_new_tokens  384 → 192     同时让输出不至于太短而被门控拦下
+#
+# 用法（4 条 prompt 就能看到 4 个优化步）：
+#   python scripts/train_grpo.py --config configs/grpo_smoke_fact_judge.yaml \
+#       --sft-adapter outputs/sft_chatglm3/step_000336.pt --limit-prompts 4
+#
+# 看什么（附判据）：
+#   * 启动两行：策略精度 4-bit nf4 / 语义裁判 judge_fact
+#   * 每步 reward 均值与组内 reward_std 不全为 0     ← 奖励有区分度
+#   * 事实一致性那一行的档位分布不是 100% 落在 4      ← 裁判在真的判
+#   * judge_missing 接近 0                            ← 裁判没在批量失败
+#   * nvidia-smi 里卡 0 峰值离 14.5G 还留 1G 以上     ← 之后才敢放大
+
+rl:
+  output_dir: outputs/grpo_smoke
+  group_size: 2
+  prompts_per_step: 1
+  max_length: 1024
+  max_new_tokens: 192
+  temperature: 0.9
+  top_p: 0.95
+  # 策略 logprob 前向的批内切分。G=2 时设 1 就是把两条序列分开算，
+  # 峰值再降一半；数值不变（每条序列的 logprob 与同批无关）。
+  logprob_micro_batch: 1
+  save_every_n_steps: 5
+  keep_last_n_checkpoints: 1
+  log_every_n_steps: 1
+  reward:
+    mode: fact_judge
+    weights: {rouge_l: 0.3, fact: 0.7}
+
+semantic:
+  # 裁判仍在卡 1；这两个值只影响速度与裁判侧显存。
+  max_batch_size: 4
+  # 六要素提取的生成预算。截断会自动用双倍重试，冒烟时压小一点换速度。
+  extract_max_new_tokens: 512
+  min_document_elements: 2
