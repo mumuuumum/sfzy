@@ -66,6 +66,8 @@ semantic:
   device: cuda:1                 # 裁判钉卡 1，策略在卡 0
   max_batch_size: 4
   extract_max_new_tokens: 768
+  model: Qwen/Qwen2.5-7B-Instruct
+  trust_remote_code: false
 
 tracking:
   backend: none                  # 先不联网；要面板就改成 swanlab
