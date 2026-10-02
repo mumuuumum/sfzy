@@ -55,7 +55,7 @@ rl:
     terms:
       rouge_l:          {enabled: false, weight: 0.0}
       fact_consistency: {enabled: true,  weight: 1.0}
-      gate: {enabled: false}
+      # gate: {enabled: false}
     # gate 不写 = 用默认（enabled: true + 默认阈值）；
     # 写成 {enabled: false} 就整块关掉，纯看事实一致性分。
 
