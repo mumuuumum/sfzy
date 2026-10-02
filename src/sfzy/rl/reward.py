@@ -1,30 +1,40 @@
-"""事实一致性奖励：门控 + 六要素 Judge 加权分 + ROUGE-L。
+"""奖励聚合：门控 + 多个 reward term 的（归一化）加权求和。
 
-================================ 结构 ================================
-  第一层  硬门控 —— 不满足直接 0 分，后面都不算。切断"牺牲格式换分数"的路径
-  第二层  事实一致性 ★ 主信号 —— 六要素 Judge 的加权分 weighted_reward ∈ [0,1]
-  第三层  ROUGE-L —— 辅助，保持和官方评测口径一致
+============================ 结构 ================================
+    gate（全局开关）→ 逐个启用项求值 → 按归一化权重求和 → RewardBreakdown
 
-门控和加权求和的区别是**可补偿性**：加权求和下模型能学会"格式烂一点、
-但 ROUGE 多拿分"，总分反而更高；门控切断的就是这条路。
+哪些项参与、权重多少、要不要裁判，全部由 `RewardSpec`（`reward_spec.py`）
+从 YAML 决定；每项从哪来、消费哪个信号，由注册表（`reward_terms.py`）决定。
+**本文件只负责"把已经算好的分项拼成总分"**，不关心某个 reward 具体怎么算。
 
-`reward.mode` 现在只有 `fact_judge` 一种。事实项**完全来自**
-`sfzy/judge/` 的六要素 Judge，不做任何金额/日期/编号的规则匹配。
+================================ 多条信号 ================================
+规则项（rouge_l）在进程内直接算；裁判项（fact_consistency 等）消费模型 B
+一次批量产出的**命名信号**：
+
+    judge_signals = {"fact_consistency": [0.8, 0.3, ...], "element_coverage": [...]}
+
+一个裁判项拿不到自己需要的信号时**直接报错**，不静默降级 —— 否则你会以为
+在跑某个 reward，其实那一路权重是 0。组内补缺（用组内均值）由 trainer 做，
+到这里必须已经是有值的。
+
+================================ 门控 ================================
+门控是全局的硬开关：不通过直接 0 分，后面所有项都不算。它的作用是切断
+"格式烂一点、但某个 reward 多拿分"的补偿路径。`gate.enabled=false` 时
+整块跳过（连最短长度都不看）。
 
 ================================ 为什么还保留 extract_facts ================================
 `extract_facts` 是规则口径（金额/日期/编号）的抽取函数，它**不参与奖励**，
-只给 `tools/select_rl_prompts.py` 用来筛选 GRPO 的 prompt 池
-（参考摘要里含金额的样本，是事实项最可能有信号的那一批）。
+只给 `tools/select_rl_prompts.py` 用来筛选 GRPO 的 prompt 池。
 """
 
 from __future__ import annotations
 
-import copy
 import re
-from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from dataclasses import dataclass, field
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from sfzy.eval.rouge import score_pair
+from sfzy.rl.reward_spec import RewardSpec
+from sfzy.rl.reward_terms import compute_rule_term
 
 # --------------------------------------------------------------------------
 # 事实提取（只用于 prompt 池筛选，不参与奖励）
@@ -46,37 +56,25 @@ ARTICLE_RE = re.compile(r"第\s*\d+\s*条")
 
 RESULT_MARKERS = ("判决如下", "判令", "驳回", "本院认为", "判决", "裁定")
 
-DEFAULT_REWARD_CFG: Dict[str, Any] = {
-    # 现在只有 fact_judge 一种模式，见模块 docstring
-    "mode": "fact_judge",
-    "weights": {"rouge_l": 0.3, "fact": 0.7},
-    "rouge_mode": "jieba",
-    "gate": {
-        "min_chars": 60,
-        "length_ratio_range": [0.5, 1.5],
-        "forbidden_prefixes": ["以下是", "摘要：", "摘要:", "本摘要", "这是"],
-        "require_result_marker": True,
-    },
-}
-
 
 @dataclass
 class RewardBreakdown:
-    """分项奖励。**必须返回分项** —— 只看总分判断不出"这一版好在哪"。"""
+    """一条样本的奖励分项。
+
+    `values` 是**动态**字典：开关了哪些 reward 就有哪些键，新增 reward
+    不需要改这个数据类。只看 total 判断不出"这一版好在哪"，所以必须留分项。
+    """
 
     total: float = 0.0
     gated: bool = False
     gate_reason: str = ""
-    rouge_l: float = 0.0
-    fact_judge: float = 0.0
+    values: Dict[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, float]:
-        return {
-            "reward": self.total,
-            "reward_rouge_l": self.rouge_l,
-            "reward_fact_judge": self.fact_judge,
-            "gated": float(self.gated),
-        }
+        out: Dict[str, float] = {"reward": self.total, "gated": float(self.gated)}
+        for name, value in self.values.items():
+            out[f"reward_{name}"] = value
+        return out
 
 
 def _mask(text: str, spans: Iterable[Tuple[int, int]]) -> str:
@@ -132,7 +130,7 @@ def extract_facts(text: str, kinds: Sequence[str] = ("money", "date", "id")) -> 
     return facts
 
 
-def check_gate(candidate: str, reference: str, gate_cfg: Dict[str, Any]) -> Optional[str]:
+def check_gate(candidate: str, reference: str, gate_cfg: Mapping[str, Any]) -> Optional[str]:
     """返回 None 表示通过，否则返回被拦下的原因（写进日志用）。"""
     text = candidate.strip()
     ref_len = max(len(reference.strip()), 1)
@@ -158,78 +156,100 @@ def check_gate(candidate: str, reference: str, gate_cfg: Dict[str, Any]) -> Opti
     return None
 
 
+def _as_spec(spec: Optional[Any]) -> RewardSpec:
+    """允许直接传字典（测试/工具方便），但只解析一次。"""
+    return spec if isinstance(spec, RewardSpec) else RewardSpec.from_config(spec)
+
+
+def _compute_one(
+    candidate: str,
+    reference: str,
+    source: Optional[str],
+    spec: RewardSpec,
+    judge_signals: Mapping[str, Optional[float]],
+) -> Tuple[float, RewardBreakdown]:
+    bd = RewardBreakdown()
+
+    # ---- 第一层：全局硬门控 ----
+    if spec.gate.enabled:
+        reason = check_gate(candidate, reference, spec.gate.cfg)
+        if reason is not None:
+            bd.gated = True
+            bd.gate_reason = reason
+            bd.total = 0.0
+            return 0.0, bd
+
+    # ---- 第二层：逐项求值 + 归一化加权求和 ----
+    weights = spec.normalized_weights()
+    total = 0.0
+    for term in spec.enabled_terms:
+        ts = term.spec
+        if ts.source == "rule":
+            value = compute_rule_term(
+                ts.name, candidate, reference, source, rouge_mode=spec.rouge_mode
+            )
+        else:
+            value = judge_signals.get(ts.signal)
+            if value is None:
+                raise ValueError(
+                    f"reward term {ts.name!r} 需要裁判信号 {ts.signal!r}，但收到 None。\n"
+                    "  检查 semantic.backend=fact 的裁判是否接上、以及组内补缺是否生效。"
+                )
+            value = float(value)
+            # 量纲护栏：judge 信号必须是 [0,1]，接成 0-100 会把其它项压成噪声。
+            if not 0.0 <= value <= 1.0 + 1e-6:
+                raise ValueError(
+                    f"裁判信号 {ts.signal!r} 的值 {value} 不在 [0,1]。"
+                    "六要素 Judge 的 weighted_reward 本来就是 [0,1]，不做量纲换算。"
+                )
+        bd.values[ts.name] = value
+        total += weights[ts.name] * value
+
+    bd.total = total
+    return total, bd
+
+
 def compute_reward(
     candidate: str,
     reference: str,
     source: Optional[str] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-    semantic: Optional[float] = None,
+    spec: Optional[Any] = None,
+    judge_signals: Optional[Mapping[str, Optional[float]]] = None,
 ) -> Tuple[float, RewardBreakdown]:
-    """算一条样本的奖励，返回 (总分, 分项明细)。
-
-    `semantic` 是六要素事实一致性 Judge 的加权分，**本来就是 [0,1]**，
-    不做任何量纲换算。它是这个奖励模式的唯一事实来源，缺了直接报错 ——
-    静默降级只会让你以为在跑 Judge，其实没有。
-    """
-    full_cfg = _merge_cfg(cfg)
-    weights = full_cfg["weights"]
-
-    bd = RewardBreakdown()
-    bd.rouge_l = score_pair(
-        candidate.strip(), reference.strip(), mode=full_cfg["rouge_mode"]
-    )["rouge-l-f"]
-    if semantic is not None:
-        # 量纲护栏。fact_judge 的分数是 [0,1]，接错了**不报错**，
-        # 只是事实项凭空大 100 倍、把 ROUGE 压成噪声。
-        if not 0.0 <= float(semantic) <= 1.0 + 1e-6:
-            raise ValueError(
-                f"mode=fact_judge 收到的事实一致性分 {semantic} 不在 [0,1]。"
-                "这个模式只接受六要素 Judge 的 weighted_reward"
-                "（semantic.backend=fact）。"
-            )
-        bd.fact_judge = float(semantic)
-
-    reason = check_gate(candidate, reference, full_cfg["gate"])
-    if reason is not None:
-        bd.gated = True
-        bd.gate_reason = reason
-        bd.total = 0.0
-        return 0.0, bd
-
-    if semantic is None:
-        raise ValueError(
-            "mode=fact_judge 需要每条样本都有六要素事实一致性分，收到 None。"
-            "检查 semantic.backend=fact 的裁判是否传给了 compute_rewards，"
-            "以及脚本启动日志里的 '语义裁判' 行。"
-        )
-
-    bd.total = weights["rouge_l"] * bd.rouge_l + weights["fact"] * bd.fact_judge
-    return bd.total, bd
+    """算一条样本的奖励。`judge_signals` 是这条样本的 {信号名: 值}。"""
+    return _compute_one(
+        candidate, reference, source, _as_spec(spec), judge_signals or {}
+    )
 
 
 def compute_rewards(
     candidates: Sequence[str],
     references: Sequence[str],
     sources: Optional[Sequence[str]] = None,
-    cfg: Optional[Dict[str, Any]] = None,
-    semantic_scores: Optional[Sequence[Optional[float]]] = None,
+    spec: Optional[Any] = None,
+    judge_signals: Optional[Mapping[str, Sequence[Optional[float]]]] = None,
 ) -> List[RewardBreakdown]:
     """批量打分，返回分项明细列表（GRPO 的 rollout 用这个）。
 
-    `semantic_scores` 是六要素裁判分 ∈ [0,1]，由调用方先批量算好再传进来 ——
-    裁判模型比规则慢几个数量级，必须批处理，不能在这里逐条调用。
+    `judge_signals` 是 {信号名: 每条候选一个值}；裁判比规则慢几个数量级，
+    必须由调用方**批量**算好再传进来。`None` 表示该条这一路缺失 —— 到这里
+    还缺失会报错，因为 trainer 应该已经用组内均值补过。
     """
+    resolved = _as_spec(spec)
     sources = sources or [None] * len(candidates)
-    if semantic_scores is None:
-        semantic_scores = [None] * len(candidates)
-    if len(semantic_scores) != len(candidates):
-        raise ValueError(
-            f"裁判分个数 {len(semantic_scores)} 与候选数 {len(candidates)} 不一致"
-        )
-    return [
-        compute_reward(c, r, s, cfg, semantic=sem)[1]
-        for c, r, s, sem in zip(candidates, references, sources, semantic_scores)
-    ]
+    judge_signals = dict(judge_signals or {})
+    n = len(candidates)
+    for name, values in judge_signals.items():
+        if len(values) != n:
+            raise ValueError(
+                f"裁判信号 {name!r} 的个数 {len(values)} 与候选数 {n} 不一致"
+            )
+
+    out: List[RewardBreakdown] = []
+    for i, (cand, ref, src) in enumerate(zip(candidates, references, sources)):
+        signals = {name: values[i] for name, values in judge_signals.items()}
+        out.append(_compute_one(cand, ref, src, resolved, signals)[1])
+    return out
 
 
 def summarize_gate_reasons(breakdowns: Sequence[RewardBreakdown]) -> Dict[str, int]:
@@ -244,23 +264,3 @@ def summarize_gate_reasons(breakdowns: Sequence[RewardBreakdown]) -> Dict[str, i
             stats["gated"] += 1
             stats[bd.gate_reason] = stats.get(bd.gate_reason, 0) + 1
     return stats
-
-
-def _merge_cfg(override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """把配置和默认值深合并一层，允许只覆盖部分字段。
-
-    现在只支持 `mode: fact_judge`。老配置里的 rouge_only / flat / gated /
-    gated_judge 已经删除，写进来会直接报错，而不是静默跑成别的口径。
-    """
-    cfg = copy.deepcopy(DEFAULT_REWARD_CFG)
-    if override:
-        for key, value in override.items():
-            if isinstance(value, dict) and isinstance(cfg.get(key), dict):
-                cfg[key].update(value)
-            else:
-                cfg[key] = value
-    if cfg["mode"] != "fact_judge":
-        raise ValueError(
-            f"未知的 reward.mode={cfg['mode']!r}：现在只支持 fact_judge。"
-        )
-    return cfg

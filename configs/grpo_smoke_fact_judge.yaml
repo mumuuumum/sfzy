@@ -41,8 +41,10 @@ rl:
   keep_last_n_checkpoints: 1
   log_every_n_steps: 1
   reward:
-    mode: fact_judge
-    weights: {rouge_l: 0.3, fact: 0.7}
+    normalize_weights: true
+    terms:
+      rouge_l:          {enabled: true, weight: 0.3}
+      fact_consistency: {enabled: true, weight: 0.7}
 
 semantic:
   # 裁判仍在卡 1；这两个值只影响速度与裁判侧显存。

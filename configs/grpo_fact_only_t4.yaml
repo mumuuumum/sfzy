@@ -1,0 +1,71 @@
+defaults: grpo_fact_judge
+
+# ============================================================================
+# 只考虑"事实一致性 reward" —— 2× T4 15GB 验证版
+#
+#   GPU0  策略：ChatGLM3-6B 4-bit NF4（冻结）+ LoRA + 优化器 + rollout
+#   GPU1  裁判：Qwen2.5-7B-Instruct 4-bit NF4（冻结，只做 inference）
+#
+# 奖励里**只留 fact_consistency 一项**（ROUGE 关掉），门控仍作为全局开关生效。
+# 这一版的目标是：接线通不通、15GB 够不够、奖励有没有区分度 —— 不是效果。
+#
+# 和 grpo_fact_judge.yaml 的区别只有两类：
+#   1. 奖励只留事实一致性；
+#   2. 按 T4 调小规模，并把精度全换成 float16（Turing 不支持 bf16）。
+#
+# 跑法（脚本不带其它参数，全部从这份配置读）：
+#   python scripts/train_grpo.py --config configs/grpo_fact_only_t4.yaml
+# ============================================================================
+
+# 4-bit + float16 + device_map {"":0}。模型路径写在那个文件里
+# （默认是 HuggingFace id THUDM/chatglm3-6b，离线机器改成本地目录）。
+model_config: configs/model_chatglm3_6b.yaml
+
+rl:
+  output_dir: outputs/grpo_fact_only_t4
+  # SFT 产出的 LoRA checkpoint —— 换成你机器上实际的路径
+  sft_adapter: /kaggle/input/models/mumuuumum/sft-chatglm3-6b/transformers/default/1/step_000336.pt
+  # 想先跑最小闭环（几条 prompt 看接线），把它设成整数，例如 8
+  limit_prompts: 8
+
+  quantize: true                 # 策略 4-bit，和 SFT 训练时的底座一致
+
+  # ---- rollout：15GB 卡的保守取值 ----
+  # 显存峰值 ≈ group_size × (max_length + max_new_tokens) × vocab，
+  # 不够就先降 group_size，再降 max_length。
+  group_size: 4
+  prompts_per_step: 1
+  max_length: 1536               # 源文档被截断时保尾部（判决结果在结尾）
+  max_new_tokens: 320
+  temperature: 0.9               # 要有方差才能算出 advantage
+  top_p: 0.95
+
+  # ---- 显存 ----
+  gradient_checkpointing: true
+  logprob_micro_batch: 1         # 最省显存的取值，只压瞬时峰值
+
+  # ---- 存档与日志 ----
+  save_every_n_steps: 10
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 1
+
+  # ---- 奖励：只留事实一致性 ----
+  reward:
+    normalize_weights: true
+    terms:
+      rouge_l:          {enabled: false, weight: 0.0}
+      fact_consistency: {enabled: true,  weight: 1.0}
+      gate: {enabled: false}
+    # gate 不写 = 用默认（enabled: true + 默认阈值）；
+    # 写成 {enabled: false} 就整块关掉，纯看事实一致性分。
+
+semantic:
+  dtype: float16                 # T4 是 Turing，不支持 bf16
+  bnb_4bit_compute_dtype: float16
+  load_in_4bit: true
+  device: cuda:1                 # 裁判钉卡 1，策略在卡 0
+  max_batch_size: 4
+  extract_max_new_tokens: 768
+
+tracking:
+  backend: none                  # 先不联网；要面板就改成 swanlab

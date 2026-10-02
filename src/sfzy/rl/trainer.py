@@ -43,6 +43,7 @@ from sfzy.rl.reward import (
     compute_rewards,
     summarize_gate_reasons,
 )
+from sfzy.rl.reward_spec import RewardSpec
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sfzy.sft.infer import generate_batch
 from sfzy.utils.logging import get_logger
@@ -84,9 +85,9 @@ class GRPOTrainer:
         """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
         关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
 
-        `scorer` 是裁判（`sfzy.judge.scorer.FactConsistencyScorer`）。现在只有
-        `fact_judge` 一种奖励模式，没有裁判直接报错 —— 配置说要接裁判却没有
-        裁判，静默降级是最坏的结果。
+        `scorer` 是裁判（`sfzy.judge.scorer.FactConsistencyScorer`）。奖励由
+        `rl.reward.terms` 决定开哪些项；只要有 judge 项而没裁判，直接报错 ——
+        配置说要接裁判却没有裁判，静默降级是最坏的结果。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -125,17 +126,23 @@ class GRPOTrainer:
         self.anchor_slack = float(anchor.get("slack", 0.05))
         self.baseline_rewards: Dict[str, float] = {}
 
-        mode = (self.reward_cfg or {}).get("mode", "fact_judge")
-        self.reward_mode = mode
-        if mode != "fact_judge":
-            raise ValueError(
-                f"未知的 reward.mode={mode!r}：现在只支持 fact_judge。"
-            )
-        if self.scorer is None:
-            raise ValueError(
-                "reward.mode=fact_judge 但没传裁判（scorer）。\n"
-                "  在配置里写 semantic.backend=fact。"
-            )
+        # ---- 奖励规格：开哪些项、权重、要不要裁判，全在这里定 ----
+        self.reward_spec = RewardSpec.from_config(self.reward_cfg)
+        self.reward_mode = "terms"
+        if self.reward_spec.needs_judge():
+            if self.scorer is None:
+                raise ValueError(
+                    "奖励里有 judge 项（"
+                    f"{sorted(self.reward_spec.required_signals)}），但没传裁判（scorer）。\n"
+                    "  在配置里写 semantic.backend=fact。"
+                )
+            missing = self.reward_spec.required_signals - set(self.scorer.available_signals())
+            if missing:
+                raise ValueError(
+                    f"奖励需要的裁判信号 {sorted(missing)} 这个裁判产不出来，"
+                    f"它只有 {sorted(self.scorer.available_signals())}。\n"
+                    "  要么换裁判，要么把对应的 reward term 关掉。"
+                )
 
         trainable = [p for p in model.parameters() if p.requires_grad]
         self.optimizer = torch.optim.AdamW(trainable, lr=rl.get("learning_rate", 1e-5))
@@ -143,15 +150,29 @@ class GRPOTrainer:
         self.state = RLState()
 
     # ------------------------------------------------------------------
-    def score_semantic(self, candidates, references, sources) -> Optional[List[Optional[float]]]:
-        """批量算裁判分。返回 None 表示这次不接裁判（模式不需要）。"""
-        if self.scorer is None:
+    def score_semantic(
+        self, candidates, references, sources
+    ) -> Optional[Dict[str, List[Optional[float]]]]:
+        """批量算裁判信号。
+
+        返回 `{信号名: 每条候选一个值}`；返回 None 表示这次不需要裁判
+        （没有任何 judge 项被启用）。
+        """
+        if self.scorer is None or not self.reward_spec.needs_judge():
             return None
         items = [
             {"candidate": c, "reference": r, "source": s}
             for c, r, s in zip(candidates, references, sources)
         ]
-        return self.scorer.score_batch(items)
+        records = self.scorer.score_batch_signals(items)
+        if len(records) != len(items):
+            raise ValueError(
+                f"裁判返回 {len(records)} 条信号，输入是 {len(items)} 条，数量对不上。"
+            )
+        return {
+            name: [rec.get(name) for rec in records]
+            for name in sorted(self.reward_spec.required_signals)
+        }
 
     def prepare_baseline(self, prompts: List[Dict[str, Any]]) -> None:
         """用 prompt 池里的 `sft_output` 预先把 SFT 的奖励算出来，当锚。
@@ -177,9 +198,31 @@ class GRPOTrainer:
         refs = [p["summary"] for p in with_out]
         srcs = [p["source"] for p in with_out]
         cands = [p["sft_output"] for p in with_out]
-        semantic = self.score_semantic(cands, refs, srcs)
-        bds = compute_rewards(cands, refs, srcs, self.reward_cfg, semantic)
-        for p, bd in zip(with_out, bds):
+        signals = self.score_semantic(cands, refs, srcs)
+        if signals is None:
+            signals = {}
+        # 基线锚是每 prompt 一条（不是每 prompt G 条），不能用组内均值补缺 ——
+        # 缺信号的 SFT 输出直接跳过，填 0 会把它变成一个假的低锚。
+        required = sorted(self.reward_spec.required_signals)
+        keep = [
+            i for i in range(len(with_out))
+            if all(signals.get(name, [None] * len(with_out))[i] is not None for name in required)
+        ]
+        if len(keep) < len(with_out):
+            logger.warning(
+                "基线锚：%d 条 SFT 输出缺裁判信号，已跳过（不填 0）。",
+                len(with_out) - len(keep),
+            )
+        if not keep:
+            logger.warning("基线锚：没有一条拿到完整裁判信号，锚不生效。")
+            return
+        kept = [with_out[i] for i in keep]
+        kept_signals = {name: [signals[name][i] for i in keep] for name in required}
+        bds = compute_rewards(
+            [cands[i] for i in keep], [refs[i] for i in keep], [srcs[i] for i in keep],
+            spec=self.reward_spec, judge_signals=kept_signals,
+        )
+        for p, bd in zip(kept, bds):
             self.baseline_rewards[str(p.get("id"))] = bd.total
         vals = list(self.baseline_rewards.values())
         logger.info(
@@ -187,10 +230,28 @@ class GRPOTrainer:
             len(vals), sum(vals) / len(vals), self.anchor_slack,
         )
 
+    @staticmethod
+    def _fill_one_signal(scores: List[Optional[float]], group_size: int) -> Tuple[List[float], int]:
+        """单路信号：按组用可用分均值补缺，返回 (补齐后的值, 缺失条数)。"""
+        filled: List[float] = [0.0] * len(scores)
+        missing = 0
+        for start in range(0, len(scores), group_size):
+            chunk = scores[start:start + group_size]
+            ok = [s for s in chunk if s is not None]
+            fallback = sum(ok) / len(ok) if ok else 0.0
+            missing += sum(1 for s in chunk if s is None)
+            for i, s in enumerate(chunk):
+                filled[start + i] = float(s) if s is not None else fallback
+        return filled, missing
+
     def fill_semantic_gaps(
-        self, scores: List[Optional[float]], group_size: int
-    ) -> Tuple[List[float], float]:
-        """裁判个别失败时不中断训练，用**组内可用分的均值**补上，并返回缺失比例。
+        self,
+        signals: Dict[str, List[Optional[float]]],
+        group_size: int,
+    ) -> Tuple[Dict[str, List[float]], float]:
+        """多路信号各自补缺，返回 ({信号名: 补齐后的值}, 总缺失比例)。
+
+        裁判个别失败时不中断训练，用**组内可用分的均值**补上。
 
         为什么不是直接抛错：300 步的 run 里任何一次 API 超时或截断都会在
         第 137 步崩掉，前面几小时白跑。一个失败样本不该有这种权力。
@@ -206,16 +267,15 @@ class GRPOTrainer:
         这一组仍能靠 ROUGE 和事实项学习。缺失比例记进日志 —— 超过 10%
         说明裁判配置有问题，该去查超时和 max_new_tokens，而不是接着跑。
         """
-        filled: List[float] = [0.0] * len(scores)
+        filled: Dict[str, List[float]] = {}
         missing = 0
-        for start in range(0, len(scores), group_size):
-            chunk = scores[start:start + group_size]
-            ok = [s for s in chunk if s is not None]
-            fallback = sum(ok) / len(ok) if ok else 0.0
-            missing += sum(1 for s in chunk if s is None)
-            for i, s in enumerate(chunk):
-                filled[start + i] = float(s) if s is not None else fallback
-        return filled, missing / max(len(scores), 1)
+        total = 0
+        for name, scores in signals.items():
+            values, miss = self._fill_one_signal(scores, group_size)
+            filled[name] = values
+            missing += miss
+            total += len(scores)
+        return filled, missing / max(total, 1)
 
     # ------------------------------------------------------------------
     def rollout(self, prompts: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -299,12 +359,13 @@ class GRPOTrainer:
         for i in batch["prompt_index"].tolist():
             refs.append(prompts[i]["summary"])
             sources.append(prompts[i]["source"])
-        semantic = self.score_semantic(batch["responses"], refs, sources)
+        signals = self.score_semantic(batch["responses"], refs, sources)
         judge_missing = 0.0
-        if semantic is not None:
-            semantic, judge_missing = self.fill_semantic_gaps(semantic, self.group_size)
+        if signals is not None:
+            signals, judge_missing = self.fill_semantic_gaps(signals, self.group_size)
         breakdowns = compute_rewards(
-            batch["responses"], refs, sources, self.reward_cfg, semantic
+            batch["responses"], refs, sources,
+            spec=self.reward_spec, judge_signals=signals,
         )
         # ★ 奖励/长度/基线必须建在**模型所在的设备**上。
         # 默认的 torch.tensor([...]) 建在 CPU；后续 advantages 也就留在 CPU，
@@ -430,19 +491,19 @@ class GRPOTrainer:
         metrics["reward_group_std"] = float(
             rewards.std(dim=-1, unbiased=False).mean()
         )
-        # 事实一致性和 ROUGE 的分项也该看 —— 只盯总分判断不出"好在哪"
-        metrics["fact_judge"] = float(
-            sum(b.fact_judge for b in breakdowns) / len(breakdowns)
-        )
-        # 事实项的**组内**标准差：均值好看但组内没方差，归一化之后就是常数，
-        # 等于白接一套裁判。
-        fj = torch.tensor(
-            [b.fact_judge for b in breakdowns], dtype=torch.float32, device=self.device
-        )
-        metrics["fact_judge_group_std"] = float(
-            fj.reshape(len(prompts), self.group_size).std(dim=-1, unbiased=False).mean()
-        )
-        metrics["rouge_l"] = float(sum(b.rouge_l for b in breakdowns) / len(breakdowns))
+        # ---- 逐项分项：每个启用的 reward 都要有均值 + 组内标准差 ----
+        # 只盯总分判断不出"好在哪"；组内标准差才是"这一项在 GRPO 里有没有用"
+        # 的判据 —— 均值好看但组内没方差，归一化之后就是常数，等于白接。
+        for term in self.reward_spec.enabled_terms:
+            values = torch.tensor(
+                [b.values.get(term.name, 0.0) for b in breakdowns],
+                dtype=torch.float32, device=self.device,
+            )
+            metrics[f"term_{term.name}"] = float(values.mean())
+            metrics[f"term_{term.name}_group_std"] = float(
+                values.reshape(len(prompts), self.group_size)
+                .std(dim=-1, unbiased=False).mean()
+            )
         # 六要素裁判自己汇报的统计量（需求第十二节）：mean_fact_reward、
         # 各要素均值、0-4 各档比例。只有事实一致性后端有这个钩子，
         # **不需要 trainer 认识六要素**，耦合面就一个方法名。
@@ -484,24 +545,27 @@ class GRPOTrainer:
 
     # ------------------------------------------------------------------
     def _log_step(self, step: int, n_steps: int, m: Dict[str, float]) -> None:
-        """打这一步的日志。奖励只有 fact_judge 一种，列固定。"""
-        head = (
-            f"step {step}/{n_steps} | "
+        """打这一步的日志。启用了哪些 reward，就打印哪几列。"""
+        parts = [
+            f"step {step}/{n_steps}",
             f"reward {m['reward_mean']:.4f}±{m['reward_std']:.4f}"
-            f"(组内σ{m['reward_group_std']:.4f}) | ROUGE-L {m['rouge_l']:.4f}"
-        )
-        head += (
-            f" | 事实一致性 {m['fact_judge']:.4f}"
-            f"(组内σ{m['fact_judge_group_std']:.4f})"
-            f" | 裁判缺失 {m['judge_missing'] * 100:.1f}%"
-        )
-        head += (
-            f" | 门控 {m['gating_rate'] * 100:.1f}%"
-            f" | 保留组 {m['kept_groups']}/{m['total_groups']}"
-            f" | clip {m['clipped_frac'] * 100:.1f}%"
-            f" | |g| {m['grad_norm']:.2f} | len {m['output_len_mean']:.0f}"
-        )
-        logger.info(head)
+            f"(组内σ{m['reward_group_std']:.4f})",
+        ]
+        for term in self.reward_spec.enabled_terms:
+            parts.append(
+                f"{term.name} {m[f'term_{term.name}']:.4f}"
+                f"(σ{m[f'term_{term.name}_group_std']:.4f})"
+            )
+        if self.reward_spec.needs_judge():
+            parts.append(f"裁判缺失 {m['judge_missing'] * 100:.1f}%")
+        parts += [
+            f"门控 {m['gating_rate'] * 100:.1f}%",
+            f"保留组 {m['kept_groups']}/{m['total_groups']}",
+            f"clip {m['clipped_frac'] * 100:.1f}%",
+            f"|g| {m['grad_norm']:.2f}",
+            f"len {m['output_len_mean']:.0f}",
+        ]
+        logger.info(" | ".join(parts))
 
         # 六要素的逐项明细（需求第十二节）：均值 + 0-4 各档比例。
         if "mean_fact_reward" in m:

@@ -1,0 +1,57 @@
+defaults: grpo_fact_judge
+
+# ============================================================================
+# 只考虑"事实一致性 reward" —— 2× A100 40GB 正式版
+#
+#   GPU0  策略：ChatGLM3-6B 4-bit NF4（冻结）+ LoRA + 优化器 + rollout
+#   GPU1  裁判：Qwen2.5-7B-Instruct（bf16 全精度，冻结）
+#
+# 和 t4 版的差别主要是规模与精度：A100 40GB 装得下全精度裁判（判定质量更好），
+# rollout 的组也开大一倍。奖励口径与 T4 版完全一致（只留 fact_consistency）。
+#
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_only_a100.yaml
+# ============================================================================
+
+model_config: configs/model_chatglm3_6b_nf4.yaml   # 4-bit + bf16 计算
+
+rl:
+  output_dir: outputs/grpo_fact_only_a100
+  sft_adapter: outputs/sft_chatglm3/step_000336.pt   # 换成你机器上的路径
+  limit_prompts: null
+
+  quantize: true
+
+  # ---- rollout：40GB 卡的推荐取值 ----
+  group_size: 8                  # 组内基线更稳；成本随时间线性涨
+  prompts_per_step: 1
+  max_length: 3072
+  max_new_tokens: 512
+  temperature: 0.9
+  top_p: 0.95
+
+  # ---- 显存 ----
+  gradient_checkpointing: true
+  logprob_micro_batch: 4
+
+  # ---- 存档与日志 ----
+  save_every_n_steps: 25
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 1
+
+  # ---- 奖励：只留事实一致性 ----
+  reward:
+    normalize_weights: true
+    terms:
+      rouge_l:          {enabled: false, weight: 0.0}
+      fact_consistency: {enabled: true,  weight: 1.0}
+
+semantic:
+  dtype: bfloat16                # A100 支持 bf16
+  load_in_4bit: false            # 40GB 装得下 7B 全精度裁判（约 14GB）
+  device: cuda:1
+  max_batch_size: 8
+  extract_max_new_tokens: 1024
+
+tracking:
+  backend: swanlab

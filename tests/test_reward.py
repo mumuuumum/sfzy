@@ -1,8 +1,9 @@
-"""rl/reward.py 的验收测试。
+"""rl/reward.py 的验收测试：门控 + 多 reward 的归一化加权聚合 + 多信号。
 
-奖励现在只有 `fact_judge` 一种：门控 + 六要素裁判分 + ROUGE-L。
-规则事实抽取（`extract_facts`）保留，但**只给 prompt 池筛选**用，
-不参与奖励。
+奖励项本身怎么算由注册表（reward_terms）和裁判负责；这里只测：
+  * 门控的分支
+  * 权重归一化 + 逐项求和
+  * 多信号怎么进来、缺了怎么办、量纲不对怎么拦
 
     python -m pytest tests/test_reward.py -q
 """
@@ -12,7 +13,6 @@ from __future__ import annotations
 import pytest
 
 from sfzy.rl.reward import (
-    DEFAULT_REWARD_CFG,
     check_gate,
     compute_reward,
     compute_rewards,
@@ -24,7 +24,6 @@ from sfzy.rl.reward import (
 # ---------------------------------------------------------------- 事实抽取（只用于 prompt 池筛选）
 
 def test_金额单位归一化():
-    """48000元 与 4.8万元 必须视为同一个事实。不折算的话信号全是噪声。"""
     assert extract_facts("共计48000元") == extract_facts("共计4.8万元")
 
 
@@ -39,12 +38,10 @@ def test_日期按书写精度归一化():
 
 
 def test_法条号被排除():
-    """项目决定不考虑法条，所以"第1079条"不该产生任何事实。"""
     assert extract_facts("依照《合同法》第1079条之规定") == set()
 
 
 def test_法条号里的数字不会变成编号():
-    """这是提取顺序的意义：法条号先挖掉，1079 就不会落到 ID 分支。"""
     facts = extract_facts("依照第1079条判决")
     assert not any(f.startswith("id:") for f in facts)
 
@@ -56,12 +53,10 @@ def test_提取顺序_金额不会被当成编号():
 
 
 def test_提取顺序_年份不会被当成编号():
-    facts = extract_facts("2015年7月19日")
-    assert facts == {"date:2015-07-19"}
+    assert extract_facts("2015年7月19日") == {"date:2015-07-19"}
 
 
 def test_纯编号能被抽出来():
-    """案号里的 4 位以上数字（既不是金额也不是日期）算编号。"""
     facts = extract_facts("（2018）陕1023民初539号")
     assert "id:1023" in facts
 
@@ -73,6 +68,12 @@ def test_空文本返回空集合():
 # ---------------------------------------------------------------- 门控
 
 REF = "原被告系借款合同纠纷。原告请求判令被告归还借款本金48000元及利息。本院认为借贷关系合法有效。判决如下：被告归还原告48000元。"
+
+# 两个 reward 都开，权重 0.3 / 0.7（和为 1，归一化后不变）
+SPEC = {"terms": {
+    "rouge_l": {"enabled": True, "weight": 0.3},
+    "fact_consistency": {"enabled": True, "weight": 0.7},
+}}
 
 
 def gate_cfg(**over):
@@ -108,90 +109,102 @@ def test_门控_缺判决结果标记():
     assert check_gate(no_marker, no_marker, gate_cfg()) == "no_result_marker"
 
 
-# ---------------------------------------------------------------- 奖励
+# ---------------------------------------------------------------- 多 reward 聚合
 
-def test_fact_judge模式_通过门控后按权重组合():
-    cfg = {"mode": "fact_judge", "weights": {"rouge_l": 0.3, "fact": 0.7}}
-    score, bd = compute_reward(REF, REF, cfg=cfg, semantic=0.8)
+def test_多个reward按归一化权重求和():
+    score, bd = compute_reward(
+        REF, REF, spec=SPEC, judge_signals={"fact_consistency": 0.8}
+    )
     assert bd.gated is False
-    assert bd.fact_judge == pytest.approx(0.8)
-    assert score == pytest.approx(0.3 * bd.rouge_l + 0.7 * 0.8)
+    assert bd.values["fact_consistency"] == pytest.approx(0.8)
+    assert score == pytest.approx(0.3 * bd.values["rouge_l"] + 0.7 * 0.8)
 
 
-def test_fact_judge模式_不做量纲换算():
-    """裁判返回的 weighted_reward 本就是 [0,1]，不能再按 0-100 除一遍。
-    配错量纲不会报错，只会让事实项缩水 100 倍 —— 必须钉住。"""
-    cfg = {"mode": "fact_judge", "semantic_scale": 100.0}
-    _, bd = compute_reward(REF, REF, cfg=cfg, semantic=0.8)
-    assert bd.fact_judge == pytest.approx(0.8)          # 不是 0.008
+def test_权重会被归一到一():
+    spec = {"terms": {"rouge_l": {"weight": 30}, "fact_consistency": {"weight": 70}}}
+    score, bd = compute_reward(
+        REF, REF, spec=spec, judge_signals={"fact_consistency": 1.0}
+    )
+    assert score == pytest.approx(0.3 * bd.values["rouge_l"] + 0.7 * 1.0)
 
 
-def test_fact_judge模式_裁判分越高奖励越高():
-    cfg = {"mode": "fact_judge"}
-    s_low, _ = compute_reward(REF, REF, cfg=cfg, semantic=0.0)
-    s_high, _ = compute_reward(REF, REF, cfg=cfg, semantic=1.0)
-    assert s_high > s_low
+def test_可以只开一个reward():
+    spec = {"terms": {
+        "rouge_l": {"enabled": True, "weight": 1.0},
+        "fact_consistency": {"enabled": False, "weight": 1.0},
+    }}
+    score, bd = compute_reward(REF, REF, spec=spec)     # 不需要裁判
+    assert set(bd.values) == {"rouge_l"}
+    assert score == pytest.approx(bd.values["rouge_l"])
 
 
-def test_fact_judge模式_被门控时总分0():
-    cfg = {"mode": "fact_judge"}
-    score, bd = compute_reward("太短", REF, cfg=cfg, semantic=1.0)
+def test_可以关掉rouge只留裁判():
+    spec = {"terms": {
+        "rouge_l": {"enabled": False, "weight": 1.0},
+        "fact_consistency": {"enabled": True, "weight": 1.0},
+    }}
+    score, bd = compute_reward(
+        REF, REF, spec=spec, judge_signals={"fact_consistency": 0.4}
+    )
+    assert set(bd.values) == {"fact_consistency"}
+    assert score == pytest.approx(0.4)
+
+
+def test_judge项缺信号要报错():
+    with pytest.raises(ValueError, match="fact_consistency"):
+        compute_reward(REF, REF, spec=SPEC)
+
+
+def test_judge信号量纲不对要报错():
+    with pytest.raises(ValueError, match="不在 \\[0,1\\]"):
+        compute_reward(REF, REF, spec=SPEC, judge_signals={"fact_consistency": 80.0})
+
+
+def test_默认配置需要裁判信号():
+    with pytest.raises(ValueError, match="fact_consistency"):
+        compute_reward(REF, REF)          # spec=None → 默认预设 fact_judge
+
+
+# ---------------------------------------------------------------- 门控是全局开关
+
+def test_被门控时总分0且不碰裁判():
+    score, bd = compute_reward("太短", REF, spec=SPEC)   # 不给信号也不该报错
     assert bd.gated is True
     assert bd.gate_reason == "too_short"
     assert score == 0.0
+    assert bd.values == {}
 
 
-def test_fact_judge模式_缺裁判分要报错():
-    """静默降级只会让你以为在跑 Judge，其实没有。"""
-    with pytest.raises(ValueError, match="fact_judge"):
-        compute_reward(REF, REF, cfg={"mode": "fact_judge"})
-
-
-def test_fact_judge模式_接到0到100量纲的裁判要报错():
-    """把 0-100 量纲的分数接到 fact_judge 上，事实项会凭空大 100 倍 ——
-    而且不报错。护栏必须拦住。"""
-    with pytest.raises(ValueError, match="不在 \\[0,1\\]"):
-        compute_reward(REF, REF, cfg={"mode": "fact_judge"}, semantic=80.0)
-
-
-def test_未知的奖励模式直接报错():
-    """rouge_only / flat / gated / gated_judge 已删除，写进来必须报错，
-    而不是静默跑成别的口径。"""
-    with pytest.raises(ValueError, match="fact_judge"):
-        compute_reward(REF, REF, cfg={"mode": "gated"})
-
-
-def test_权重可覆盖():
-    cfg = {"mode": "fact_judge", "weights": {"rouge_l": 1.0, "fact": 0.0}}
-    score, bd = compute_reward(REF, REF, cfg=cfg, semantic=0.9)
-    assert score == pytest.approx(bd.rouge_l)
+def test_门控可以整块关掉():
+    spec = {"gate": {"enabled": False}, "terms": {"rouge_l": {"weight": 1.0}}}
+    score, bd = compute_reward("太短", REF, spec=spec)
+    assert bd.gated is False
+    assert "rouge_l" in bd.values
 
 
 # ---------------------------------------------------------------- 批量与统计
 
-def test_批量打分():
-    out = compute_rewards([REF, "太短"], [REF, REF], semantic_scores=[0.5, 0.5])
-    assert len(out) == 2
-    assert out[1].gated is True
-
-
-def test_批量打分_裁判分个数必须对齐():
-    with pytest.raises(ValueError, match="裁判分个数"):
-        compute_rewards([REF, REF], [REF, REF], semantic_scores=[0.5])
-
-
-def test_批量打分_带裁判分():
+def test_批量打分_带多信号():
     out = compute_rewards(
-        [REF, REF], [REF, REF], cfg={"mode": "fact_judge"},
-        semantic_scores=[0.1, 0.9],
+        [REF, REF], [REF, REF], spec=SPEC,
+        judge_signals={"fact_consistency": [0.1, 0.9]},
     )
-    assert out[0].fact_judge == pytest.approx(0.1)
+    assert out[0].values["fact_consistency"] == pytest.approx(0.1)
     assert out[1].total > out[0].total
+
+
+def test_批量打分_信号个数要对齐():
+    with pytest.raises(ValueError, match="不一致"):
+        compute_rewards(
+            [REF, REF], [REF, REF], spec=SPEC,
+            judge_signals={"fact_consistency": [0.1]},
+        )
 
 
 def test_门控原因统计():
     bds = compute_rewards(
-        [REF, "太短", REF * 3], [REF] * 3, semantic_scores=[0.5] * 3
+        [REF, "太短", REF * 3], [REF] * 3, spec=SPEC,
+        judge_signals={"fact_consistency": [0.5, 0.5, 0.5]},
     )
     stats = summarize_gate_reasons(bds)
     assert stats["total"] == 3
@@ -200,13 +213,9 @@ def test_门控原因统计():
     assert stats["length_too_long"] == 1
 
 
-def test_默认配置是fact_judge模式():
-    assert DEFAULT_REWARD_CFG["mode"] == "fact_judge"
-    assert set(DEFAULT_REWARD_CFG["weights"]) == {"rouge_l", "fact"}
-
-
 def test_分项明细能导出():
-    _, bd = compute_reward(REF, REF, semantic=0.6)
+    _, bd = compute_reward(REF, REF, spec={"terms": {"rouge_l": {"weight": 1.0}}})
     detail = bd.to_dict()
-    assert set(detail) == {"reward", "reward_rouge_l", "reward_fact_judge", "gated"}
-    assert detail["reward_fact_judge"] == pytest.approx(0.6)
+    assert detail["reward"] == pytest.approx(bd.total)
+    assert "reward_rouge_l" in detail
+    assert detail["gated"] == 0.0

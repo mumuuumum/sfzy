@@ -26,6 +26,9 @@ rl:
   output_dir: outputs/grpo_chatglm3
   prompt_style: structured
   prompt_file: data/splits/rl_prompts.jsonl
+  # GRPO 的起点（SFT 产出的 LoRA checkpoint）。写在这里，
+  # `python scripts/train_grpo.py --config <本文件>` 就不用再传 --sft-adapter。
+  sft_adapter: outputs/sft_chatglm3/step_000336.pt
 
   # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
   # 等价于在命令行加 --quantize，但写进配置更不容易忘。
@@ -72,10 +75,13 @@ rl:
   resume_from: null
 
   reward:
-    mode: fact_judge
-    weights:
-      rouge_l: 0.3             # 保持和官方评测口径的锚
-      fact: 0.7                # ★ 六要素事实一致性 Judge，主信号
+    # 多 reward：每个 term 可以单独开关，权重按启用项归一到 1。
+    # 新增 reward 只加一行；聚合 / 训练 / 日志都不用改。
+    normalize_weights: true
+    terms:
+      rouge_l:          {enabled: true, weight: 0.3}   # 官方评测口径的锚
+      fact_consistency: {enabled: true, weight: 0.7}   # ★ 六要素事实一致性 Judge
+    # gate 不写就用默认（enabled: true + 默认阈值）；写成 {enabled: false} 可整块关掉
 
   # SFT 基线锚：需要 prompt 池带 sft_output，现在的 rl_prompts.jsonl 没有，
   # 保持关闭；要开就先按 tools/select_rl_prompts.py --triples 重新生成池子。

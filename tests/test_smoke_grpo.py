@@ -1,12 +1,12 @@
-"""GRPOTrainer 的冒烟测试：CPU 上跑通 rollout → 打分 → advantage → 更新。
+"""GRPOTrainer 的冒烟测试：CPU 上跑通 rollout → 多信号打分 → advantage → 更新。
 
-这是**唯一**把 RL 全链路串起来的测试。在此之前 rollout、裁判接线、基线锚、
-组过滤都只有单元测试，各自都对，但接起来是不是对的没人验证过 —— 而 RL 的
-bug 恰恰最爱藏在这种接缝上（比如"裁判分算出来了但没传进奖励"）。
+这是**唯一**把 RL 全链路串起来的测试。奖励项本身怎么算由
+tests/test_reward.py / test_reward_spec.py 覆盖；这里测的是**接缝**：
+多信号怎么从裁判进到聚合、逐项指标有没有漏、缺信号会不会补、只开规则项时
+会不会多余地要求裁判。
 
-奖励只有 fact_judge 一种，所以每个 trainer 都必须挂裁判桩。规模压到最小：
-微型 GPT2、假 tokenizer、2 个 prompt × G=2、生成 8 个 token，门控放开
-（这里测的是**管线**，不是奖励设计本身，奖励语义由 tests/test_reward.py 覆盖）。
+规模压到最小：微型 GPT2、假 tokenizer、2 个 prompt × G=2、生成 8 个 token，
+门控整块关掉（这里测管线，不测门控）。
 
     python -m pytest tests/test_smoke_grpo.py -q
 """
@@ -25,6 +25,7 @@ from sfzy.rl.trainer import GRPOTrainer
 
 ROOT = Path(__file__).resolve().parents[1]
 VOCAB = 1024
+FACT_SIGNAL = "fact_consistency"
 
 
 class FakeTokenizer:
@@ -53,22 +54,16 @@ class FakeTokenizer:
 def _stub_fact_score(text: str) -> float:
     """长度项 + **内容相关的稳定扰动**，取值 ∈ [0,1]。
 
-    为什么必须带内容：微型随机模型在 eval 模式下（rollout 的正确模式）为同一个
-    prompt 采样的 G 条**长度经常完全相同**，只按长度打分会让奖励在组内变成常数、
-    advantage 全 0 —— 那是夹具退化，不是管线问题。
-
-    用 `sum(map(ord, ...))` 而不是内置 `hash()`：后者受 PYTHONHASHSEED 影响，
-    同一份输入跨进程会给出不同的分，测试就不再可复现。
+    为什么必须带内容：微型随机模型在 eval 模式下为同一个 prompt 采样的 G 条
+    长度经常完全相同，只按长度打分会让奖励在组内变成常数、advantage 全 0 ——
+    那是夹具退化，不是管线问题。用 `sum(map(ord, ...))` 而不是内置 `hash()`，
+    保证跨进程可复现。
     """
     return min(1.0, 0.1 + 0.02 * len(text) + (sum(map(ord, text)) % 7) / 100.0)
 
 
 class FactStubScorer(SemanticScorer):
-    """六要素裁判桩：分数和候选内容相关，量纲 [0,1]（fact_judge 只认这个量纲）。
-
-    同时记录调用次数 —— 没有这条断言，"裁判被调用但结果被丢掉"这种接缝
-    bug 会让测试依然通过。
-    """
+    """给 fact_consistency 信号用的裁判桩。量纲 [0,1]。"""
 
     name = "judge_fact_stub"
 
@@ -76,10 +71,16 @@ class FactStubScorer(SemanticScorer):
         self.calls = 0
         self.seen_items: list = []
 
+    def available_signals(self):
+        return {FACT_SIGNAL}
+
     def score_batch(self, items):
+        return [_stub_fact_score(i["candidate"]) for i in items]
+
+    def score_batch_signals(self, items):
         self.calls += 1
         self.seen_items.extend(items)
-        return [_stub_fact_score(i["candidate"]) for i in items]
+        return [{FACT_SIGNAL: _stub_fact_score(i["candidate"])} for i in items]
 
 
 class FlakyScorer(SemanticScorer):
@@ -87,8 +88,11 @@ class FlakyScorer(SemanticScorer):
 
     name = "judge_fact_flaky"
 
-    def score_batch(self, items):
-        return [None if i % 2 else 0.7 for i, _ in enumerate(items)]
+    def available_signals(self):
+        return {FACT_SIGNAL}
+
+    def score_batch_signals(self, items):
+        return [{FACT_SIGNAL: None if i % 2 else 0.7} for i, _ in enumerate(items)]
 
 
 def tiny_model():
@@ -112,10 +116,24 @@ def make_prompts(n: int = 2, with_sft: bool = True) -> list[dict]:
             "summary": "判令被告支付48000元。",
         }
         if with_sft:
-            # 基线锚要用：SFT 阶段对同一个 prompt 的输出
             rec["sft_output"] = "判令被告支付48000元，本案受理费由被告负担。"
         out.append(rec)
     return out
+
+
+def reward_cfg(**over):
+    cfg = {
+        "normalize_weights": True,
+        "terms": {
+            "rouge_l": {"enabled": True, "weight": 0.3},
+            "fact_consistency": {"enabled": True, "weight": 0.7},
+        },
+        "rouge_mode": "char",
+        # 门控整块关掉：生成只有 8 个 token，正常门控会全拦下，测不出东西。
+        "gate": {"enabled": False},
+    }
+    cfg.update(over)
+    return cfg
 
 
 def make_cfg(**rl_over):
@@ -131,19 +149,7 @@ def make_cfg(**rl_over):
         "log_every_n_steps": 1,
         "learning_rate": 1e-3,
         "temperature": 0.9,
-        "reward": {
-            "mode": "fact_judge",
-            "weights": {"rouge_l": 0.3, "fact": 0.7},
-            "rouge_mode": "char",
-            # 门控放开：生成只有 8 个 token，正常门控会把每条都拦下，
-            # 那一组奖励全 0、advantage 全 0，测不出任何东西。
-            "gate": {
-                "min_chars": 0,
-                "length_ratio_range": [0.0, 1000.0],
-                "forbidden_prefixes": [],
-                "require_result_marker": False,
-            },
-        },
+        "reward": reward_cfg(),
     })
     cfg["rl"].update(rl_over)
     return cfg
@@ -170,21 +176,17 @@ def test_一步训练能跑完并返回全部指标(tmp_path):
     trainer = make_trainer(tmp_path)
     metrics = trainer.step(make_prompts())
 
-    for key in ("loss", "reward_mean", "rouge_l", "fact_judge",
-                "fact_judge_group_std", "kept_groups", "total_groups", "gating_rate",
-                "output_len_mean", "clipped_frac", "anchor_filtered",
-                # swanlab 面板要用的那几项；少一个就在面板上少一根曲线
-                "grad_norm", "kept_ratio", "reward_group_std", "judge_missing"):
+    for key in ("loss", "reward_mean", "reward_group_std", "gating_rate",
+                "term_rouge_l", "term_rouge_l_group_std",
+                "term_fact_consistency", "term_fact_consistency_group_std",
+                "kept_groups", "total_groups", "kept_ratio", "anchor_filtered",
+                "output_len_mean", "clipped_frac", "grad_norm", "judge_missing"):
         assert key in metrics, f"训练日志缺少指标 {key}"
     assert metrics["loss"] == metrics["loss"]          # 不是 nan
 
 
 def test_一步训练确实更新了参数(tmp_path):
-    """梯度真的传到了参数上。
-
-    裁判桩的分数随内容变化，组内才有真实方差；纯规则奖励在微型随机模型上
-    常常是常数，advantage 全 0 时 loss 恒等于 0，测试等于没测。
-    """
+    """梯度真的传到了参数上。裁判桩的分数随内容变化，组内才有真实方差。"""
     trainer = make_trainer(tmp_path, scorer=FactStubScorer())
     before = [p.detach().clone() for p in trainer.model.parameters()]
     metrics = trainer.step(make_prompts())
@@ -197,20 +199,19 @@ def test_一步训练确实更新了参数(tmp_path):
     assert changed > 0, "一步训练后参数一个都没变"
 
 
-def test_fact_judge模式的奖励有方差(tmp_path):
-    """组内方差是 GRPO 的前提。奖励恒定 → advantage 全 0 → 白跑一个 epoch。"""
+def test_每个reward项都有自己的组内方差(tmp_path):
+    """组内方差是 GRPO 的前提。逐项都要有方差，否则那一项等于白接。"""
     trainer = make_trainer(tmp_path)
     metrics = trainer.step(make_prompts())
     assert metrics["reward_std"] > 0
-    assert metrics["kept_groups"] > 0, "有方差的组不该被过滤掉"
-    # 事实项自己的组内方差：均值好看但组内没方差，等于白接一个裁判
-    assert metrics["fact_judge_group_std"] > 0
+    assert metrics["kept_groups"] > 0
+    assert metrics["term_fact_consistency_group_std"] > 0
 
 
 def test_train_能跑到最后并保存(tmp_path):
     trainer = make_trainer(tmp_path)
     state = trainer.train(make_prompts(4))
-    assert state.step == 2                       # 4 个 prompt / 每步 2 个
+    assert state.step == 2
     assert len(state.history) == 2
     assert (tmp_path / "step_000002.pt").exists()
 
@@ -218,13 +219,6 @@ def test_train_能跑到最后并保存(tmp_path):
 # ---------------------------------------------------------------- train/eval 模式
 
 def test_训练前向必须处在_train_模式(tmp_path, monkeypatch):
-    """回归测试：GRPO 此前从不调 `model.train()`。
-
-    HF 的 `from_pretrained` 结尾会把模型设成 eval，而 ChatGLM3 的梯度检查点
-    条件是 `if self.gradient_checkpointing and self.training:` —— training=False
-    会让整个条件短路，检查点静默失效、激活按「每层完整保存」算，长序列必然
-    OOM，且报错栈里全是 bitsandbytes 的调用，看不出根因。
-    """
     import sfzy.rl.trainer as trainer_mod
 
     seen: dict = {}
@@ -237,7 +231,7 @@ def test_训练前向必须处在_train_模式(tmp_path, monkeypatch):
     monkeypatch.setattr(trainer_mod, "sequence_logprob", spy)
 
     trainer = make_trainer(tmp_path)
-    trainer.model.eval()                     # from_pretrained 之后就是这个状态
+    trainer.model.eval()
     trainer.step(make_prompts())
 
     assert seen["training"] is True, (
@@ -246,11 +240,6 @@ def test_训练前向必须处在_train_模式(tmp_path, monkeypatch):
 
 
 def test_rollout生成时必须切到_eval_模式(tmp_path, monkeypatch):
-    """生成时必须是 eval。
-
-    ChatGLM3 在 train + 梯度检查点下会把 KV cache 关掉，自回归生成退化成
-    每个 token 重算整个前缀 —— rollout 是 GRPO 的瓶颈，这个代价受不了。
-    """
     import sfzy.rl.trainer as trainer_mod
 
     seen: dict = {}
@@ -263,7 +252,7 @@ def test_rollout生成时必须切到_eval_模式(tmp_path, monkeypatch):
     monkeypatch.setattr(trainer_mod, "generate_batch", spy)
 
     trainer = make_trainer(tmp_path)
-    trainer.model.train()                    # 故意先置成 train
+    trainer.model.train()
     trainer.step(make_prompts())
 
     assert seen["training"] is False, "生成必须显式 eval，不能靠模型当前模式"
@@ -271,7 +260,7 @@ def test_rollout生成时必须切到_eval_模式(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- 日志列
 
-def test_日志打印事实一致性和裁判缺失(tmp_path, caplog):
+def test_日志按启用的reward打印列(tmp_path, caplog):
     import logging
 
     with caplog.at_level(logging.INFO, logger="sfzy.grpo"):
@@ -279,65 +268,85 @@ def test_日志打印事实一致性和裁判缺失(tmp_path, caplog):
         trainer.train(make_prompts(2))
 
     text = " ".join(r.message for r in caplog.records)
-    assert "事实一致性" in text
+    assert "rouge_l" in text and "fact_consistency" in text
     assert "裁判缺失" in text
     assert "组内σ" in text
 
 
-# ---------------------------------------------------------------- 裁判接线
+# ---------------------------------------------------------------- 多信号接线
 
-def test_裁判分进入奖励(tmp_path):
+def test_裁判信号批量进来(tmp_path):
     scorer = FactStubScorer()
     trainer = make_trainer(tmp_path, scorer=scorer)
     metrics = trainer.step(make_prompts())
 
     assert scorer.calls == 1, "裁判应该被**批量**调用一次，而不是逐条调用"
     assert len(scorer.seen_items) == trainer.group_size * 2
-    assert metrics["fact_judge"] > 0, "裁判分算出来了却没进明细"
+    assert metrics["term_fact_consistency"] > 0
 
 
-def test_裁判分真的改变了奖励():
-    """同一个生成结果、同一个配置，只换裁判分，奖励必须不同。
-
-    这条防的是"裁判接了但权重是 0"（改了名义没改实际）。
-    """
+def test_裁判信号真的改变了奖励():
+    """同一个生成结果、同一个配置，只换裁判信号，奖励必须不同。"""
     from sfzy.rl.reward import compute_rewards
 
-    cfg = make_cfg()["rl"]["reward"]
+    cfg = reward_cfg()
     args = (["同一段文本"], ["判令被告支付48000元"])
-    low = compute_rewards(*args, cfg=cfg, semantic_scores=[0.1])[0].total
-    high = compute_rewards(*args, cfg=cfg, semantic_scores=[0.9])[0].total
+    low = compute_rewards(*args, spec=cfg, judge_signals={FACT_SIGNAL: [0.1]})[0].total
+    high = compute_rewards(*args, spec=cfg, judge_signals={FACT_SIGNAL: [0.9]})[0].total
     assert high > low
 
 
-def test_没裁判直接报错(tmp_path):
-    """fact_judge 的唯一事实来源就是裁判，没有裁判必须当场报错。"""
-    with pytest.raises(ValueError, match="fact_judge"):
+def test_有judge项却没裁判直接报错(tmp_path):
+    with pytest.raises(ValueError, match="judge"):
         make_trainer(tmp_path, scorer=None)
 
 
+def test_裁判产不出需要的信号直接报错(tmp_path):
+    class WrongScorer(SemanticScorer):
+        name = "judge_wrong"
+
+        def available_signals(self):
+            return {"别的信号"}
+
+        def score_batch_signals(self, items):
+            return [{"别的信号": 0.5} for _ in items]
+
+    with pytest.raises(ValueError, match="产不出来"):
+        make_trainer(tmp_path, scorer=WrongScorer())
+
+
+def test_只开规则项时不加载裁判也不需要裁判(tmp_path):
+    trainer = make_trainer(tmp_path, scorer=None, reward=reward_cfg(
+        terms={"rouge_l": {"enabled": True, "weight": 1.0}},
+    ))
+    metrics = trainer.step(make_prompts())
+    assert "term_rouge_l" in metrics
+    assert "term_fact_consistency" not in metrics
+
+
+# ---------------------------------------------------------------- 判分缺失
+
 def test_裁判个别失败不中断训练(tmp_path):
-    """一次超时不该让跑了三小时的 run 在第 137 步崩掉。
-    缺失用组内均值补，比例记进日志。"""
     trainer = make_trainer(tmp_path, scorer=FlakyScorer())
     metrics = trainer.step(make_prompts())
     assert metrics["judge_missing"] == pytest.approx(0.5)
-    assert metrics["fact_judge"] > 0, "组内另一半的分数应该被用上"
+    assert metrics["term_fact_consistency"] > 0, "组内另一半的分数应该被用上"
     assert metrics["loss"] == metrics["loss"]
 
 
-def test_裁判补缺_用组内均值而不是0(tmp_path):
-    """填 0 等于"这条很差"，会把优势估计带偏。"""
+def test_补缺_用组内均值而不是0(tmp_path):
     trainer = make_trainer(tmp_path)
-    filled, frac = trainer.fill_semantic_gaps([0.8, None, None, 0.6], group_size=2)
-    assert filled == [0.8, 0.8, 0.6, 0.6]
+    filled, frac = trainer.fill_semantic_gaps(
+        {FACT_SIGNAL: [0.8, None, None, 0.6]}, group_size=2
+    )
+    assert filled[FACT_SIGNAL] == [0.8, 0.8, 0.6, 0.6]
     assert frac == pytest.approx(0.5)
 
 
-def test_裁判补缺_整组缺失时退化为0(tmp_path):
+def test_补缺_整组缺失时退化为0(tmp_path):
     trainer = make_trainer(tmp_path)
-    filled, frac = trainer.fill_semantic_gaps([None, None], group_size=2)
-    assert filled == [0.0, 0.0] and frac == 1.0
+    filled, frac = trainer.fill_semantic_gaps({FACT_SIGNAL: [None, None]}, group_size=2)
+    assert filled[FACT_SIGNAL] == [0.0, 0.0] and frac == 1.0
 
 
 # ---------------------------------------------------------------- 基线锚
@@ -361,7 +370,6 @@ def test_基线锚_默认关闭(tmp_path):
 
 
 def test_基线锚_训练时不误伤(tmp_path):
-    """锚开着也要能正常训练：prompt 池带 sft_output 时不该报错。"""
     trainer = make_trainer(tmp_path, anchor={"enabled": True, "slack": 0.05})
     state = trainer.train(make_prompts(2, with_sft=True))
     assert state.step == 1

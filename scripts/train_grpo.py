@@ -6,14 +6,20 @@
 和 train_sft.py 的分工完全一致：所有"环境相关"的决定都在这里，
 rl/trainer.py 只管训练循环。
 
-用法：
-    # 最小闭环：先确认能跑（约 10 分钟）
-    python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
-        --sft-adapter outputs/sft_chatglm3/best.pt --limit-prompts 8
+用法：**一切都在配置文件里**，脚本只有一个 --config。
 
-    # 正式
-    python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
-        --sft-adapter outputs/sft_chatglm3/best.pt
+    # 2×T4 15GB：先测"只考虑事实一致性"的方案
+    python scripts/train_grpo.py --config configs/grpo_fact_only_t4.yaml
+
+    # 2×A100 40GB：正式跑
+    python scripts/train_grpo.py --config configs/grpo_fact_only_a100.yaml
+
+临时改某一项不用动文件，加 --override 即可（值按 YAML 解析）：
+
+    python scripts/train_grpo.py --config configs/grpo_fact_only_t4.yaml \
+        --override rl.limit_prompts=8 \
+        --override rl.group_size=2 \
+        --override tracking.backend=none
 """
 
 from __future__ import annotations
@@ -38,6 +44,7 @@ from sfzy.models.loader import (                          # noqa: E402
     resolve_device_index,
 )
 from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
+from sfzy.rl.reward_spec import RewardSpec                     # noqa: E402
 from sfzy.rl.trainer import GRPOTrainer                   # noqa: E402
 from sfzy.sft.checkpoint import load_checkpoint           # noqa: E402
 from sfzy.utils.distributed import (                      # noqa: E402
@@ -78,11 +85,15 @@ def apply_overrides(cfg, pairs) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO 训练")
     parser.add_argument("--config", default="configs/grpo_fact_judge.yaml")
-    parser.add_argument("--sft-adapter", required=True,
-                        help="SFT 阶段产出的 LoRA checkpoint（GRPO 的起点）")
+    # 下面的参数**全部可以不传**：默认值来自配置文件，命令行只用来覆盖。
+    # 例：python scripts/train_grpo.py --config configs/grpo_fact_only_t4.yaml
+    parser.add_argument("--sft-adapter", default=None,
+                        help="SFT 阶段产出的 LoRA checkpoint（GRPO 的起点）。"
+                             "不传就用配置里的 rl.sft_adapter")
     parser.add_argument("--limit-prompts", type=int, default=None,
-                        help="只用前 N 个 prompt，用来跑最小闭环")
-    parser.add_argument("--resume", default=None)
+                        help="只用前 N 个 prompt，用来跑最小闭环。不传就用配置里的 rl.limit_prompts")
+    parser.add_argument("--resume", default=None,
+                        help="续训 checkpoint。不传就用配置里的 rl.resume_from")
     parser.add_argument("--quantize", action="store_true",
                         help="允许 4-bit 量化加载。默认关闭 —— 策略精度必须和 SFT "
                              "训练时一致，只有显存真的不够才开")
@@ -99,6 +110,20 @@ def main() -> None:
     model_cfg = load_config(resolve(cfg.get("model_config"))).get("model", {})
     lora_cfg = cfg.get("lora", {})
     rl_cfg = cfg.rl
+
+    # 命令行没给就用配置；两者都没有才报错。这样"跑一次实验"可以只写一个 yaml。
+    sft_adapter = args.sft_adapter or rl_cfg.get("sft_adapter")
+    if not sft_adapter:
+        raise ValueError(
+            "没有指定 SFT checkpoint：在配置里写 rl.sft_adapter，"
+            "或命令行加 --sft-adapter <path>。"
+        )
+    limit_prompts = (
+        args.limit_prompts if args.limit_prompts is not None else rl_cfg.get("limit_prompts")
+    )
+    resume_from = args.resume or rl_cfg.get("resume_from")
+    logger.info("SFT 起点: %s", sft_adapter)
+    logger.info("续训: %s", resume_from or "从头开始")
 
     local_rank = init_distributed()
     set_seed(cfg.get("seed", 42))
@@ -160,7 +185,7 @@ def main() -> None:
         raise RuntimeError(f"LoRA 目标层一个都没匹配上：{lora_cfg.get('target_modules')}")
     mark_only_lora_trainable(model)
 
-    adapter = resolve(args.sft_adapter)
+    adapter = resolve(sft_adapter)
     try:
         load_checkpoint(adapter, model=model)
     except RuntimeError as exc:
@@ -189,8 +214,8 @@ def main() -> None:
             line = line.strip()
             if line:
                 prompts.append(json.loads(line))
-    if args.limit_prompts:
-        prompts = prompts[: args.limit_prompts]
+    if limit_prompts:
+        prompts = prompts[: int(limit_prompts)]
     logger.info("prompt 池: %d 条", len(prompts))
     n_with_sft = sum(1 for p in prompts if p.get("sft_output"))
     logger.info("其中带 SFT 输出（基线锚要用）: %d 条", n_with_sft)
@@ -199,31 +224,46 @@ def main() -> None:
 
     # ---------------- 语义裁判 ----------------
     # 裁判是独立模型，和策略**分卡放**：策略吃满卡 0，裁判在卡 1。
-    # 奖励只有 fact_judge 一种，事实项完全由这个裁判产出，所以默认就要加载它；
-    # 只有显式 --judge-backend none 才会跳过（那会导致 trainer 启动即报错）。
-    reward_mode = (rl_cfg.get("reward") or {}).get("mode", "fact_judge")
-    want_judge = reward_mode == "fact_judge" and args.judge_backend != "none"
+    # 需不需要裁判由 reward 规格决定：只要有一个启用的 judge 项就要加载它。
+    reward_spec = RewardSpec.from_config(rl_cfg.get("reward"))
+    want_judge = reward_spec.needs_judge() and args.judge_backend != "none"
     semantic_cfg = dict(cfg.get("semantic") or {})
     scorer = build_scorer(semantic_cfg, override=args.judge_backend) if want_judge else None
     if scorer is not None:
+        missing = reward_spec.required_signals - set(scorer.available_signals())
+        if missing:
+            raise ValueError(
+                f"奖励需要的裁判信号 {sorted(missing)} 这个裁判产不出来，"
+                f"它只有 {sorted(scorer.available_signals())}。\n"
+                "  要么换裁判后端，要么在 rl.reward.terms 里把对应项关掉。"
+            )
         logger.info(
-            "语义裁判: %s（backend=%s）",
+            "语义裁判: %s（backend=%s，信号=%s）",
             getattr(scorer, "name", "unknown"),
             args.judge_backend or cfg.path_("semantic.backend"),
+            sorted(scorer.available_signals()),
         )
     else:
-        logger.warning(
-            "未启用语义裁判：fact_judge 模式需要它，trainer 启动时会直接报错。"
-        )
+        if reward_spec.needs_judge():
+            logger.warning(
+                "奖励里有 judge 项但没有加载裁判，trainer 启动时会直接报错。"
+            )
+        else:
+            logger.info("奖励不含 judge 项，不加载裁判。")
+    logger.info(
+        "奖励项: %s（归一化权重 %s）",
+        [t.name for t in reward_spec.enabled_terms],
+        {k: round(v, 4) for k, v in reward_spec.normalized_weights().items()},
+    )
 
     # ---------------- tracker ----------------
     # 续训时要接回 swanlab 上原来那条 run，否则一次 11 小时的训练被掐断后
     # 重启，面板上会多出一条断掉的曲线，而你会以为训练从零开始了。
     # run_id 存在 checkpoint 的 state 里，所以这里先把它读出来。
     resume_id = None
-    if args.resume:
+    if resume_from:
         try:
-            resume_id = (load_checkpoint(resolve(args.resume)).get("state") or {}).get(
+            resume_id = (load_checkpoint(resolve(resume_from)).get("state") or {}).get(
                 "tracker_run_id"
             )
             if resume_id:
@@ -242,7 +282,7 @@ def main() -> None:
         # 预声明 GRPO 的列（swanlab 专用），面板分组和中文名固定下来。
         columns=metric_columns(),
         run_name=make_run_name(
-            f"sfzy-grpo-{rl_cfg.get('reward', {}).get('mode', 'fact_judge')}",
+            "sfzy-grpo-" + "+".join(t.name for t in reward_spec.enabled_terms),
             G=rl_cfg.get("group_size"), kl=rl_cfg.get("kl_coef"), lr=rl_cfg.get("learning_rate"),
         ),
         enabled=is_main_process(),
@@ -254,7 +294,7 @@ def main() -> None:
         output_dir=str(resolve(rl_cfg.get("output_dir", "outputs/grpo"))),
         tracker=tracker, is_main_process=is_main_process(), scorer=scorer,
     )
-    trainer.resume(args.resume)
+    trainer.resume(resume_from)
     state = trainer.train(prompts)
     tracker.finish()
 

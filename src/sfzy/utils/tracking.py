@@ -183,9 +183,14 @@ GRPO_METRICS: Dict[str, Tuple[str, str]] = {
     "reward_mean": ("reward/mean", "奖励均值"),
     "reward_std": ("reward/std", "奖励标准差（整个 batch，不分组）"),
     "reward_group_std": ("reward/group_std", "★ 组内标准差均值 —— 有没有可学的信号"),
-    "rouge_l": ("reward/rouge_l", "ROUGE-L（官方口径的锚）"),
-    "fact_judge": ("reward/fact_judge", "六要素事实一致性奖励（fact_judge 模式的主信号）"),
-    "fact_judge_group_std": ("reward/fact_judge_group_std", "★ 事实项的组内标准差"),
+    # 逐项分项：键名是 term_<名字> / term_<名字>_group_std，和 rl.reward.terms 对齐。
+    # 这里登记已知项的中文名；以后新增的 reward 就算没登记也会原样透传上报。
+    "term_rouge_l": ("reward/rouge_l", "ROUGE-L 项均值（官方口径的锚）"),
+    "term_rouge_l_group_std": ("reward/rouge_l_group_std", "ROUGE-L 项的组内标准差"),
+    "term_fact_consistency": ("reward/fact_consistency", "六要素事实一致性 Judge 项均值"),
+    "term_fact_consistency_group_std": (
+        "reward/fact_consistency_group_std", "★ 事实一致性项的组内标准差",
+    ),
     "gating_rate": ("reward/gate_rate", "被门控拦下的比例；高 = 问题在生成不在奖励"),
     # ---- 组与优势：GRPO 特有的诊断 ----
     "advantage_abs_mean": ("group/advantage_abs_mean", "|优势| 均值；≈0 = 整组没方差"),

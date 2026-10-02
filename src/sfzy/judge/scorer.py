@@ -44,6 +44,10 @@ class FactConsistencyScorer(SemanticScorer):
     name = "judge_fact"
     # 本后端自己按 source 分组，不需要 trainer 对齐 group_size（那是排序裁判的要求）
     kind = "fact_consistency"
+    # 这个后端产出的信号名。以后在同一批 pair 上加覆盖率等 task 时，
+    # 在这里补名字、在 `score_batch_signals` 里补分支即可，
+    # 抽取（贵）仍然只做一次。
+    SIGNALS = ("fact_consistency",)
 
     def __init__(
         self,
@@ -66,10 +70,13 @@ class FactConsistencyScorer(SemanticScorer):
     def clear_cache(self) -> None:
         self.judge.clear_cache()
 
-    def score_batch(
+    def available_signals(self) -> set:
+        return set(self.SIGNALS)
+
+    def _score_values(
         self, items: Sequence[Dict[str, Any]]
     ) -> List[Optional[float]]:
-        """返回每条候选的加权事实一致性奖励 ∈ [0, 1]，失败为 `None`。"""
+        """真正算分的那一层：返回每条候选的加权事实一致性奖励 ∈ [0,1]，失败为 `None`。"""
         norm = [_normalize(it) for it in items]
         scores: List[Optional[float]] = [None] * len(norm)
         self.last_results = []
@@ -95,6 +102,24 @@ class FactConsistencyScorer(SemanticScorer):
                 scores[i] = float(result.weighted_reward)
                 self.last_results.append(result)
         return scores
+
+    def score_batch(
+        self, items: Sequence[Dict[str, Any]]
+    ) -> List[Optional[float]]:
+        """单信号接口：每条候选的加权事实一致性奖励 ∈ [0, 1]。"""
+        return self._score_values(items)
+
+    def score_batch_signals(
+        self, items: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Optional[float]]]:
+        """多信号接口。现在只有 `fact_consistency` 一路。
+
+        覆盖率（`element_coverage`）会作为同一批 pair 上的另一个判定 task
+        加进来 —— 那时这里返回 {"fact_consistency": ..., "element_coverage": ...}，
+        而**要素抽取仍然只做一次**。
+        """
+        values = self._score_values(items)
+        return [{"fact_consistency": v} for v in values]
 
     # ---------------------------------------------------------------- 日志
     def summarize_last(self) -> Dict[str, float]:

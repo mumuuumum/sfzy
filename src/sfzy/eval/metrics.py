@@ -7,9 +7,18 @@
 方案：裁判同时看到原文和候选时会以更短的那份（候选）为锚点，算出的其实是
 precision 而不是 recall。六要素拆解 + 逐要素判定是替代方案。
 
-所有裁判共用同一个接口：
+所有裁判共用两个接口：
 
-    score_batch(items) -> List[Optional[float]]
+    score_batch(items)         -> List[Optional[float]]                 单信号（兼容用）
+    score_batch_signals(items) -> List[Dict[str, Optional[float]]]      多信号（推荐）
+
+多信号是为了支持"同一个模型 B 一次产出多路 reward"：抽取（贵）只做一次，
+同一批 pair 上跑多个判定 task，每个 task 贡献一个**命名信号**，例如
+
+    [{"fact_consistency": 0.8, "element_coverage": 0.4}, ...]
+
+`available_signals()` 声明这个后端能产出哪些信号。`RewardSpec` 需要的信号
+必须在里面，否则启动即报错 —— 否则一个配置写着要用的 reward 会静默地拿不到分。
 
 `None` 表示这条打分失败（提取失败 / 显存抖动），**不能当 0 用** ——
 失败和"很差"是两件事，混起来会让统计系统性偏低。
@@ -17,7 +26,7 @@ precision 而不是 recall。六要素拆解 + 逐要素判定是替代方案。
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 
 class SemanticScorer:
@@ -27,6 +36,16 @@ class SemanticScorer:
 
     def score_batch(self, items: Sequence[Dict[str, Any]]) -> List[Optional[float]]:
         raise NotImplementedError
+
+    def available_signals(self) -> Set[str]:
+        """这个后端能产出的信号名。默认就是它自己的 `name`。"""
+        return {self.name}
+
+    def score_batch_signals(
+        self, items: Sequence[Dict[str, Any]]
+    ) -> List[Dict[str, Optional[float]]]:
+        """多信号接口。默认把单信号结果包一层，保证旧后端不用改就能用。"""
+        return [{self.name: s} for s in self.score_batch(items)]
 
 
 def build_scorer(
