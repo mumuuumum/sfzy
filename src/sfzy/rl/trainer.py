@@ -85,7 +85,7 @@ class GRPOTrainer:
         """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
         关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
 
-        `scorer` 是裁判（`sfzy.judge.scorer.FactConsistencyScorer`）。奖励由
+        `scorer` 是裁判（`sfzy.judge.scorer.SixElementScorer`）。奖励由
         `rl.reward.terms` 决定开哪些项；只要有 judge 项而没裁判，直接报错 ——
         配置说要接裁判却没有裁判，静默降级是最坏的结果。
         """

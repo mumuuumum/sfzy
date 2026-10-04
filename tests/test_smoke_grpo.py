@@ -20,7 +20,6 @@ import pytest
 import torch
 
 from sfzy.config import load_config
-from sfzy.eval.metrics import SemanticScorer
 from sfzy.rl.trainer import GRPOTrainer
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -70,8 +69,12 @@ def _stub_fact_score(text: str) -> float:
     return min(1.0, 0.1 + 0.02 * len(text) + (sum(map(ord, text)) % 7) / 100.0)
 
 
-class FactStubScorer(SemanticScorer):
-    """给 fact_consistency 信号用的裁判桩。量纲 [0,1]。"""
+class FactStubScorer:
+    """给 fact_consistency 信号用的裁判桩。量纲 [0,1]。
+
+    裁判契约是结构化描述（`sfzy.eval.metrics.SignalScorer` 是个 Protocol），
+    所以桩**不需要继承任何东西** —— 只要有这两个方法和一个日志名。
+    """
 
     name = "judge_fact_stub"
 
@@ -82,16 +85,13 @@ class FactStubScorer(SemanticScorer):
     def available_signals(self):
         return {FACT_SIGNAL}
 
-    def score_batch(self, items):
-        return [_stub_fact_score(i["candidate"]) for i in items]
-
     def score_batch_signals(self, items):
         self.calls += 1
         self.seen_items.extend(items)
         return [{FACT_SIGNAL: _stub_fact_score(i["candidate"])} for i in items]
 
 
-class FlakyScorer(SemanticScorer):
+class FlakyScorer:
     """一半返回 None，模拟提取失败/显存抖动。量纲仍是 [0,1]。"""
 
     name = "judge_fact_flaky"
@@ -103,7 +103,7 @@ class FlakyScorer(SemanticScorer):
         return [{FACT_SIGNAL: None if i % 2 else 0.7} for i, _ in enumerate(items)]
 
 
-class TwoSignalScorer(SemanticScorer):
+class TwoSignalScorer:
     """同时产出事实一致性和关键要素覆盖率两路信号。"""
 
     name = "judge_two"
@@ -331,7 +331,7 @@ def test_有judge项却没裁判直接报错(tmp_path):
 
 
 def test_裁判产不出需要的信号直接报错(tmp_path):
-    class WrongScorer(SemanticScorer):
+    class WrongScorer:
         name = "judge_wrong"
 
         def available_signals(self):

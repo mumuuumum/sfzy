@@ -29,11 +29,11 @@ from sfzy.judge.schema import (
     empty_field_rule,
     summarize_scores,
 )
-from sfzy.judge.scorer import FactConsistencyScorer
+from sfzy.judge.scorer import SixElementScorer
 
 __all__ = [
     "FactConsistencyJudge",
-    "FactConsistencyScorer",
+    "SixElementScorer",
     "ExtractionFailure",
     "parse_six_json",
     "parse_six_json_debug",

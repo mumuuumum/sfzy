@@ -1,107 +1,101 @@
-"""裁判接口：把"摘要好不好"交给一个 LLM 裁判来打分。
+"""裁判契约 + 裁判工厂。
 
-当前只有一个后端：**六要素事实一致性 Judge**（`semantic.backend=fact`），
-由 `sfzy/judge/` 实现，返回 `weighted_reward ∈ [0, 1]`。
+============================ 只有一种裁判 ============================
+整个项目只有**一个**裁判实现：六要素 Judge（`semantic.backend=fact`），
+由 `sfzy/judge/scorer.py::SixElementScorer` 提供。它一次产出多路**命名信号**：
 
-点式打分（0-100）、组内排序、API、缓存四个后端已删除。它们是被淘汰的
-方案：裁判同时看到原文和候选时会以更短的那份（候选）为锚点，算出的其实是
-precision 而不是 recall。六要素拆解 + 逐要素判定是替代方案。
+    [{"fact_consistency": 0.83, "element_coverage": 0.51}, ...]
 
-所有裁判共用两个接口：
+点式打分（0-100）、组内排序、API、缓存四个后端属于已淘汰方案，已经删除；
+现在的扩展方向是**加 task / 加信号**，不是加 scorer 种类。
 
-    score_batch(items)         -> List[Optional[float]]                 单信号（兼容用）
-    score_batch_signals(items) -> List[Dict[str, Optional[float]]]      多信号（推荐）
+============================ 契约用 Protocol，不用继承 ============================
+`SignalScorer` 是这份契约的结构化描述。用 `typing.Protocol` 而不是抽象基类：
+唯一的实现不需要为了"证明自己符合接口"去继承一个只服务于它的空壳，
+测试里的桩也不需要。真正被依赖的只有两个方法 + 一个日志标签。
 
-多信号是为了支持"同一个模型 B 一次产出多路 reward"：抽取（贵）只做一次，
-同一批 pair 上跑多个判定 task，每个 task 贡献一个**命名信号**，例如
-
-    [{"fact_consistency": 0.8, "element_coverage": 0.4}, ...]
-
-`available_signals()` 声明这个后端能产出哪些信号。`RewardSpec` 需要的信号
-必须在里面，否则启动即报错 —— 否则一个配置写着要用的 reward 会静默地拿不到分。
-
-`None` 表示这条打分失败（提取失败 / 显存抖动），**不能当 0 用** ——
-失败和"很差"是两件事，混起来会让统计系统性偏低。
+`build_scorer` 是唯一的构造入口：按配置决定要不要裁判，并把 reward 配置里的
+内部权重转交给实现。
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Protocol, Sequence, Set
 
 
-class SemanticScorer:
-    """所有裁判后端的统一接口。"""
+class SignalScorer(Protocol):
+    """裁判契约：把一批候选变成多路命名信号。
 
-    name = "semantic"
+    实现者只要有下面两个方法即可（`name` 只是日志里的显示名，
+    不参与任何分发；`available_signals()` 才是能力声明）。
+    """
 
-    def score_batch(self, items: Sequence[Dict[str, Any]]) -> List[Optional[float]]:
-        raise NotImplementedError
+    name: str
 
     def available_signals(self) -> Set[str]:
-        """这个后端能产出的信号名。默认就是它自己的 `name`。"""
-        return {self.name}
+        """这个裁判能产出哪些信号名。"""
+        ...
 
     def score_batch_signals(
         self, items: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Optional[float]]]:
-        """多信号接口。默认把单信号结果包一层，保证旧后端不用改就能用。"""
-        return [{self.name: s} for s in self.score_batch(items)]
+        """每条候选 → {信号名: 分数 ∈ [0,1]}。
+
+        `None` 表示这条这一路打分失败（提取失败 / 显存抖动），**不能当 0 用**；
+        整组失败时该条返回空字典，由 trainer 按缺失补。
+        """
+        ...
 
 
 def build_scorer(
     cfg: Optional[Dict[str, Any]],
     override: Optional[str] = None,
     term_options: Optional[Dict[str, Dict[str, Any]]] = None,
-) -> Optional[SemanticScorer]:
-    """按配置构造裁判后端。
+) -> Optional[SignalScorer]:
+    """按配置构造裁判。现在只支持 `fact`（六要素 Judge）与 `none`（不接）。
 
-    现在只支持 `fact`（六要素事实一致性 Judge）与 `none`（不接裁判）。
-
-    `term_options` 是 `RewardSpec.judge_term_options()` 的产物，
+    `term_options` 是 `RewardSpec.judge_term_options()` 的产物，形如
     `{信号名: {内部权重字段: 值}}` —— reward 的内部权重只能来自配置文件，
-    这里只负责把它转交给对应的裁判后端。
+    这里只负责把它转交给裁判实现。
     """
     spec = dict(cfg or {})
     backend = override or spec.get("backend", "none")
     if backend in ("none", "", None):
         return None
 
-    # 六要素事实一致性 Judge 有自己的数据结构（SixElements / JudgeResult），
-    # 不走任何 rubric。
     if backend in ("fact", "six", "fact_consistency"):
-        return _build_fact_consistency_scorer(spec, dict(term_options or {}))
+        return _build_six_element_scorer(spec, dict(term_options or {}))
 
     raise ValueError(
         f"未知的 semantic.backend：{backend}（现在只支持 fact / none）"
     )
 
 
-def _build_fact_consistency_scorer(
+def _build_six_element_scorer(
     spec: Dict[str, Any], term_options: Dict[str, Dict[str, Any]]
-) -> SemanticScorer:
-    """构造六要素事实一致性裁判（`semantic.backend=fact`）。
+) -> SignalScorer:
+    """构造六要素 Judge 的 scorer（`semantic.backend=fact`）。
 
-    延迟 import：`sfzy.judge` 会带上 torch 的数据结构，不需要裁判的路径
-    不该为它付导入代价。
+    延迟 import：`sfzy.judge` 会带上 torch / transformers，
+    不需要裁判的路径不该为它付导入代价。
     """
     # 六要素权重曾经能写在 semantic.weights 下，现在只能写在 reward term 里。
     # 留着旧写法会变成"两个地方都能设权重"，正是要避免的事。
     if spec.get("weights"):
         raise ValueError(
             "semantic.weights 已废弃：六要素权重现在只能写在配置文件里，"
-            "位置是 rl.reward.terms.fact_consistency.element_weights。"
+            "位置是 rl.reward.terms.<reward>.element_weights。"
         )
 
-    from sfzy.judge.judge import FactConsistencyJudge
-    from sfzy.judge.judge import SUPPORTED_TASKS
-    from sfzy.judge.scorer import FactConsistencyScorer
+    from sfzy.judge.judge import SUPPORTED_TASKS, FactConsistencyJudge
+    from sfzy.judge.scorer import SixElementScorer
 
     # 要跑哪些任务由 reward 配置决定：`judge_term_options()` 的键就是信号名。
     tasks = sorted(term_options) or ["fact_consistency"]
     unsupported = [t for t in tasks if t not in SUPPORTED_TASKS]
     if unsupported:
         raise ValueError(
-            f"裁判后端还不支持这些信号：{unsupported}（支持：{list(SUPPORTED_TASKS)}）"
+            f"裁判还不支持这些信号：{unsupported}（支持：{list(SUPPORTED_TASKS)}）"
         )
 
     model = spec.get("model")
@@ -120,10 +114,10 @@ def _build_fact_consistency_scorer(
         tasks=tasks,
         min_document_elements=int(spec.get("min_document_elements", 2)),
         doc_fallback=bool(spec.get("doc_fallback", True)),
-        # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，且位置由
+        # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，位置由
         # device_map 定在 semantic.device 指的卡上，与策略分居两卡。
         load_in_4bit=bool(spec.get("load_in_4bit", False)),
         bnb_4bit_compute_dtype=spec.get("bnb_4bit_compute_dtype"),
         trust_remote_code=bool(spec.get("trust_remote_code", True)),
     )
-    return FactConsistencyScorer(judge)
+    return SixElementScorer(judge)

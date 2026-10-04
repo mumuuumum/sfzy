@@ -564,7 +564,7 @@ def test_适配器_按文书分组并摊回原位置():
 
     分组后分数必须摊回**原来的位置** —— 错位不报错，只是奖励悄悄换了对象。
     """
-    from sfzy.judge.scorer import FactConsistencyScorer
+    from sfzy.judge.scorer import SixElementScorer
 
     doc_a = SixElements(case_type="借款合同纠纷")
     doc_b = SixElements(case_type="继承纠纷")
@@ -580,7 +580,8 @@ def test_适配器_按文书分组并摊回原位置():
         {"candidate": "候选4", "reference": "r", "source": "文书甲", "id": "c4"},
         {"candidate": "候选5", "reference": "r", "source": "文书乙", "id": "c5"},
     ]
-    scores = FactConsistencyScorer(j).score_batch(items)
+    signals = SixElementScorer(j).score_batch_signals(items)
+    scores = [sig["fact_consistency"] for sig in signals]
     assert len(scores) == 5 and all(s is not None for s in scores)
     # 每篇文书：候选集中提取一次 + 文档提取一次 = 2 次；两篇 = 4 次。
     # 分组不成立（逐条调用）时这里会是 5 + 2 次。
@@ -589,27 +590,29 @@ def test_适配器_按文书分组并摊回原位置():
 
 def test_适配器_文档要素跨批只提取一次():
     """同一篇文书在 GRPO 的连续批次里反复出现，文档六要素必须命中缓存。"""
-    from sfzy.judge.scorer import FactConsistencyScorer
+    from sfzy.judge.scorer import SixElementScorer
 
     j = _FakeJudge()
-    scorer = FactConsistencyScorer(j)
+    scorer = SixElementScorer(j)
     item = {"candidate": "候选", "reference": "r", "source": "文书", "id": "c"}
-    scorer.score_batch([item])
-    scorer.score_batch([item])
+    scorer.score_batch_signals([item])
+    scorer.score_batch_signals([item])
     assert len(j._doc_cache) == 1
 
 
 def test_适配器_汇总第十二节的统计量():
     """训练日志要的 mean_fact_reward / 各要素均值 / 0-4 各档比例都从这来。"""
-    from sfzy.judge.scorer import FactConsistencyScorer
+    from sfzy.judge.scorer import SixElementScorer
 
     doc = SixElements(court_facts="被告向原告借款50000元")
     cand = SixElements(court_facts="被告向原告借款90000元")
     # 查明事实写错（0 分）→ 最低分 0；结果项两边都空 → 空字段规则给 4。
     j = _FakeJudge(score_map={"court_facts": 0},
                    extract_map={"文书": doc, "候选": cand})
-    scorer = FactConsistencyScorer(j)
-    scorer.score_batch([{"candidate": "候选", "reference": "r", "source": "文书", "id": "c"}])
+    scorer = SixElementScorer(j)
+    scorer.score_batch_signals(
+        [{"candidate": "候选", "reference": "r", "source": "文书", "id": "c"}]
+    )
     stats = scorer.summarize_last()
     assert "mean_fact_reward" in stats
     assert "mean_min_element_score" in stats
@@ -620,17 +623,18 @@ def test_适配器_汇总第十二节的统计量():
 
 def test_适配器_单组失败只标None不中断训练():
     """一次提取失败不该毁掉整轮几小时的 run：标 None 交给组内均值补。"""
-    from sfzy.judge.scorer import FactConsistencyScorer
+    from sfzy.judge.scorer import SixElementScorer
 
     class _BoomJudge(_FakeJudge):
         def judge_candidates(self, *a, **k):
             raise RuntimeError("显存抖动")
 
-    scorer = FactConsistencyScorer(_BoomJudge())
-    scores = scorer.score_batch(
+    scorer = SixElementScorer(_BoomJudge())
+    signals = scorer.score_batch_signals(
         [{"candidate": "候选", "reference": "r", "source": "文书", "id": "c"}]
     )
-    assert scores == [None]
+    # 整组失败 → 该条没有任何信号（空字典），交给 trainer 按缺失补
+    assert signals == [{}]
     assert scorer.last_errors and "RuntimeError" in scorer.last_errors[0]
 
 

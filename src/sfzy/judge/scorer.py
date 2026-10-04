@@ -1,49 +1,53 @@
 """把六要素事实一致性 Judge 接到 GRPO 奖励管线上的适配层。
 
 ============================ 为什么需要这一层 ============================
-`FactConsistencyJudge` 的入口是 `judge_candidates(document, candidates)` ——
-**一次吃一篇文书 + 一组候选**。而 GRPO 的裁判接口（`SemanticScorer`）是扁平的
+`FactConsistencyJudge` 的入口是 `judge_candidates(document, candidates, reference=…)`
+—— **一次吃一篇文书 + 一组候选**。而 GRPO 侧的契约是扁平的
 
-    score_batch(items) -> List[Optional[float]]        # item = {candidate, reference, source}
+    items = [{candidate, reference, source, id}, ...]
+    score_batch_signals(items) -> [{信号名: 分数 ∈ [0,1]}, ...]
 
-中间的落差就是本文件。要做的只有两件事：
+中间的落差就是本文件。要做的只有三件事：
 
   1. 按 `source`（文书原文）把扁平的 items 分回各组
-  2. 逐组调用 `judge_candidates`，把每条候选的 `weighted_reward` 摊回原位置
+  2. 校验同组的候选共用同一份 `reference`（人工摘要）
+  3. 逐组调用 `judge_candidates`，把每条候选的多路信号摊回原位置
 
 第 1 步不能省。不分组就等于逐条调用，文档六要素会被重复提取 G 次；而候选
-六要素也失去批量 —— 需求第十节的"6 要素 × G 候选一次组 batch"直接作废。
+六要素也失去批量 —— "6 要素 × G 候选一次组 batch"直接作废。
 
-============================ 和其它裁判后端的区别 ============================
-本后端返回的是 `JudgeResult.weighted_reward`，**已经是 [0,1]**，且它的每一项
-都来自 Qwen Judge 对"候选陈述能否被原文支持"的判断，不含任何金额/日期/法条
-规则匹配。`rl/reward.py` 的 `fact_judge` 模式直接用它，不做任何量纲换算。
+============================ 契约在哪 ============================
+契约由 `sfzy.eval.metrics.SignalScorer`（一个 `typing.Protocol`）描述，
+本类**不继承**它 —— 结构上满足即可。产出哪几路信号由构造 Judge 时的 `tasks`
+决定：加 reward 是加 task，不是加 scorer。
 """
 
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence
 
-from sfzy.eval.metrics import SemanticScorer
 from sfzy.judge.judge import FactConsistencyJudge
 from sfzy.judge.schema import JudgeResult, summarize_scores
 
 
-class FactConsistencyScorer(SemanticScorer):
-    """六要素事实一致性 Judge 的 `SemanticScorer` 适配器。
+class SixElementScorer:
+    """全项目**唯一**的 scorer：把六要素 Judge 接成多路命名信号。
 
         judge = FactConsistencyJudge("models/Qwen2.5-1.5B-Instruct", device="cuda:1")
-        scorer = FactConsistencyScorer(judge)
-        rewards = scorer.score_batch(items)        # 每条候选 ∈ [0, 1]
+        scorer = SixElementScorer(judge)
+        signals = scorer.score_batch_signals(items)
+        # [{"fact_consistency": 0.83, "element_coverage": 0.51}, ...]
 
-    `score_batch` 的输入形态和 GRPO 的 rollout 完全对齐：同一篇文书会连续给出
-    G 条候选，`source` 字段是文书原文（不是参考摘要）—— 事实一致性判的是
-    "候选 vs 原文"，参考摘要在这一步用不上。
+    输入形态和 GRPO 的 rollout 完全对齐：同一篇文书会连续给出 G 条候选，
+    `source` 是文书原文，`reference` 是人工摘要。产出哪几路信号由构造 Judge 时
+    的 `tasks` 决定 —— 加 reward 是加 task，不是加 scorer。
+
+    它不需要继承任何基类：契约（`available_signals` + `score_batch_signals`）
+    由 `sfzy.eval.metrics.SignalScorer` 这个 Protocol 描述。
     """
 
-    name = "judge_fact"
-    # 本后端自己按 source 分组，不需要 trainer 对齐 group_size
-    kind = "six_element"
+    # 只是日志里的显示名，不参与任何分发
+    name = "judge_six_element"
 
     def __init__(
         self,
@@ -117,22 +121,10 @@ class FactConsistencyScorer(SemanticScorer):
                 self.last_results.append(result)
         return signals
 
-    def score_batch(
-        self, items: Sequence[Dict[str, Any]]
-    ) -> List[Optional[float]]:
-        """单信号接口：每条候选的事实一致性奖励 ∈ [0, 1]（兼容用）。
-
-        没启用事实一致性任务时全部返回 None。
-        """
-        return [
-            sig.get("fact_consistency")
-            for sig in self._score_item_signals(items)
-        ]
-
     def score_batch_signals(
         self, items: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Optional[float]]]:
-        """多信号接口：`{"fact_consistency":…, "element_coverage":…}`。
+        """每条候选 → `{"fact_consistency":…, "element_coverage":…}`。
 
         要素抽取（原文 / 人工摘要 / 候选）在这条路径上各做一次，
         两个任务共用；判定 prompt 合成一次批量前向。
