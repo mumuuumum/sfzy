@@ -76,11 +76,24 @@ rl:
 
   reward:
     # 多 reward：每个 term 可以单独开关，权重按启用项归一到 1。
-    # 新增 reward 只加一行；聚合 / 训练 / 日志都不用改。
+    # ★ 所有权重都只在这里指定：term 的权重是 terms.<名字>.weight，
+    #   term 内部的权重是 terms.<名字>.<内部字段>，代码里不存默认值。
     normalize_weights: true
     terms:
-      rouge_l:          {enabled: true, weight: 0.3}   # 官方评测口径的锚
-      fact_consistency: {enabled: true, weight: 0.7}   # ★ 六要素事实一致性 Judge
+      rouge_l:
+        enabled: true
+        weight: 0.3              # 官方评测口径的锚
+      fact_consistency:
+        enabled: true
+        weight: 0.7              # ★ 六要素事实一致性 Judge
+        # 这个 reward **内部**的六要素权重（键固定六个，之和必须为 1）
+        element_weights:
+          case_type:          0.05   # 案件类型
+          plaintiff_claims:   0.15   # 原告诉讼请求
+          defendant_defenses: 0.10   # 被告辩称
+          court_facts:        0.25   # 法院查明事实
+          legal_basis:        0.15   # 法律依据
+          judgment_result:    0.30   # 裁判结果
     # gate 不写就用默认（enabled: true + 默认阈值）；写成 {enabled: false} 可整块关掉
 
   # SFT 基线锚：需要 prompt 池带 sft_output，现在的 rl_prompts.jsonl 没有，

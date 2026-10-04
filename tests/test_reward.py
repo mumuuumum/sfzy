@@ -69,10 +69,23 @@ def test_空文本返回空集合():
 
 REF = "原被告系借款合同纠纷。原告请求判令被告归还借款本金48000元及利息。本院认为借贷关系合法有效。判决如下：被告归还原告48000元。"
 
+# 六要素的内部权重（只能写在配置里；测试里也用同一份）
+ELEMENT_WEIGHTS = {
+    "case_type": 0.05,
+    "plaintiff_claims": 0.15,
+    "defendant_defenses": 0.10,
+    "court_facts": 0.25,
+    "legal_basis": 0.15,
+    "judgment_result": 0.30,
+}
+
 # 两个 reward 都开，权重 0.3 / 0.7（和为 1，归一化后不变）
 SPEC = {"terms": {
     "rouge_l": {"enabled": True, "weight": 0.3},
-    "fact_consistency": {"enabled": True, "weight": 0.7},
+    "fact_consistency": {
+        "enabled": True, "weight": 0.7,
+        "element_weights": dict(ELEMENT_WEIGHTS),
+    },
 }}
 
 
@@ -121,7 +134,10 @@ def test_多个reward按归一化权重求和():
 
 
 def test_权重会被归一到一():
-    spec = {"terms": {"rouge_l": {"weight": 30}, "fact_consistency": {"weight": 70}}}
+    spec = {"terms": {
+        "rouge_l": {"weight": 30},
+        "fact_consistency": {"weight": 70, "element_weights": dict(ELEMENT_WEIGHTS)},
+    }}
     score, bd = compute_reward(
         REF, REF, spec=spec, judge_signals={"fact_consistency": 1.0}
     )
@@ -131,7 +147,7 @@ def test_权重会被归一到一():
 def test_可以只开一个reward():
     spec = {"terms": {
         "rouge_l": {"enabled": True, "weight": 1.0},
-        "fact_consistency": {"enabled": False, "weight": 1.0},
+        "fact_consistency": {"enabled": False},
     }}
     score, bd = compute_reward(REF, REF, spec=spec)     # 不需要裁判
     assert set(bd.values) == {"rouge_l"}
@@ -140,8 +156,11 @@ def test_可以只开一个reward():
 
 def test_可以关掉rouge只留裁判():
     spec = {"terms": {
-        "rouge_l": {"enabled": False, "weight": 1.0},
-        "fact_consistency": {"enabled": True, "weight": 1.0},
+        "rouge_l": {"enabled": False},
+        "fact_consistency": {
+            "enabled": True, "weight": 1.0,
+            "element_weights": dict(ELEMENT_WEIGHTS),
+        },
     }}
     score, bd = compute_reward(
         REF, REF, spec=spec, judge_signals={"fact_consistency": 0.4}
@@ -160,9 +179,10 @@ def test_judge信号量纲不对要报错():
         compute_reward(REF, REF, spec=SPEC, judge_signals={"fact_consistency": 80.0})
 
 
-def test_默认配置需要裁判信号():
-    with pytest.raises(ValueError, match="fact_consistency"):
-        compute_reward(REF, REF)          # spec=None → 默认预设 fact_judge
+def test_不传spec直接报错():
+    """没有奖励配置就不该算分 —— 权重只能来自配置文件。"""
+    with pytest.raises(ValueError, match="rl.reward"):
+        compute_reward(REF, REF)
 
 
 # ---------------------------------------------------------------- 门控是全局开关

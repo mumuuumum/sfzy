@@ -49,11 +49,17 @@ class SemanticScorer:
 
 
 def build_scorer(
-    cfg: Optional[Dict[str, Any]], override: Optional[str] = None
+    cfg: Optional[Dict[str, Any]],
+    override: Optional[str] = None,
+    term_options: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Optional[SemanticScorer]:
-    """按配置构造裁判后端。`override` 可以强制指定后端（"fact" / "none"）。
+    """按配置构造裁判后端。
 
     现在只支持 `fact`（六要素事实一致性 Judge）与 `none`（不接裁判）。
+
+    `term_options` 是 `RewardSpec.judge_term_options()` 的产物，
+    `{信号名: {内部权重字段: 值}}` —— reward 的内部权重只能来自配置文件，
+    这里只负责把它转交给对应的裁判后端。
     """
     spec = dict(cfg or {})
     backend = override or spec.get("backend", "none")
@@ -63,19 +69,29 @@ def build_scorer(
     # 六要素事实一致性 Judge 有自己的数据结构（SixElements / JudgeResult），
     # 不走任何 rubric。
     if backend in ("fact", "six", "fact_consistency"):
-        return _build_fact_consistency_scorer(spec)
+        return _build_fact_consistency_scorer(spec, dict(term_options or {}))
 
     raise ValueError(
         f"未知的 semantic.backend：{backend}（现在只支持 fact / none）"
     )
 
 
-def _build_fact_consistency_scorer(spec: Dict[str, Any]) -> SemanticScorer:
+def _build_fact_consistency_scorer(
+    spec: Dict[str, Any], term_options: Dict[str, Dict[str, Any]]
+) -> SemanticScorer:
     """构造六要素事实一致性裁判（`semantic.backend=fact`）。
 
     延迟 import：`sfzy.judge` 会带上 torch 的数据结构，不需要裁判的路径
     不该为它付导入代价。
     """
+    # 六要素权重曾经能写在 semantic.weights 下，现在只能写在 reward term 里。
+    # 留着旧写法会变成"两个地方都能设权重"，正是要避免的事。
+    if spec.get("weights"):
+        raise ValueError(
+            "semantic.weights 已废弃：六要素权重现在只能写在配置文件里，"
+            "位置是 rl.reward.terms.fact_consistency.element_weights。"
+        )
+
     from sfzy.judge.judge import FactConsistencyJudge
     from sfzy.judge.scorer import FactConsistencyScorer
 
@@ -88,7 +104,9 @@ def _build_fact_consistency_scorer(spec: Dict[str, Any]) -> SemanticScorer:
         dtype=spec.get("dtype", "bfloat16"),
         max_batch_size=int(spec.get("max_batch_size", 8)),
         extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
-        weights=spec.get("weights"),
+        # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
+        # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
+        weights=(term_options.get("fact_consistency") or {}).get("element_weights"),
         min_document_elements=int(spec.get("min_document_elements", 2)),
         judge_variant=spec.get("judge_variant", "spec"),
         doc_fallback=bool(spec.get("doc_fallback", True)),

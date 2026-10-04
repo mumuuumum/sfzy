@@ -604,3 +604,15 @@ def test_贪婪生成_清掉模型自带的采样参数():
     assert model.gen_kwargs["temperature"] is None
     assert model.gen_kwargs["top_p"] is None
     assert model.gen_kwargs["top_k"] is None
+
+
+def test_奖励侧与裁判侧的六要素键集合一致():
+    """`rl/reward_terms.py` 为了不引入 torch，把六要素键名抄了一份。
+
+    这份拷贝必须和 `judge/schema.py` 的 ELEMENTS 完全一致，否则配置里写的
+    `element_weights` 会对着一套键校验、对另一套键聚合 —— 而且不报错。
+    """
+    from sfzy.judge.schema import ELEMENTS
+    from sfzy.rl.reward_terms import FACT_ELEMENTS
+
+    assert tuple(FACT_ELEMENTS) == tuple(ELEMENTS)

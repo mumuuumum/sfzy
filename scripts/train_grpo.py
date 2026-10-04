@@ -228,7 +228,15 @@ def main() -> None:
     reward_spec = RewardSpec.from_config(rl_cfg.get("reward"))
     want_judge = reward_spec.needs_judge() and args.judge_backend != "none"
     semantic_cfg = dict(cfg.get("semantic") or {})
-    scorer = build_scorer(semantic_cfg, override=args.judge_backend) if want_judge else None
+    scorer = (
+        build_scorer(
+            semantic_cfg,
+            override=args.judge_backend,
+            term_options=reward_spec.judge_term_options(),
+        )
+        if want_judge
+        else None
+    )
     if scorer is not None:
         missing = reward_spec.required_signals - set(scorer.available_signals())
         if missing:
@@ -243,6 +251,8 @@ def main() -> None:
             args.judge_backend or cfg.path_("semantic.backend"),
             sorted(scorer.available_signals()),
         )
+        if reward_spec.judge_term_options():
+            logger.info("裁判内部权重: %s", reward_spec.judge_term_options())
     else:
         if reward_spec.needs_judge():
             logger.warning(

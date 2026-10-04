@@ -44,6 +44,8 @@ rl:
     normalize_weights: true
     terms:
       rouge_l:          {enabled: false, weight: 0.0}
+      # element_weights 继承自 grpo_fact_judge.yaml；要在 A100 上单独调，
+      # 就在 terms.fact_consistency.element_weights 下把六个键写全（和为 1）。
       fact_consistency: {enabled: true,  weight: 1.0}
 
 semantic:

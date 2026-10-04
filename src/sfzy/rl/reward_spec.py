@@ -1,10 +1,15 @@
 """奖励规格：把 YAML 里的 `rl.reward` 解析成可校验、可组合的 RewardSpec。
 
-============================ 这一层解决什么 ============================
-`terms` 是唯一的事实来源：某个 reward 开不开、权重多少、要不要裁判，
-全部在这里定下来，并在**启动时**一次性校验完。校验放在这里而不是散在
-trainer 里，是因为"配置说要接裁判却没有裁判"这类错误必须当场报错 ——
-沉默地跑出一条其实没接裁判的曲线，是最贵的 bug。
+============================ 权重只能来自配置文件 ============================
+这个模块有一条硬规矩：**所有权重都只能写在配置文件里**。
+
+  * 每个 reward 的权重      → `terms.<名字>.weight`
+  * reward 内部的分项权重    → `terms.<名字>.<内部字段>`，例如
+                              `terms.fact_consistency.element_weights`
+
+代码里不存权重数值（注册表只声明"有哪些子项"），也没有命令行开关。
+缺了就在**启动时**报错并告诉你该往哪一段写什么，而不是悄悄用一个藏在源码里
+的默认值 —— 那种默认值是"我明明改了权重，曲线却一点没变"这类事故的源头。
 
 ============================ 配置形状 ============================
     rl:
@@ -16,23 +21,32 @@ trainer 里，是因为"配置说要接裁判却没有裁判"这类错误必须�
           length_ratio_range: [0.5, 1.5]
           require_result_marker: true
         terms:                         # 想开几个开几个
-          rouge_l:          { enabled: true,  weight: 0.3 }
-          fact_consistency: { enabled: true,  weight: 0.7 }
-          # 以后新增的项直接加在这里，聚合/训练/日志都不用改
+          rouge_l:          {enabled: true,  weight: 0.3}
+          fact_consistency:
+            enabled: true
+            weight: 0.7
+            element_weights:           # ★ 这个 reward 内部的六要素权重
+              case_type:          0.05
+              plaintiff_claims:   0.15
+              defendant_defenses: 0.10
+              court_facts:        0.25
+              legal_basis:        0.15
+              judgment_result:    0.30
 
-老配置的 `mode: fact_judge` 作为**预设**保留：它等价于一组 terms，
-方便不想改历史的实验继续跑。
+被启用的 term 必须写全 `weight`；有内部权重的 term 还必须写全那个字段
+（键齐全、非负、之和为 1）。关掉的 term 不要求写，写了也不生效。
 """
 
 from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Set
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
 
 from sfzy.rl.reward_terms import TERM_REGISTRY, TermSpec, get_term
 
-# 门控默认值。`enabled=False` 时整块不生效（连 min_chars 都不看）。
+# 门控默认值。门控是筛选条件、不是奖励权重，所以这里保留默认。
+# `enabled=False` 时整块不生效（连 min_chars 都不看）。
 DEFAULT_GATE: Dict[str, Any] = {
     "min_chars": 60,
     "length_ratio_range": [0.5, 1.5],
@@ -40,13 +54,8 @@ DEFAULT_GATE: Dict[str, Any] = {
     "require_result_marker": True,
 }
 
-# 预设：一个名字展开成一组 terms。只为兼容老配置，新配置请直接写 terms。
-PRESETS: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "fact_judge": {
-        "rouge_l": {"enabled": True, "weight": 0.3},
-        "fact_consistency": {"enabled": True, "weight": 0.7},
-    },
-}
+# term 配置里除了内部权重字段、只能写这两个保留字段
+_RESERVED_FIELDS = ("enabled", "weight")
 
 
 class RewardConfigError(ValueError):
@@ -64,6 +73,8 @@ class TermConfig:
     name: str
     enabled: bool
     weight: float
+    # 内部权重等（字段名 → 值），例如 {"element_weights": {...}}
+    options: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def spec(self) -> TermSpec:
@@ -72,6 +83,46 @@ class TermConfig:
     @property
     def source(self) -> str:
         return self.spec.source
+
+
+def _as_float(value: Any, where: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise RewardConfigError(f"{where} 必须是数字，收到 {value!r}") from exc
+
+
+def _validate_internal_weights(
+    term: str, field_name: str, required: Sequence[str], raw: Any
+) -> Dict[str, float]:
+    """校验一个 reward 的内部权重：键齐全、非负、之和为 1。"""
+    if not isinstance(raw, Mapping):
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 必须是 {{键: 权重}} 形式的映射，收到 {raw!r}"
+        )
+    missing = [k for k in required if k not in raw]
+    unknown = [k for k in raw if k not in required]
+    if missing or unknown:
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 的键不对。\n"
+            f"  缺少：{missing}\n"
+            f"  多余：{unknown}\n"
+            f"  必须且只能写：{list(required)}"
+        )
+    weights: Dict[str, float] = {}
+    for key, value in raw.items():
+        weight = _as_float(value, f"terms.{term}.{field_name}.{key}")
+        if weight < 0:
+            raise RewardConfigError(
+                f"terms.{term}.{field_name}.{key} 不能为负：{weight}"
+            )
+        weights[key] = weight
+    total = sum(weights.values())
+    if abs(total - 1.0) > 1e-6:
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 的权重之和必须为 1，当前是 {total:.6f}。"
+        )
+    return weights
 
 
 @dataclass
@@ -84,20 +135,20 @@ class RewardSpec:
     # ---------------------------------------------------------------- 解析
     @classmethod
     def from_config(cls, raw: Optional[Mapping[str, Any]]) -> "RewardSpec":
-        raw = dict(raw or {})
+        if raw is None:
+            raise RewardConfigError(
+                "配置里没有 rl.reward：每个 reward 的开关和权重都要写在配置文件里。"
+            )
+        raw = dict(raw)
 
         terms_raw = raw.get("terms")
         if terms_raw is None:
-            # 老配置：用 mode/preset 展开
-            preset_name = raw.get("mode", "fact_judge")
-            if preset_name not in PRESETS:
-                raise RewardConfigError(
-                    f"未知的 reward.mode/preset：{preset_name!r}（可用：{sorted(PRESETS)}）"
-                )
-            terms_raw = PRESETS[preset_name]
+            raise RewardConfigError(
+                "rl.reward 里必须写 terms —— 每个 reward 的开关和权重都在这一段。"
+            )
         if not isinstance(terms_raw, Mapping):
             raise RewardConfigError(
-                "rl.reward.terms 必须是 {名字: {enabled, weight}} 形式的映射"
+                "rl.reward.terms 必须是 {名字: {enabled, weight, ...}} 形式的映射"
             )
 
         terms: Dict[str, TermConfig] = {}
@@ -112,14 +163,48 @@ class RewardSpec:
                 raise RewardConfigError(
                     f"reward term {name!r} 的配置必须是映射，收到 {entry!r}"
                 )
+            entry = dict(entry)
             term_spec = TERM_REGISTRY[name]
             enabled = bool(entry.get("enabled", True))
-            weight = float(entry.get("weight", term_spec.default_weight))
-            if weight < 0:
+
+            allowed = set(_RESERVED_FIELDS) | set(term_spec.internal_weight_fields)
+            unknown = sorted(set(entry) - allowed)
+            if unknown:
                 raise RewardConfigError(
-                    f"reward term {name!r} 的权重不能为负：{weight}"
+                    f"terms.{name} 里有不认识的字段 {unknown}；可以写 {sorted(allowed)}"
                 )
-            terms[name] = TermConfig(name=name, enabled=enabled, weight=weight)
+
+            # ---- 这个 reward 的权重：启用就必须写 ----
+            if "weight" in entry:
+                weight = _as_float(entry["weight"], f"terms.{name}.weight")
+            elif enabled:
+                raise RewardConfigError(
+                    f"terms.{name} 被启用，但没有写 weight。\n"
+                    f"  每个 reward 的权重只能写在配置文件里，"
+                    f"加上一行 {name}: {{enabled: true, weight: <数值>}}。"
+                )
+            else:
+                weight = 0.0
+            if weight < 0:
+                raise RewardConfigError(f"terms.{name}.weight 不能为负：{weight}")
+
+            # ---- 这个 reward 内部的权重：同样只能来自配置 ----
+            options: Dict[str, Any] = {}
+            for field_name, required_keys in term_spec.internal_weight_fields.items():
+                if field_name in entry:
+                    options[field_name] = _validate_internal_weights(
+                        name, field_name, required_keys, entry[field_name]
+                    )
+                elif enabled:
+                    raise RewardConfigError(
+                        f"terms.{name} 被启用，但没有写 {field_name}。\n"
+                        f"  {name} 的内部权重只能写在配置文件的 "
+                        f"terms.{name}.{field_name} 下，\n"
+                        f"  键必须且只能是 {list(required_keys)}，权重之和必须为 1。"
+                    )
+            terms[name] = TermConfig(
+                name=name, enabled=enabled, weight=weight, options=options
+            )
 
         enabled = [t for t in terms.values() if t.enabled]
         if not enabled:
@@ -163,3 +248,11 @@ class RewardSpec:
 
     def needs_judge(self) -> bool:
         return bool(self.required_signals)
+
+    def judge_term_options(self) -> Dict[str, Dict[str, Any]]:
+        """{裁判信号名: 该 reward 的内部权重}，交给裁判后端构造时使用。"""
+        out: Dict[str, Dict[str, Any]] = {}
+        for term in self.enabled_terms:
+            if term.source == "judge" and term.spec.signal and term.options:
+                out[term.spec.signal] = dict(term.options)
+        return out

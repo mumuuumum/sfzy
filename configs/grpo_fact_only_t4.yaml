@@ -54,6 +54,9 @@ rl:
     normalize_weights: true
     terms:
       rouge_l:          {enabled: false, weight: 0.0}
+      # fact_consistency 的 element_weights 继承自 grpo_fact_judge.yaml；
+      # 要单独调六要素权重，就在这里把 terms.fact_consistency.element_weights 写全
+      # （六个键、非负、之和为 1），写不全启动就会报错。
       fact_consistency: {enabled: true,  weight: 1.0}
       # gate: {enabled: false}
     # gate 不写 = 用默认（enabled: true + 默认阈值）；

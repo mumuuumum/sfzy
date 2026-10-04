@@ -26,6 +26,14 @@ from sfzy.rl.trainer import GRPOTrainer
 ROOT = Path(__file__).resolve().parents[1]
 VOCAB = 1024
 FACT_SIGNAL = "fact_consistency"
+ELEMENT_WEIGHTS = {
+    "case_type": 0.05,
+    "plaintiff_claims": 0.15,
+    "defendant_defenses": 0.10,
+    "court_facts": 0.25,
+    "legal_basis": 0.15,
+    "judgment_result": 0.30,
+}
 
 
 class FakeTokenizer:
@@ -126,7 +134,10 @@ def reward_cfg(**over):
         "normalize_weights": True,
         "terms": {
             "rouge_l": {"enabled": True, "weight": 0.3},
-            "fact_consistency": {"enabled": True, "weight": 0.7},
+            "fact_consistency": {
+                "enabled": True, "weight": 0.7,
+                "element_weights": dict(ELEMENT_WEIGHTS),
+            },
         },
         "rouge_mode": "char",
         # 门控整块关掉：生成只有 8 个 token，正常门控会全拦下，测不出东西。
