@@ -1,0 +1,114 @@
+# ============================================================================
+# 事实一致性 + 关键要素覆盖率 —— 2× T4 15GB
+#
+# 和 grpo_fact_only_t4 只差奖励那一段（多开 element_coverage）。算力上只多花
+# 判定那一段：原文 / 人工摘要 / 候选三种六要素各只抽一次（人工摘要按 sha1
+# 缓存），两套判定 prompt 合成一次批量前向。
+#
+# 这份配置**自包含**，不继承任何其它 yaml。
+#
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_coverage_t4.yaml
+# ============================================================================
+
+seed: 42
+device: auto
+
+data_config: configs/data_splits.yaml
+
+model:
+  model_name_or_path: THUDM/chatglm3-6b   # 离线机器改成本地目录
+  trust_remote_code: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: float16
+  torch_dtype: float16
+  device_map: {"": 0}
+  max_length: 2048
+  config_patches: {}
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+
+rl:
+  output_dir: outputs/grpo_fact_coverage_t4
+  prompt_style: structured
+  prompt_file: data/splits/rl_prompts.jsonl
+  sft_adapter: /kaggle/input/models/mumuuumum/sft-chatglm3-6b/transformers/default/1/step_000336.pt
+  limit_prompts: 8            # 先跑最小闭环；确认接线后再改成 null
+
+  quantize: true
+
+  group_size: 4
+  prompts_per_step: 1
+  max_length: 1536
+  max_new_tokens: 320
+  temperature: 0.9
+  top_p: 0.95
+
+  gradient_checkpointing: true
+  logprob_micro_batch: 1
+
+  clip_ratio: 0.2
+  kl_coef: 0.0
+  length_norm: sqrt
+  learning_rate: 1.0e-5
+  max_grad_norm: 1.0
+  grad_accum_steps: 1
+
+  save_every_n_steps: 10
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 1
+  resume_from: null
+
+  # ---- 奖励：两个 judge 项，各有各的内部权重 ----
+  reward:
+    normalize_weights: true
+    terms:
+      rouge_l: {enabled: false, weight: 0.0}
+      fact_consistency:
+        enabled: true
+        weight: 0.7
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
+      element_coverage:
+        enabled: true
+        weight: 0.3
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
+
+  anchor:
+    enabled: false
+    slack: 0.05
+
+semantic:
+  backend: fact
+  model: Qwen/Qwen2.5-7B-Instruct   # 离线机器改成本地目录
+  trust_remote_code: false
+  device: cuda:1
+  dtype: float16
+  bnb_4bit_compute_dtype: float16
+  load_in_4bit: true
+  # 两个 judge 项的判定会合并成一次批量前向，batch 上限仍然按"6 要素 × G 候选"估
+  max_batch_size: 4
+  extract_max_new_tokens: 768
+  min_document_elements: 2
+  doc_fallback: true
+
+tracking:
+  backend: none
+  project: sfzy

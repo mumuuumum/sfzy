@@ -103,6 +103,24 @@ class FlakyScorer(SemanticScorer):
         return [{FACT_SIGNAL: None if i % 2 else 0.7} for i, _ in enumerate(items)]
 
 
+class TwoSignalScorer(SemanticScorer):
+    """同时产出事实一致性和关键要素覆盖率两路信号。"""
+
+    name = "judge_two"
+
+    def available_signals(self):
+        return {"fact_consistency", "element_coverage"}
+
+    def score_batch_signals(self, items):
+        return [
+            {
+                "fact_consistency": _stub_fact_score(i["candidate"]),
+                "element_coverage": min(1.0, 0.2 + 0.02 * len(i["candidate"])),
+            }
+            for i in items
+        ]
+
+
 def tiny_model():
     from transformers import GPT2Config, GPT2LMHeadModel
 
@@ -333,6 +351,22 @@ def test_只开规则项时不加载裁判也不需要裁判(tmp_path):
     metrics = trainer.step(make_prompts())
     assert "term_rouge_l" in metrics
     assert "term_fact_consistency" not in metrics
+
+
+def test_两个reward同时训练(tmp_path):
+    """事实一致性 + 关键要素覆盖率：两路信号都要进指标、都要有组内方差。"""
+    reward = reward_cfg(terms={
+        "rouge_l": {"enabled": False, "weight": 0.0},
+        "fact_consistency": {"enabled": True, "weight": 0.6,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "element_coverage": {"enabled": True, "weight": 0.4,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+    })
+    trainer = make_trainer(tmp_path, scorer=TwoSignalScorer(), reward=reward)
+    metrics = trainer.step(make_prompts())
+    assert "term_fact_consistency" in metrics
+    assert "term_element_coverage" in metrics
+    assert metrics["judge_missing"] == 0.0
 
 
 # ---------------------------------------------------------------- 判分缺失

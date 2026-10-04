@@ -145,35 +145,54 @@ def test_真实配置上覆盖resume_from():
 def test_继承链从根到叶():
     from sfzy.config import config_chain
 
-    names = [p.name for p in config_chain(ROOT / "configs" / "grpo_fact_only_t4.yaml")]
-    assert names == [
-        "base.yaml",
-        "sft.yaml",
-        "sft_cloud.yaml",
-        "grpo_fact_judge.yaml",
-        "grpo_fact_only_t4.yaml",
-    ]
+    names = [p.name for p in config_chain(ROOT / "configs" / "sft_cloud.yaml")]
+    assert names == ["base.yaml", "sft.yaml", "sft_cloud.yaml"]
+
+
+GRPO_CONFIGS = (
+    "grpo_fact_judge.yaml",
+    "grpo_fact_only_t4.yaml",
+    "grpo_fact_only_a100.yaml",
+    "grpo_fact_coverage_t4.yaml",
+    "grpo_fact_coverage_a100.yaml",
+    "grpo_smoke_fact_judge.yaml",
+    "grpo_cloud_qwen.yaml",
+)
+
+
+@pytest.mark.parametrize("name", GRPO_CONFIGS)
+def test_grpo配置是自包含的(name):
+    """GRPO 的运行配置不继承任何东西：一个文件里就是这次 run 的全部参数。
+
+    继承链一长，"我改的到底是哪一层"就只能靠翻文件才能回答。
+    """
+    from sfzy.config import config_chain
+
+    cfg = load_config(ROOT / "configs" / name)
+    assert [p.name for p in config_chain(ROOT / "configs" / name)] == [name]
+    assert "model_config" not in cfg, "自包含配置应该把底座直接写进 model: 块"
+    for key in ("seed", "device", "model", "lora", "rl", "semantic", "tracking"):
+        assert key in cfg, f"{name} 缺少 {key}"
 
 
 def test_渲染出来的是展开后的值():
-    """光看 t4 那份 yaml 看不到 seed / element_weights 这些继承来的键。"""
+    """渲染出来的是这份配置的最终取值（自包含配置里就是文件里写的那份）。"""
     from sfzy.config import render_config
 
     data = yaml.safe_load(render_config(load_config(ROOT / "configs" / "grpo_fact_only_t4.yaml")))
 
-    # 来自 base / sft_cloud
     assert data["seed"] == 42
     assert data["lora"]["target_modules"] == [
         "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
     ]
-    # 来自 grpo_fact_judge.yaml（子配置只覆盖了非继承项）
     assert data["rl"]["learning_rate"] == pytest.approx(1e-5)
     weights = data["rl"]["reward"]["terms"]["fact_consistency"]["element_weights"]
     assert weights["judgment_result"] == pytest.approx(0.30)
     assert data["rl"]["reward"]["terms"]["rouge_l"]["enabled"] is False
-    # 本层自己写的
     assert data["rl"]["max_length"] == 1536
     assert data["semantic"]["dtype"] == "float16"
+    # 底座是内联的，不再指向另一个 yaml
+    assert data["model"]["torch_dtype"] == "float16"
 
 
 def test_渲染可以附加运行时信息():

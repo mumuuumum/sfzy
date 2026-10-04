@@ -1,29 +1,11 @@
 # ============================================================================
-# 小规模冒烟：**只验证接线通不通、会不会 OOM**，不看效果。
+# 事实一致性 + 关键要素覆盖率 —— 2× A100 40GB
 #
-# 适用场景：单卡显存 14~16GB，正常规模会在策略前向的 logits 上 OOM ——
-#
-#     logits 大小 ≈ N × L × vocab × 2 字节
-#     默认：8 × 2432 × 65024 × 2 ≈ 2.5GB（还要再算 logsumexp 的中间量）
-#     冒烟：2 × 1216 × 65024 × 2 ≈ 0.32GB
-#
-# 三个杠杆按"效果/代价"排序：
-#   group_size      8 → 2     峰值按 N 线性下降；代价是组内基线更抖
-#   max_length      2048 → 1024   激活与 logits 同时下降
-#   max_new_tokens  384 → 192     别让输出短到被门控全拦下
-#
+# 奖励口径与 T4 版完全一致，只是规模/精度按 A100 放大。
 # 这份配置**自包含**，不继承任何其它 yaml。
 #
-# 用法：
-#   python scripts/train_grpo.py --config configs/grpo_smoke_fact_judge.yaml \
-#       --override rl.limit_prompts=4
-#
-# 看什么（附判据）：
-#   * 启动几行：策略精度 4-bit nf4 / 语义裁判 judge_fact / 实际生效的配置
-#   * reward 组内 σ 不为 0                          ← 奖励有区分度
-#   * 事实一致性那一行的档位分布不是 100% 落在 4     ← 裁判在真的判
-#   * judge_missing 接近 0                          ← 裁判没在批量失败
-#   * nvidia-smi 里卡 0 峰值离 14.5G 还留 1G 以上    ← 之后才敢放大
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_coverage_a100.yaml
 # ============================================================================
 
 seed: 42
@@ -49,23 +31,23 @@ lora:
   target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
 
 rl:
-  output_dir: outputs/grpo_smoke
+  output_dir: outputs/grpo_fact_coverage_a100
   prompt_style: structured
   prompt_file: data/splits/rl_prompts.jsonl
   sft_adapter: outputs/sft_chatglm3/step_000336.pt   # 换成你机器上的路径
-  limit_prompts: 4            # 4 条 prompt 就能看到 4 个优化步
+  limit_prompts: null
 
   quantize: true
 
-  group_size: 4
+  group_size: 8
   prompts_per_step: 1
-  max_length: 8192
+  max_length: 3072
   max_new_tokens: 512
   temperature: 0.9
   top_p: 0.95
 
   gradient_checkpointing: true
-  logprob_micro_batch: 1      # 最省显存：把序列分开算，数值不变
+  logprob_micro_batch: 4
 
   clip_ratio: 0.2
   kl_coef: 0.0
@@ -74,18 +56,29 @@ rl:
   max_grad_norm: 1.0
   grad_accum_steps: 1
 
-  save_every_n_steps: 5
-  keep_last_n_checkpoints: 1
+  save_every_n_steps: 25
+  keep_last_n_checkpoints: 2
   log_every_n_steps: 1
   resume_from: null
 
+  # ---- 奖励：两个 judge 项，各有各的内部权重 ----
   reward:
     normalize_weights: true
     terms:
-      rouge_l: {enabled: true, weight: 0.3}
+      rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
         enabled: true
         weight: 0.7
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
+      element_coverage:
+        enabled: true
+        weight: 0.3
         element_weights:
           case_type:          0.05
           plaintiff_claims:   0.15
@@ -104,11 +97,9 @@ semantic:
   trust_remote_code: false
   device: cuda:1
   dtype: bfloat16
-  load_in_4bit: true
-  bnb_4bit_compute_dtype: bfloat16
-  # 这两项只影响速度与裁判侧显存；冒烟时压小一点换速度
-  max_batch_size: 4
-  extract_max_new_tokens: 512
+  load_in_4bit: false
+  max_batch_size: 8
+  extract_max_new_tokens: 1024
   min_document_elements: 2
   doc_fallback: true
 

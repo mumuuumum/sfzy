@@ -25,6 +25,7 @@ from sfzy.judge.schema import (
     JudgeResult,
     SixElements,
     aggregate,
+    aggregate_coverage,
     empty_field_rule,
     summarize_scores,
 )
@@ -44,6 +45,7 @@ __all__ = [
     "MIN_SCORE_ELEMENTS",
     "MAX_SCORE",
     "aggregate",
+    "aggregate_coverage",
     "empty_field_rule",
     "summarize_scores",
 ]

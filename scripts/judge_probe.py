@@ -123,8 +123,6 @@ def main() -> None:
     ap.add_argument("--no-4bit", dest="load_in_4bit", action="store_false",
                     help="关掉 4-bit，走配置里的 bf16/fp16")
     ap.add_argument("--probes", default="data/judge/probe_cases.jsonl")
-    ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"],
-                    help="判定 Prompt 版本。小模型上先试 fewshot")
     args = ap.parse_args()
 
     if not args.model and not args.model_config:
@@ -154,7 +152,7 @@ def main() -> None:
 
     # 用模型**实际**设备，避免量化模型经 device_map 放置后与 --device 错位
     runtime = TorchRuntime(model=model, tokenizer=tokenizer, device=device)
-    judge = FactConsistencyJudge(runtime=runtime, judge_variant=args.judge_variant)
+    judge = FactConsistencyJudge(runtime=runtime)
 
     probes = [json.loads(l) for l in open(resolve(args.probes), encoding="utf-8") if l.strip()]
     pairs = [(p["element"], p["doc"], p["cand"]) for p in probes]

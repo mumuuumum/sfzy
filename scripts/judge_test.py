@@ -160,7 +160,7 @@ def build_judge(args) -> FactConsistencyJudge:
         model=model, tokenizer=tokenizer, device=device,
         max_batch_size=args.batch_size,
     )
-    return FactConsistencyJudge(runtime=runtime, judge_variant=args.judge_variant)
+    return FactConsistencyJudge(runtime=runtime)
 
 
 def load_documents() -> dict:
@@ -304,8 +304,6 @@ def main() -> None:
                     default=None, help="强制开启 4-bit（默认跟随配置）")
     ap.add_argument("--no-4bit", dest="load_in_4bit", action="store_false",
                     help="关掉 4-bit，走配置里的 bf16/fp16")
-    ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"],
-                    help="判定 Prompt 版本。小模型上先试 fewshot")
     ap.add_argument("--batch-size", type=int, default=8,
                     help="本地内存小就调小；服务器上可以调到 16")
     ap.add_argument("--cases", default="data/judge/fact_cases.jsonl")
@@ -335,7 +333,6 @@ def main() -> None:
 
     tag = args.model or args.model_config
     print(f"模型来源 {tag}   设备 {args.device}   batch {args.batch_size}"
-          f"   judge_variant {args.judge_variant}"
           + (f"   adapter {args.adapter}" if args.adapter else ""))
     judge = build_judge(args)
 

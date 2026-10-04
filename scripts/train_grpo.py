@@ -29,12 +29,11 @@ import json
 import sys
 from pathlib import Path
 
-import yaml
-
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import (                                 # noqa: E402
+    apply_overrides,
     config_chain,
     load_config,
     render_config,
@@ -69,24 +68,6 @@ def resolve(path) -> Path:
     return path if path.is_absolute() else ROOT / path
 
 
-def apply_overrides(cfg, pairs) -> None:
-    """就地覆盖配置项，形如 ["rl.kl_coef=0.01", "rl.group_size=4"]。
-
-    三组对照实验（A1/A2/A3）就是靠它切出来的，不用改文件。
-    """
-    for item in pairs:
-        if "=" not in item:
-            raise ValueError(f"--override 需要 KEY=VALUE 形式，收到：{item!r}")
-        dotted, raw = item.split("=", 1)
-        parts = dotted.split(".")
-        node = cfg
-        for part in parts[:-1]:
-            if part not in node:
-                raise KeyError(f"--override 的路径不存在：{dotted}")
-            node = node[part]
-        node[parts[-1]] = yaml.safe_load(raw)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="GRPO 训练")
     parser.add_argument("--config", default="configs/grpo_fact_judge.yaml")
@@ -112,7 +93,12 @@ def main() -> None:
         apply_overrides(cfg, args.override)
         logger.info("配置覆盖: %s", args.override)
 
-    model_cfg = load_config(resolve(cfg.get("model_config"))).get("model", {})
+    # 策略底座有两种写法：**内联的 model: 块**（自包含配置推荐），或者
+    # 引用另一个 yaml（model_config:，SFT 那条链还在用）。内联优先。
+    if cfg.get("model"):
+        model_cfg = dict(cfg.get("model"))
+    else:
+        model_cfg = load_config(resolve(cfg.get("model_config"))).get("model", {})
     lora_cfg = cfg.get("lora", {})
     rl_cfg = cfg.rl
 

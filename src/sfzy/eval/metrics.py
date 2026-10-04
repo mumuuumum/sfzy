@@ -93,7 +93,16 @@ def _build_fact_consistency_scorer(
         )
 
     from sfzy.judge.judge import FactConsistencyJudge
+    from sfzy.judge.judge import SUPPORTED_TASKS
     from sfzy.judge.scorer import FactConsistencyScorer
+
+    # 要跑哪些任务由 reward 配置决定：`judge_term_options()` 的键就是信号名。
+    tasks = sorted(term_options) or ["fact_consistency"]
+    unsupported = [t for t in tasks if t not in SUPPORTED_TASKS]
+    if unsupported:
+        raise ValueError(
+            f"裁判后端还不支持这些信号：{unsupported}（支持：{list(SUPPORTED_TASKS)}）"
+        )
 
     model = spec.get("model")
     if not model:
@@ -107,8 +116,9 @@ def _build_fact_consistency_scorer(
         # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),
+        coverage_weights=(term_options.get("element_coverage") or {}).get("element_weights"),
+        tasks=tasks,
         min_document_elements=int(spec.get("min_document_elements", 2)),
-        judge_variant=spec.get("judge_variant", "spec"),
         doc_fallback=bool(spec.get("doc_fallback", True)),
         # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，且位置由
         # device_map 定在 semantic.device 指的卡上，与策略分居两卡。

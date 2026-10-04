@@ -22,6 +22,7 @@ from sfzy.judge.schema import (
     MIN_SCORE_ELEMENTS,
     SixElements,
     aggregate,
+    aggregate_coverage,
     empty_field_rule,
     summarize_scores,
 )
@@ -205,15 +206,19 @@ def test_解析_数组里的占位词被丢掉():
 class _FakeJudge(FactConsistencyJudge):
     """不加载模型：记录哪些 pair 真的被"送进模型"，并按规则表返回分数。"""
 
-    def __init__(self, score_map=None, extract_map=None):
+    def __init__(self, score_map=None, extract_map=None,
+                 tasks=("fact_consistency",), coverage_weights=None):
         self.weights = dict(DEFAULT_WEIGHTS)
+        self.coverage_weights = dict(coverage_weights or DEFAULT_WEIGHTS)
+        self.tasks = tuple(tasks)
         self._doc_cache = {}
+        self._ref_cache = {}
         self.min_document_elements = 0          # 假裁判不检查提取质量
         self.doc_fallback = True
-        self.judge_variant = "spec"
         self.stats = {}
         self.runtime = type("R", (), {"stats": {}})()
-        self.sent_pairs = []
+        self.sent_pairs = []        # 事实一致性真正送进模型的 pair
+        self.sent_coverage = []     # 覆盖率真正送进模型的 pair
         self.extract_calls = 0
         self._score_map = score_map or {}
         self._extract_map = extract_map or {}
@@ -223,10 +228,14 @@ class _FakeJudge(FactConsistencyJudge):
         return [self._extract_map.get(t, SixElements(case_type="借款合同纠纷"))
                 for t in texts]
 
-    def _judge_pairs_raw(self, pairs):
-        self.sent_pairs.extend(list(pairs))
-        scores = [self._score_map.get(name, 4) for name, _, _ in pairs]
-        return scores, [0.9] * len(pairs), [[0.02] * 5 for _ in pairs]
+    def _score_requests(self, requests):        # noqa: D102 — 见基类
+        for req in requests:
+            if req.task == "element_coverage":
+                self.sent_coverage.append((req.element, req.left, req.right))
+            else:
+                self.sent_pairs.append((req.element, req.left, req.right))
+        scores = [self._score_map.get(req.element, 4) for req in requests]
+        return scores, [0.9] * len(requests), [[0.02] * 5 for _ in requests]
 
 
 def test_文档要素只提取一次():
@@ -324,6 +333,113 @@ def test_单要素判定走同一条路径():
     assert j.judge_element("case_type", "", "") == MAX_SCORE     # 空字段规则
 
 
+# ---------------------------------------------------------------- 关键要素覆盖率
+
+def test_覆盖率聚合公式():
+    raw = {name: 4 for name in ELEMENTS}
+    both = ["court_facts", "judgment_result"]
+    assert aggregate_coverage(raw, both) == pytest.approx(1.0)
+
+    raw["judgment_result"] = 0
+    # (0.25×1 + 0.30×0) / (0.25+0.30)
+    assert aggregate_coverage(raw, both) == pytest.approx(0.25 / 0.55, abs=1e-5)
+
+
+def test_覆盖率分母跟着参与要素走():
+    """只算一个要素时，那一项自己的权重就是分母 —— 不能拿全局权重和去除。"""
+    assert aggregate_coverage(
+        {"case_type": 2}, ["case_type"]
+    ) == pytest.approx(0.5)
+
+
+def test_覆盖率没有要素参与时返回None():
+    assert aggregate_coverage({}, []) is None
+
+
+def test_覆盖率_参考没有的要素不参与():
+    ref = SixElements(court_facts="借款48000元属实")          # 只抽到一项
+    cand = SixElements(court_facts="借款48000元", judgment_result="判决还款")
+    j = _FakeJudge(extract_map={"REF": ref, "CAND": cand}, tasks=("element_coverage",))
+    res = j.judge_candidates("DOC", ["CAND"], reference="REF")[0]
+    assert res.signals["element_coverage"] == pytest.approx(1.0)
+    assert [p[0] for p in j.sent_coverage] == ["court_facts"]
+
+
+def test_覆盖率_候选漏写该要素直接0分且不发请求():
+    ref = SixElements(court_facts="借款48000元属实", judgment_result="判决还款")
+    cand = SixElements(court_facts="借款48000元")             # 漏了裁判结果
+    j = _FakeJudge(extract_map={"REF": ref, "CAND": cand}, tasks=("element_coverage",))
+    res = j.judge_candidates("DOC", ["CAND"], reference="REF")[0]
+    assert res.signals["element_coverage"] == pytest.approx(0.25 / 0.55, abs=1e-5)
+    assert [p[0] for p in j.sent_coverage] == ["court_facts"]
+
+
+def test_覆盖率_参考里一个要素都没有时返回None():
+    j = _FakeJudge(
+        extract_map={"REF": SixElements(), "CAND": SixElements(court_facts="x")},
+        tasks=("element_coverage",),
+    )
+    res = j.judge_candidates("DOC", ["CAND"], reference="REF")[0]
+    assert res.signals["element_coverage"] is None
+
+
+def test_覆盖率_没传参考摘要直接报错():
+    j = _FakeJudge(tasks=("element_coverage",))
+    with pytest.raises(ValueError, match="reference"):
+        j.judge_candidates("DOC", ["CAND"])
+
+
+def test_覆盖率_参考摘要要素只抽一次():
+    """同一个 prompt 的参考是固定的，每步只该抽候选。"""
+    j = _FakeJudge(extract_map={"REF": SixElements(court_facts="x")},
+                   tasks=("element_coverage",))
+    j.judge_candidates("DOC", ["CAND"], reference="REF")
+    first = j.extract_calls
+    j.judge_candidates("DOC", ["CAND"], reference="REF")
+    assert first == 2 and j.extract_calls == 3      # 第一次：候选+参考；第二次：只有候选
+    assert len(j._ref_cache) == 1
+
+
+def test_只开覆盖率时不抽原文要素():
+    """只开覆盖率就不该为原文多付一次抽取 —— 抽取是这条路径上最贵的部分。"""
+    j = _FakeJudge(extract_map={"REF": SixElements(court_facts="x")},
+                   tasks=("element_coverage",))
+    j.judge_candidates("DOC", ["CAND"], reference="REF")
+    assert j._doc_cache == {}
+    assert j.sent_pairs == []                      # 一致性那一路根本没跑
+
+
+def test_两个任务共用一次候选抽取():
+    """同时开两个 reward 时：原文 / 参考 / 候选三种要素各只抽一次。"""
+    doc = SixElements(court_facts="借款48000元属实", judgment_result="判决还款")
+    ref = SixElements(court_facts="借款48000元", judgment_result="判决还款")
+    cand = SixElements(court_facts="借款48000元", judgment_result="判决还款")
+    j = _FakeJudge(
+        extract_map={"DOC": doc, "REF": ref, "CAND": cand},
+        tasks=("fact_consistency", "element_coverage"),
+    )
+    results = j.judge_candidates("DOC", ["CAND"], reference="REF")
+    assert j.extract_calls == 3                    # 文档 + 候选 + 参考，各一次
+    assert set(results[0].signals) == {"fact_consistency", "element_coverage"}
+    # 两个任务的判定都发出去了，但走的是同一次批量前向
+    assert [p[0] for p in j.sent_pairs] == ["court_facts", "judgment_result"]
+    assert [p[0] for p in j.sent_coverage] == ["court_facts", "judgment_result"]
+
+
+def test_覆盖率权重可单独配置():
+    """覆盖率用自己的 element_weights，不和事实一致性共用一份。"""
+    ref = SixElements(court_facts="借款属实", judgment_result="判决还款")
+    cand = SixElements(court_facts="借款属实")     # 漏了裁判结果
+    only_facts = {name: 0.0 for name in ELEMENTS}
+    only_facts["court_facts"] = 1.0
+    j = _FakeJudge(
+        extract_map={"REF": ref, "CAND": cand},
+        tasks=("element_coverage",),
+        coverage_weights=only_facts,
+    )
+    res = j.judge_candidates("DOC", ["CAND"], reference="REF")[0]
+    # 裁判结果权重为 0，漏写它不该影响分数
+    assert res.signals["element_coverage"] == pytest.approx(1.0)
 # ---------------------------------------------------------------- ChatGLM3 路径
 
 class _NativeTokenizer:

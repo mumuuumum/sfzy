@@ -107,83 +107,71 @@ JUDGE_SYSTEM = """你是严格的裁判文书摘要事实一致性评价器。�
 
 
 # ---------------------------------------------------------------------------
-# 少样本版判定 Prompt
+# 关键要素覆盖率判定
 # ---------------------------------------------------------------------------
-# 为什么需要它：规范 Prompt 是给"能读懂一长串细则"的模型写的。实测
+# 和事实一致性**方向相反**：那边"参考有、摘要没有"是省略，不扣分；
+# 这边正是要罚省略。所以必须是独立 prompt，绝不能复用上面那套。
 #
-#   Qwen2.5-0.5B  三套提示词下都是常量输出（4 / 3 / 1），提示词无从下手
-#   Qwen2.5-1.5B  10 条探针答对 6 条，**答案随内容变化**（pmax 0.45~1.00），
-#                 但错在最要命的四条上：合理概括判 0、金额写错判 2、
-#                 主体颠倒判 4、编造事实判 4
-#
-# 后者是"能力有、行为没锚定"，不是"能力不足" —— 这种情况示例比细则管用。
-# 五个示例逐一对应上面四条失败模式，外加一条结果反转。
-#
-# 示例里的分数刻意只用 4 / 1 / 0 三档：五档的细分对 1.5B 太细，
-# 能把"对"和"错"分开就够（探针判据也是 ≥3 / ≤1）。
-JUDGE_SYSTEM_FEWSHOT = """你是裁判文书摘要事实一致性评价器。判断摘要里陈述的事实能否被原文支持。
+# 只做一版：rubric 本身已经把 0~4 每一档写死了，不提供示例变体。
+COVERAGE_SYSTEM = """你是裁判文书摘要的要素覆盖率评价器。
 
-评分：
-4 = 摘要的陈述都能被原文支持。允许省略细节、换词、合理概括。
-1 = 摘要里有明显错误（金额、主体、时间、行为与原文不符），或加了原文没有的内容。
-0 = 摘要的核心结论与原文相反。
+给你【参考摘要要素】（人工撰写的正确摘要中的某一项）和【候选摘要要素】（待评价摘要中的同一项）。
+请判断候选摘要对参考摘要这一项的覆盖程度。
 
-关键：摘要没提到的内容不算错；摘要自己加上原文没有的内容算错。
+评分（只输出一个整数）：
 
-示例1（省略加概括，正确）
-原文：被告于2019年3月1日向原告偿还借款人民币100000元。
-摘要：被告曾偿还部分借款。
-输出 4
+0：未覆盖该要素，或核心语义与参考摘要不一致。
+1：仅涉及少量相关信息，存在明显遗漏。
+2：部分覆盖，遗漏部分重要信息。
+3：核心信息基本覆盖，仅遗漏次要信息。
+4：完整覆盖核心信息。
 
-示例2（金额写错）
-原文：判决被告偿还原告借款本金50000元。
-摘要：判决被告偿还原告借款本金90000元。
-输出 1
+判断要点：
 
-示例3（主体颠倒）
-原文：判决被告偿还原告借款本金50000元。
-摘要：判决原告偿还被告借款本金50000元。
-输出 0
+1. 方向是“参考摘要 → 候选摘要”：看参考里有的信息，候选写出来了多少。
+2. 允许换词、压缩和合理概括；只要核心语义一致就算覆盖，不要因为措辞不同扣分。
+3. 候选多写了参考里没有的内容不扣分 —— 多写由别的指标负责。
+4. 但如果候选与参考的核心语义矛盾（主体、行为、金额、日期、肯否关系、
+   裁判结果等相反），给 0。
+5. 逐档对齐：遗漏的是次要信息给 3，遗漏的是重要信息给 2，只沾到一点边给 1。
 
-示例4（加了原文没有的内容）
-原文：被告向原告借款50000元，至今未还。
-摘要：被告向原告借款50000元，至今未还，双方还约定由被告支付违约金20000元。
-输出 1
+只输出一个整数（0/1/2/3/4）。"""
 
-示例5（结果反转）
-原文：判决被告偿还原告借款本金50000元。
-摘要：判决驳回原告的诉讼请求。
-输出 0
 
-现在判断下面这一例，只输出一个整数（0/1/2/3/4）。"""
+def build_coverage_messages(
+    element_name: str, reference_element: str, candidate_element: str
+) -> List[Dict[str, str]]:
+    """覆盖率判定的两段 prompt。
 
-JUDGE_VARIANTS = {"spec": JUDGE_SYSTEM, "fewshot": JUDGE_SYSTEM_FEWSHOT}
+    `reference_element` 是人工摘要的对应要素，`candidate_element` 是候选摘要的。
+    参考摘要里不存在的要素根本不会走到这里（调用方直接跳过，见
+    `FactConsistencyJudge.build_coverage_pairs`）。
+    """
+    zh = ELEMENT_ZH.get(element_name, element_name)
+    user = f"""当前评价要素：
+{zh}（{element_name}）
+
+参考摘要要素：
+{reference_element}
+
+候选摘要要素：
+{candidate_element}
+
+请判断候选摘要要素对参考摘要要素的覆盖程度，只输出一个整数（0/1/2/3/4）。"""
+    return [
+        {"role": "system", "content": COVERAGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
 
 
 def build_judge_messages(
-    element_name: str, document_element: str, candidate_element: str,
-    variant: str = "spec",
+    element_name: str, document_element: str, candidate_element: str
 ) -> List[Dict[str, str]]:
-    """`element_name` 用英文键名，但正文里给出中文名 —— 需求里就是这么写的。"""
-    if variant not in JUDGE_VARIANTS:
-        raise ValueError(f"未知的判定 Prompt 版本：{variant}（可选 {list(JUDGE_VARIANTS)}）")
-    zh = ELEMENT_ZH.get(element_name, element_name)
+    """`element_name` 用英文键名，但正文里给出中文名 —— 需求里就是这么写的。
 
-    if variant == "fewshot":
-        # **user 消息必须和示例里的格式一致。**
-        # 第一版少样本没生效就是这个原因：示例写的是"原文：…/摘要：…"，
-        # 而真实调用用的是规范 prompt 那套"裁判文书原文要素：…"的冗长格式，
-        # 格式对不上，模型学到的是另一个任务的行为，于是坏样本全卡在 2 分。
-        user = (
-            f"要素：{zh}\n"
-            f"原文：{document_element}\n"
-            f"摘要：{candidate_element}\n"
-            "只输出一个整数（0/1/2/3/4）。"
-        )
-        return [
-            {"role": "system", "content": JUDGE_VARIANTS[variant]},
-            {"role": "user", "content": user},
-        ]
+    只有这一版 prompt：判定规则已经逐档写死在 system 里，不提供少样本变体。
+    """
+    zh = ELEMENT_ZH.get(element_name, element_name)
 
     user = f"""当前评价要素类型：
 {zh}（{element_name}）
@@ -196,6 +184,6 @@ def build_judge_messages(
 
     请判断待评价摘要要素与裁判文书原文要素的事实一致性。"""
     return [
-        {"role": "system", "content": JUDGE_VARIANTS[variant]},
+        {"role": "system", "content": JUDGE_SYSTEM},
         {"role": "user", "content": user},
     ]

@@ -169,6 +169,30 @@ def test_可以关掉rouge只留裁判():
     assert score == pytest.approx(0.4)
 
 
+def test_两个裁判项各按自己的权重进入总分():
+    spec = {"terms": {
+        "fact_consistency": {"enabled": True, "weight": 0.6,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "element_coverage": {"enabled": True, "weight": 0.4,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+    }}
+    score, bd = compute_reward(
+        REF, REF, spec=spec,
+        judge_signals={"fact_consistency": 0.5, "element_coverage": 1.0},
+    )
+    assert set(bd.values) == {"fact_consistency", "element_coverage"}
+    assert score == pytest.approx(0.6 * 0.5 + 0.4 * 1.0)
+
+
+def test_覆盖率信号缺失要报错():
+    spec = {"terms": {
+        "element_coverage": {"enabled": True, "weight": 1.0,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+    }}
+    with pytest.raises(ValueError, match="element_coverage"):
+        compute_reward(REF, REF, spec=spec, judge_signals={"fact_consistency": 0.9})
+
+
 def test_judge项缺信号要报错():
     with pytest.raises(ValueError, match="fact_consistency"):
         compute_reward(REF, REF, spec=SPEC)

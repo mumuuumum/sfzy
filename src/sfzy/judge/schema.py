@@ -162,6 +162,9 @@ class JudgeResult:
     raw_outputs: Dict[str, str] = field(default_factory=dict)
     probs: Dict[str, List[float]] = field(default_factory=dict)
     candidate_id: str = ""
+    # 这次判定产出的**所有信号**（事实一致性 / 关键要素覆盖率 / 以后新增的）。
+    # 动态字典：加一个 reward 只需要往这里多放一个键，不用改数据类。
+    signals: Dict[str, Optional[float]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -169,6 +172,7 @@ class JudgeResult:
             "scores": dict(self.scores),
             "raw_scores": dict(self.raw_scores),
             "fact_reward": self.weighted_reward,
+            "signals": dict(self.signals),
             "min_element_score": self.min_element_score,
             "judgment_result_score": self.judgment_result_score,
         }
@@ -233,6 +237,29 @@ def aggregate(
         probs=dict(probs or {}),
         candidate_id=candidate_id,
     )
+
+
+def aggregate_coverage(
+    raw_scores: Dict[str, int],
+    present: Sequence[str],
+    weights: Optional[Dict[str, float]] = None,
+) -> Optional[float]:
+    """关键要素覆盖率：R = Σ(w_i · s_i/4) / Σ w_i，只对 `present` 里的要素求和。
+
+    `present` 是**参考摘要里真实存在的**要素。参考里没有的要素必须从分子和
+    分母里同时去掉 —— 不能按 0 分算，那等于把"参考没写"记成"候选没覆盖"。
+    一个要素都不存在时返回 None（这一条没有定义，交给调用方按缺失处理）。
+
+    和事实一致性 `aggregate` 的区别：那个的权重和恒为 1，直接加权求和即可；
+    这里的要素可能缺项，所以必须除以参与计算的权重和。
+    """
+    weights = weights or DEFAULT_WEIGHTS
+    names = list(present)
+    total = sum(weights[name] for name in names)
+    if total <= 0:
+        return None
+    weighted = sum(weights[name] * raw_scores[name] / float(MAX_SCORE) for name in names)
+    return round(weighted / total, 6)
 
 
 # ---------------------------------------------------------------------------

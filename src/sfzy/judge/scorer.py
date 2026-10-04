@@ -42,12 +42,8 @@ class FactConsistencyScorer(SemanticScorer):
     """
 
     name = "judge_fact"
-    # 本后端自己按 source 分组，不需要 trainer 对齐 group_size（那是排序裁判的要求）
-    kind = "fact_consistency"
-    # 这个后端产出的信号名。以后在同一批 pair 上加覆盖率等 task 时，
-    # 在这里补名字、在 `score_batch_signals` 里补分支即可，
-    # 抽取（贵）仍然只做一次。
-    SIGNALS = ("fact_consistency",)
+    # 本后端自己按 source 分组，不需要 trainer 对齐 group_size
+    kind = "six_element"
 
     def __init__(
         self,
@@ -71,14 +67,18 @@ class FactConsistencyScorer(SemanticScorer):
         self.judge.clear_cache()
 
     def available_signals(self) -> set:
-        return set(self.SIGNALS)
+        """这个后端实际会产出的信号 = 构造时启用的任务。
 
-    def _score_values(
+        只开覆盖率时，事实一致性那一路根本不会被算，也就不会出现在这里。
+        """
+        return set(self.judge.tasks)
+
+    def _score_item_signals(
         self, items: Sequence[Dict[str, Any]]
-    ) -> List[Optional[float]]:
-        """真正算分的那一层：返回每条候选的加权事实一致性奖励 ∈ [0,1]，失败为 `None`。"""
+    ) -> List[Dict[str, Optional[float]]]:
+        """真正算分的那一层：返回每条候选的**全部信号**，失败的那一组为 `{}`。"""
         norm = [_normalize(it) for it in items]
-        scores: List[Optional[float]] = [None] * len(norm)
+        signals: List[Dict[str, Optional[float]]] = [{} for _ in norm]
         self.last_results = []
         self.last_errors = []
 
@@ -91,35 +91,53 @@ class FactConsistencyScorer(SemanticScorer):
         for source, idxs in groups.items():
             candidates = [norm[i]["candidate"] for i in idxs]
             ids = [norm[i]["id"] or str(i) for i in idxs]
+            # 同一篇原文的候选必须共用同一份人工摘要 —— 不然覆盖率判的就
+            # 不是同一把尺子。这里显式拦住，而不是让第一份悄悄生效。
+            references = {norm[i]["reference"] for i in idxs}
+            if len(references) > 1:
+                raise ValueError(
+                    "同一个 source 下的候选必须共用同一个 reference（人工摘要），"
+                    f"收到 {len(references)} 份不同的。"
+                )
+            reference = next(iter(references)) if references else ""
             try:
-                results = self.judge.judge_candidates(source, candidates, candidate_ids=ids)
+                results = self.judge.judge_candidates(
+                    source, candidates, candidate_ids=ids, reference=reference
+                )
             except Exception as exc:  # noqa: BLE001 — 见 fail_soft 的说明
                 if not self.fail_soft:
                     raise
                 self.last_errors.append(f"{source[:32]}…: {type(exc).__name__}: {exc}")
                 continue
             for i, result in zip(idxs, results):
-                scores[i] = float(result.weighted_reward)
+                signals[i] = {
+                    name: (None if value is None else float(value))
+                    for name, value in result.signals.items()
+                }
                 self.last_results.append(result)
-        return scores
+        return signals
 
     def score_batch(
         self, items: Sequence[Dict[str, Any]]
     ) -> List[Optional[float]]:
-        """单信号接口：每条候选的加权事实一致性奖励 ∈ [0, 1]。"""
-        return self._score_values(items)
+        """单信号接口：每条候选的事实一致性奖励 ∈ [0, 1]（兼容用）。
+
+        没启用事实一致性任务时全部返回 None。
+        """
+        return [
+            sig.get("fact_consistency")
+            for sig in self._score_item_signals(items)
+        ]
 
     def score_batch_signals(
         self, items: Sequence[Dict[str, Any]]
     ) -> List[Dict[str, Optional[float]]]:
-        """多信号接口。现在只有 `fact_consistency` 一路。
+        """多信号接口：`{"fact_consistency":…, "element_coverage":…}`。
 
-        覆盖率（`element_coverage`）会作为同一批 pair 上的另一个判定 task
-        加进来 —— 那时这里返回 {"fact_consistency": ..., "element_coverage": ...}，
-        而**要素抽取仍然只做一次**。
+        要素抽取（原文 / 人工摘要 / 候选）在这条路径上各做一次，
+        两个任务共用；判定 prompt 合成一次批量前向。
         """
-        values = self._score_values(items)
-        return [{"fact_consistency": v} for v in values]
+        return self._score_item_signals(items)
 
     # ---------------------------------------------------------------- 日志
     def summarize_last(self) -> Dict[str, float]:
@@ -129,6 +147,9 @@ class FactConsistencyScorer(SemanticScorer):
         trainer 只要 `hasattr(scorer, "summarize_last")` 就合并进日志，
         **不需要认识六要素**，耦合面只有一个方法名。
         """
+        # 只开了覆盖率时，last_results 里没有一致性的逐要素分，统计量无从谈起
+        if not self.last_results or not self.last_results[0].scores:
+            return {}
         return summarize_scores(self.last_results)
 
     def iteration_stats(self) -> Dict[str, int]:

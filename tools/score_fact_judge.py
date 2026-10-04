@@ -192,7 +192,6 @@ def build_judge(args: argparse.Namespace) -> FactConsistencyJudge:
         max_batch_size=args.max_batch_size,
         extract_max_new_tokens=args.extract_max_new_tokens,
         min_document_elements=args.min_document_elements,
-        judge_variant=args.judge_variant,
         doc_fallback=not args.no_doc_fallback,
     )
 
@@ -220,7 +219,6 @@ def main() -> None:
     ap.add_argument("--max-batch-size", type=int, default=8)
     ap.add_argument("--extract-max-new-tokens", type=int, default=1024)
     ap.add_argument("--min-document-elements", type=int, default=2)
-    ap.add_argument("--judge-variant", default="spec", choices=["spec", "fewshot"])
     ap.add_argument("--no-doc-fallback", action="store_true",
                     help="关掉『要素抽空时拿整篇原文兜底』（默认开）")
     args = ap.parse_args()

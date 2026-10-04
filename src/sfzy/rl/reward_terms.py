@@ -83,6 +83,15 @@ TERM_REGISTRY: Dict[str, TermSpec] = {
         # 六要素的**内部权重**只能写在配置里，这里只声明键集合。
         internal_weight_fields={"element_weights": FACT_ELEMENTS},
     ),
+    "element_coverage": TermSpec(
+        name="element_coverage",
+        source="judge",
+        signal="element_coverage",
+        description="关键要素覆盖率：候选摘要对人工摘要六要素的覆盖程度 ∈ [0,1]",
+        # 同样六个要素，但权重可以单独设（两者共用一个 judge 后端，
+        # 抽取共用，判定各一套 prompt）。
+        internal_weight_fields={"element_weights": FACT_ELEMENTS},
+    ),
 }
 
 

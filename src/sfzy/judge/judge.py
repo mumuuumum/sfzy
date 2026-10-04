@@ -25,9 +25,14 @@ import hashlib
 import json
 import os
 import re
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from sfzy.judge.prompts import build_extract_messages, build_judge_messages
+from sfzy.judge.prompts import (
+    build_coverage_messages,
+    build_extract_messages,
+    build_judge_messages,
+)
 from sfzy.judge.runtime import (
     DIGITS,
     TorchRuntime,
@@ -41,6 +46,7 @@ from sfzy.judge.schema import (
     JudgeResult,
     SixElements,
     aggregate,
+    aggregate_coverage,
     coerce_element_value,
     empty_field_rule,
     summarize_scores,
@@ -51,6 +57,21 @@ _KEY_RE = re.compile(r'"?([a-z_]+)"?\s*[:：]')
 
 # 调试开关：设置环境变量 JUDGE_VERBOSE=1 即可打印模型输入/输出
 _VERBOSE = os.environ.get("JUDGE_VERBOSE", "0") == "1"
+
+# 这个 Judge 支持的任务（= 它产出的信号名）。
+# 加一个新 reward：在 prompts.py 里写判定 prompt、在这里加一个分支、
+# 在 `term_options` 里声明要它，不需要动抽取和批处理的代码。
+SUPPORTED_TASKS: tuple = ("fact_consistency", "element_coverage")
+
+
+@dataclass(frozen=True)
+class JudgeRequest:
+    """一次要送进模型的判定：哪个任务、哪个要素、对照双方是什么。"""
+
+    task: str
+    element: str
+    left: str    # 被对照的一方：原文要素（一致性）/ 参考摘要要素（覆盖率）
+    right: str   # 候选摘要要素
 
 
 class ExtractionFailure(RuntimeError):
@@ -146,10 +167,11 @@ class FactConsistencyJudge:
         max_batch_size: int = 4,
         extract_max_new_tokens: int = 1024,
         weights: Optional[Dict[str, float]] = None,
+        coverage_weights: Optional[Dict[str, float]] = None,
+        tasks: Optional[Sequence[str]] = None,
         max_input_tokens: int = 4096,
         min_document_elements: int = 2,
         runtime: Optional[TorchRuntime] = None,
-        judge_variant: str = "spec",
         doc_fallback: bool = True,
         load_in_4bit: bool = False,
         bnb_4bit_compute_dtype: Optional[str] = None,
@@ -176,7 +198,15 @@ class FactConsistencyJudge:
             )
         self.runtime = runtime
         self.weights = dict(weights or DEFAULT_WEIGHTS)
-        self.judge_variant = judge_variant
+        # 覆盖率自己的六要素权重。没给就沿用一致性的那份（同一套要素）。
+        self.coverage_weights = dict(coverage_weights or self.weights)
+        # 这次要跑哪些任务。只跑需要的，能省掉对应材料的抽取与判定。
+        self.tasks = tuple(tasks) if tasks else ("fact_consistency",)
+        unknown = [t for t in self.tasks if t not in SUPPORTED_TASKS]
+        if unknown:
+            raise ValueError(
+                f"未知的 judge task：{unknown}（支持：{list(SUPPORTED_TASKS)}）"
+            )
         self.doc_fallback = doc_fallback
         self.extract_max_new_tokens = extract_max_new_tokens
         # 文档要素少于这个数就认定提取失败（见 ExtractionFailure 的说明）。
@@ -184,6 +214,9 @@ class FactConsistencyJudge:
         self.min_document_elements = min_document_elements
         # 文档要素缓存：GRPO 里同一篇文书要配 G 个候选，只提取一次
         self._doc_cache: Dict[str, SixElements] = {}
+        # 参考摘要（人工摘要）要素缓存：同一篇 prompt 的参考是固定的，
+        # 也只需要抽一次。覆盖率任务才会用到。
+        self._ref_cache: Dict[str, SixElements] = {}
         self.stats: Dict[str, int] = {
             "extract_calls": 0, "extract_degraded": 0, "extract_retry": 0,
         }
@@ -287,42 +320,69 @@ class FactConsistencyJudge:
 
     def clear_cache(self) -> None:
         self._doc_cache.clear()
+        self._ref_cache.clear()
+
+    def reference_elements(self, reference: str) -> SixElements:
+        """参考摘要（人工摘要）的六要素，按 sha1 缓存。
+
+        覆盖率要拿"候选 vs 人工摘要"逐项比，所以人工摘要的六要素也得抽一次。
+        但它在同一篇 prompt 上是**固定**的，GRPO 每步换的只是候选 ——
+        所以和原文要素一样按内容缓存，整个训练里只抽一次。
+        """
+        key = self._cache_key(reference)
+        if key not in self._ref_cache:
+            self._ref_cache[key] = self.extract_six_elements(reference)
+        return self._ref_cache[key]
 
     # ---------------------------------------------------------------- 判定
+    def _render_request(self, request: "JudgeRequest") -> str:
+        if request.task == "element_coverage":
+            messages = build_coverage_messages(
+                request.element, request.left, request.right
+            )
+        else:
+            messages = build_judge_messages(
+                request.element, request.left, request.right
+            )
+        return self.runtime.render(messages)
+
+    def _score_requests(
+        self, requests: Sequence["JudgeRequest"]
+    ) -> Tuple[List[int], List[float], List[List[float]]]:
+        """把所有任务的判定 prompt **合成一次批量前向**。
+
+        事实一致性和关键要素覆盖率用的是两套 prompt，但它们打的是同一个
+        受限解码头，可以放进同一个 batch —— 这样多一个 reward 不会多跑一遍
+        模型，只是每批的序列数变多。
+        """
+        if not requests:
+            return [], [], []
+        prompts = [self._render_request(r) for r in requests]
+        if _VERBOSE:
+            for i, (r, prompt) in enumerate(zip(requests, prompts)):
+                print(f"\n{'='*20} [Judge:{r.task}] 请求 {i+1} {'='*20}")
+                print(f"要素名称: {r.element}")
+                print(f"对照左：{r.left}")
+                print(f"对照右：{r.right}")
+                print(f"构造的完整 Prompt:\n{prompt}\n")
+        scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
+        if _VERBOSE:
+            for i, (s, pm, pr) in enumerate(zip(scores, pmaxs, probs)):
+                print(f"\n{'='*20} [Judge] 请求 {i+1} 输出 {'='*20}")
+                print(f"解析得分: {s}")
+                print(f"最大概率 (pmax): {pm:.4f}")
+                print(f"各数字概率分布: {pr}\n")
+        return scores, pmaxs, probs
+
     def _judge_pairs_raw(
         self, pairs: Sequence[Tuple[str, str, str]]
     ) -> Tuple[List[int], List[float], List[List[float]]]:
         """真正调模型的那一层。**不做**空字段规则，调用方负责。"""
-        if not pairs:
-            return [], [], []
-        prompts = [
-            self.runtime.render(build_judge_messages(name, doc, cand, variant=self.judge_variant))
-            for name, doc, cand in pairs
+        requests = [
+            JudgeRequest("fact_consistency", name, left, right)
+            for name, left, right in pairs
         ]
-
-        # === 调试：打印判定阶段的输入 Prompt ===
-        if _VERBOSE:
-            for i, ((name, doc, cand), p) in enumerate(zip(pairs, prompts)):
-                print(f"\n{'='*20} [Judge] Pair {i+1} 输入 {'='*20}")
-                print(f"要素名称: {name}")
-                print(f"原文要素: {doc}")
-                print(f"候选要素: {cand}")
-                print(f"构造的完整 Prompt:\n{p}\n")
-        # =======================================
-
-        scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
-
-        # === 调试：打印判定阶段的模型输出与分数 ===
-        if _VERBOSE:
-            for i, (s, pm, pr) in enumerate(zip(scores, pmaxs, probs)):
-                print(f"\n{'='*20} [Judge] Pair {i+1} 输出 {'='*20}")
-                print(f"解析得分: {s}")
-                print(f"最大概率 (pmax): {pm:.4f}")
-                print(f"各数字概率分布: {pr}")
-                print()
-        # ==========================================
-
-        return scores, pmaxs, probs
+        return self._score_requests(requests)
 
     def judge_elements_batch(
         self, pairs: Sequence[Tuple[str, str, str]]
@@ -424,82 +484,182 @@ class FactConsistencyJudge:
                 pairs.append((name, "", cand_v))
         return pairs
 
+    def build_coverage_pairs(
+        self,
+        reference_elements: SixElements,
+        candidate_elements: SixElements,
+    ) -> Tuple[List[Tuple[str, str, str]], List[str], Dict[str, int]]:
+        """关键要素覆盖率的判定输入：候选摘要**对参考摘要**的覆盖程度。
+
+        返回 `(要送进模型的 pair, 参与计算的要素, 免调模型直接给的分)`。
+
+        规则（和事实一致性刻意相反）：
+
+          * 参考摘要里**没有**这一项 → 该要素不参与，分子分母都不算
+          * 参考有、候选空       → 未覆盖，0 分，不发请求
+          * 两边都有             → 送进模型判 0~4
+
+        注意方向：左是**参考摘要要素**，右是候选。候选多写不扣分
+        （参考没写的内容由别的 reward 或 ROUGE 负责罚）。
+        """
+        pairs: List[Tuple[str, str, str]] = []
+        present: List[str] = []
+        precomputed: Dict[str, int] = {}
+        for name in ELEMENTS:
+            ref_v = reference_elements.get(name).strip()
+            if not ref_v:
+                continue                       # 参考里没有 → 不参与
+            present.append(name)
+            cand_v = candidate_elements.get(name).strip()
+            if not cand_v:
+                precomputed[name] = 0          # 未覆盖该要素
+            else:
+                pairs.append((name, ref_v, cand_v))
+        return pairs, present, precomputed
+
     # ---------------------------------------------------------------- GRPO 入口
     def judge_candidates(
         self,
         document: str,
         candidates: Sequence[str],
         candidate_ids: Optional[Sequence[str]] = None,
+        reference: Optional[str] = None,
     ) -> List[JudgeResult]:
-        """一次评一批候选（就是 GRPO 的一个 group）。
+        """一次评一批候选（就是 GRPO 的一个 group），**一次产出所有启用任务的信号**。
 
         这是接入 GRPOTrainer 时唯一要调的入口：
 
-            doc_el = judge.document_elements(原文)      # 命中缓存，不重复提取
-            results = judge.judge_candidates(原文, 8 条采样)
-            rewards = [r.weighted_reward for r in results]
+            results = judge.judge_candidates(原文, 8 条采样, reference=人工摘要)
+            signals = [r.signals for r in results]   # {"fact_consistency":…, "element_coverage":…}
 
-        48 个 pair（6 要素 × 8 候选）会一次性组 batch 送进模型，
-        空字段的那些根本不发请求。
+        算力只花一次：
+          * 原文要素按 sha1 缓存（只在启用事实一致性时才抽）
+          * 人工摘要要素按 sha1 缓存（只在启用覆盖率时才抽）
+          * 候选要素一次批量抽完，**两个任务共用**
+          * 两个任务的判定 prompt 合成**一次批量前向**
+        空字段的那些 pair 根本不发请求。
         """
         candidates = list(candidates)
         cand_els = self.extract_six_elements_batch(candidates)
-        doc_el = self.document_elements(document)
+        ids = (
+            list(candidate_ids)
+            if candidate_ids is not None
+            else [str(i) for i in range(len(candidates))]
+        )
 
-        pairs: List[Tuple[str, str, str]] = []
-        slots: List[Tuple[int, str]] = []
-        precomputed: Dict[Tuple[int, str], int] = {}
+        # ---- 事实一致性：原文要素 vs 候选要素 ----
+        cons_requests: List[JudgeRequest] = []
+        cons_slots: List[Tuple[int, str]] = []
+        cons_precomputed: Dict[Tuple[int, str], int] = {}
         fallback_slots: set = set()
-        for ci, ce in enumerate(cand_els):
-            for name in ELEMENTS:
-                doc_v = doc_el.get(name).strip()
-                cand_v = ce.get(name).strip()
-                if not cand_v:
-                    # 规则一 / 规则二：候选省略（或两边都空）→ 4 分，不发请求
-                    precomputed[(ci, name)] = MAX_SCORE
-                elif doc_v:
-                    pairs.append((name, doc_v, cand_v))
-                    slots.append((ci, name))
-                elif self.doc_fallback and document:
-                    # ★ 提取器漏了这个要素，但候选写了。
-                    # 按需求规则三仍然调 Judge —— 但**不能把空字符串当原文要素**：
-                    # 裁判看到空原文只能判 0，于是奖励变成"提取器漏过的要素
-                    # 千万别写"（写了 0 分、不写 4 分），而且不报错。
-                    # 拿整篇原文去判，裁判才有东西可核对。
-                    pairs.append((name, document, cand_v))
-                    slots.append((ci, name))
-                    fallback_slots.add((ci, name))
-                else:
-                    pairs.append((name, "", cand_v))
-                    slots.append((ci, name))
+        if "fact_consistency" in self.tasks:
+            doc_el = self.document_elements(document)
+            for ci, ce in enumerate(cand_els):
+                for name in ELEMENTS:
+                    doc_v = doc_el.get(name).strip()
+                    cand_v = ce.get(name).strip()
+                    if not cand_v:
+                        # 规则一 / 规则二：候选省略（或两边都空）→ 4 分，不发请求
+                        cons_precomputed[(ci, name)] = MAX_SCORE
+                    elif doc_v:
+                        cons_requests.append(
+                            JudgeRequest("fact_consistency", name, doc_v, cand_v)
+                        )
+                        cons_slots.append((ci, name))
+                    elif self.doc_fallback and document:
+                        # ★ 提取器漏了这个要素，但候选写了。
+                        # 不能把空字符串当原文要素：裁判看到空原文只能判 0，
+                        # 奖励就变成"提取器漏过的要素千万别写"，而且不报错。
+                        # 拿整篇原文去判，裁判才有东西可核对。
+                        cons_requests.append(
+                            JudgeRequest("fact_consistency", name, document, cand_v)
+                        )
+                        cons_slots.append((ci, name))
+                        fallback_slots.add((ci, name))
+                    else:
+                        cons_requests.append(
+                            JudgeRequest("fact_consistency", name, "", cand_v)
+                        )
+                        cons_slots.append((ci, name))
 
-        scores, pmaxs, probs = self._judge_pairs_raw(pairs)
-        got = {(ci, name): v for (ci, name), v in zip(slots, scores)}
-        pget = {(ci, name): v for (ci, name), v in zip(slots, pmaxs)}
-        prget = {(ci, name): v for (ci, name), v in zip(slots, probs)}
+        # ---- 关键要素覆盖率：参考摘要要素 vs 候选要素 ----
+        cov_requests: List[JudgeRequest] = []
+        cov_slots: List[Tuple[int, str]] = []
+        cov_precomputed: Dict[Tuple[int, str], int] = {}
+        cov_present: Dict[int, List[str]] = {}
+        if "element_coverage" in self.tasks:
+            if reference is None:
+                raise ValueError(
+                    "element_coverage 需要人工摘要（reference），但调用时没有传。"
+                )
+            ref_el = self.reference_elements(reference)
+            for ci, ce in enumerate(cand_els):
+                pairs, present, precomputed = self.build_coverage_pairs(ref_el, ce)
+                cov_present[ci] = present
+                for name, score in precomputed.items():
+                    cov_precomputed[(ci, name)] = score
+                for name, left, right in pairs:
+                    cov_requests.append(
+                        JudgeRequest("element_coverage", name, left, right)
+                    )
+                    cov_slots.append((ci, name))
 
-        ids = list(candidate_ids) if candidate_ids is not None else [str(i) for i in range(len(candidates))]
+        # ---- 两个任务合成一次批量前向 ----
+        scores, pmaxs, probs = self._score_requests(cons_requests + cov_requests)
+        n_cons = len(cons_requests)
+        cons_scores, cons_pmaxs, cons_probs = (
+            scores[:n_cons], pmaxs[:n_cons], probs[:n_cons],
+        )
+        cov_scores = scores[n_cons:]
+        # last_pmax 只覆盖一致性那一段：它是给 CLI 看置信度用的，语义不要变
+        self.last_pmax, self.last_probs = cons_pmaxs, cons_probs
+
+        got = {(ci, name): v for (ci, name), v in zip(cons_slots, cons_scores)}
+        pget = {(ci, name): v for (ci, name), v in zip(cons_slots, cons_pmaxs)}
+        prget = {(ci, name): v for (ci, name), v in zip(cons_slots, cons_probs)}
+        cov_got = {(ci, name): v for (ci, name), v in zip(cov_slots, cov_scores)}
+
         results: List[JudgeResult] = []
         for ci in range(len(candidates)):
-            raw_scores, sources, raw_outputs, prob_map = {}, {}, {}, {}
-            for name in ELEMENTS:
-                key = (ci, name)
-                if key in precomputed:
-                    raw_scores[name] = precomputed[key]
-                    sources[name] = "empty_rule"
-                else:
-                    raw_scores[name] = got[key]
-                    sources[name] = "doc_fallback" if key in fallback_slots else "judge"
-                    raw_outputs[name] = str(got[key])
-                    prob_map[name] = prget[key]
-            results.append(aggregate(
-                raw_scores,
-                weights=self.weights,
-                sources=sources,
-                raw_outputs=raw_outputs,
-                probs=prob_map,
-                candidate_id=ids[ci],
-            ))
+            signals: Dict[str, Optional[float]] = {}
+            result = JudgeResult(candidate_id=ids[ci])
+
+            if "fact_consistency" in self.tasks:
+                raw_scores, sources, raw_outputs, prob_map = {}, {}, {}, {}
+                for name in ELEMENTS:
+                    key = (ci, name)
+                    if key in cons_precomputed:
+                        raw_scores[name] = cons_precomputed[key]
+                        sources[name] = "empty_rule"
+                    else:
+                        raw_scores[name] = got[key]
+                        sources[name] = (
+                            "doc_fallback" if key in fallback_slots else "judge"
+                        )
+                        raw_outputs[name] = str(got[key])
+                        prob_map[name] = prget[key]
+                result = aggregate(
+                    raw_scores,
+                    weights=self.weights,
+                    sources=sources,
+                    raw_outputs=raw_outputs,
+                    probs=prob_map,
+                    candidate_id=ids[ci],
+                )
+                signals["fact_consistency"] = result.weighted_reward
+
+            if "element_coverage" in self.tasks:
+                present = cov_present[ci]
+                raw_scores = {
+                    name: cov_precomputed.get((ci, name), cov_got.get((ci, name)))
+                    for name in present
+                }
+                signals["element_coverage"] = aggregate_coverage(
+                    raw_scores, present, self.coverage_weights
+                )
+
+            result.signals = signals
+            results.append(result)
         return results
 
     # ---------------------------------------------------------------- 日志

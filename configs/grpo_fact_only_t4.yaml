@@ -1,76 +1,115 @@
-defaults: grpo_fact_judge
-
 # ============================================================================
 # 只考虑"事实一致性 reward" —— 2× T4 15GB 验证版
 #
 #   GPU0  策略：ChatGLM3-6B 4-bit NF4（冻结）+ LoRA + 优化器 + rollout
 #   GPU1  裁判：Qwen2.5-7B-Instruct 4-bit NF4（冻结，只做 inference）
 #
-# 奖励里**只留 fact_consistency 一项**（ROUGE 关掉），门控仍作为全局开关生效。
-# 这一版的目标是：接线通不通、15GB 够不够、奖励有没有区分度 —— 不是效果。
+# 这份配置**自包含**：不继承任何其它 yaml，训练用到的值全在这里。
+# 奖励只留 fact_consistency 一项（ROUGE 关掉），门控仍作为全局开关生效。
 #
-# 和 grpo_fact_judge.yaml 的区别只有两类：
-#   1. 奖励只留事实一致性；
-#   2. 按 T4 调小规模，并把精度全换成 float16（Turing 不支持 bf16）。
-#
-# 跑法（脚本不带其它参数，全部从这份配置读）：
+# 跑法（脚本不需要其它参数，全部从这份配置读）：
 #   python scripts/train_grpo.py --config configs/grpo_fact_only_t4.yaml
 # ============================================================================
 
-# 4-bit + float16 + device_map {"":0}。模型路径写在那个文件里
-# （默认是 HuggingFace id THUDM/chatglm3-6b，离线机器改成本地目录）。
-model_config: configs/model_chatglm3_6b.yaml
+seed: 42
+device: auto
+
+data_config: configs/data_splits.yaml     # 只有数据工具会用；GRPO 本身不读
+
+# ---- 策略底座：T4 是 Turing，不支持 bf16，只能 float16 ----
+model:
+  model_name_or_path: THUDM/chatglm3-6b   # 离线机器改成本地目录
+  trust_remote_code: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: float16
+  torch_dtype: float16
+  device_map: {"": 0}                     # 策略钉卡 0，卡 1 留给裁判
+  max_length: 2048
+  config_patches: {}
+
+# ---- LoRA：必须和 SFT 阶段完全一致，否则载入权重会 shape mismatch ----
+lora:
+  r: 16
+  alpha: 32
+  # RL 必须关掉 dropout：old_logprobs 与策略 logprobs 是背靠背两次前向，
+  # 权重没变、ratio 本该恒为 1；dropout 会让两次 mask 不同、裁剪率飙升。
+  dropout: 0.0
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
 
 rl:
   output_dir: outputs/grpo_fact_only_t4
-  # SFT 产出的 LoRA checkpoint —— 换成你机器上实际的路径
+  prompt_style: structured
+  prompt_file: data/splits/rl_prompts.jsonl
+  # GRPO 的起点（SFT 产出的 LoRA checkpoint）
   sft_adapter: /kaggle/input/models/mumuuumum/sft-chatglm3-6b/transformers/default/1/step_000336.pt
-  # 想先跑最小闭环（几条 prompt 看接线），把它设成整数，例如 8
-  limit_prompts: 8
+  limit_prompts: 8            # 先跑最小闭环；确认接线后再改成 null
 
-  quantize: true                 # 策略 4-bit，和 SFT 训练时的底座一致
+  quantize: true              # 策略 4-bit，和 SFT 训练时的底座一致
 
   # ---- rollout：15GB 卡的保守取值 ----
-  # 显存峰值 ≈ group_size × (max_length + max_new_tokens) × vocab，
-  # 不够就先降 group_size，再降 max_length。
   group_size: 4
   prompts_per_step: 1
-  max_length: 1536               # 源文档被截断时保尾部（判决结果在结尾）
+  max_length: 1536            # 源文档被截断时保尾部（判决结果在结尾）
   max_new_tokens: 320
-  temperature: 0.9               # 要有方差才能算出 advantage
+  temperature: 0.9            # 要有方差才能算出 advantage
   top_p: 0.95
 
   # ---- 显存 ----
   gradient_checkpointing: true
-  logprob_micro_batch: 1         # 最省显存的取值，只压瞬时峰值
+  logprob_micro_batch: 1      # 最省显存的取值，只压瞬时峰值
+
+  # ---- 算法 ----
+  clip_ratio: 0.2
+  kl_coef: 0.0
+  length_norm: sqrt
+  learning_rate: 1.0e-5
+  max_grad_norm: 1.0
+  grad_accum_steps: 1
 
   # ---- 存档与日志 ----
   save_every_n_steps: 10
   keep_last_n_checkpoints: 2
   log_every_n_steps: 1
+  resume_from: null
 
-  # ---- 奖励：只留事实一致性 ----
+  # ---- 奖励：只留事实一致性（权重只能写在这里）----
   reward:
     normalize_weights: true
     terms:
-      rouge_l:          {enabled: false, weight: 0.0}
-      # fact_consistency 的 element_weights 继承自 grpo_fact_judge.yaml；
-      # 要单独调六要素权重，就在这里把 terms.fact_consistency.element_weights 写全
-      # （六个键、非负、之和为 1），写不全启动就会报错。
-      fact_consistency: {enabled: true,  weight: 1.0}
-      # gate: {enabled: false}
-    # gate 不写 = 用默认（enabled: true + 默认阈值）；
-    # 写成 {enabled: false} 就整块关掉，纯看事实一致性分。
+      rouge_l: {enabled: false, weight: 0.0}
+      fact_consistency:
+        enabled: true
+        weight: 1.0
+        element_weights:      # 六要素内部权重：键固定六个，之和必须为 1
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
+    # gate 不写 = 默认开启（格式不过关直接 0 分）；要关掉写 gate: {enabled: false}
 
+  # SFT 基线锚：需要 prompt 池里带 sft_output，现在的池子没有，保持关闭
+  anchor:
+    enabled: false
+    slack: 0.05
+
+# ---- 裁判（模型 B）：卡 1，4-bit，完全冻结 ----
 semantic:
-  dtype: float16                 # T4 是 Turing，不支持 bf16
+  backend: fact
+  model: Qwen/Qwen2.5-7B-Instruct   # 离线机器改成本地目录
+  trust_remote_code: false
+  device: cuda:1
+  dtype: float16                    # 和策略一样：T4 不支持 bf16
   bnb_4bit_compute_dtype: float16
   load_in_4bit: true
-  device: cuda:1                 # 裁判钉卡 1，策略在卡 0
   max_batch_size: 4
-  extract_max_new_tokens: 768
-  model: Qwen/Qwen2.5-7B-Instruct
-  trust_remote_code: false
+  extract_max_new_tokens: 768       # 截断会自动用双倍预算重试
+  min_document_elements: 2
+  doc_fallback: true
 
 tracking:
-  backend: none                  # 先不联网；要面板就改成 swanlab
+  backend: none                     # 先不联网；要面板就改成 swanlab
+  project: sfzy

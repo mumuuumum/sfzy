@@ -191,6 +191,10 @@ GRPO_METRICS: Dict[str, Tuple[str, str]] = {
     "term_fact_consistency_group_std": (
         "reward/fact_consistency_group_std", "★ 事实一致性项的组内标准差",
     ),
+    "term_element_coverage": ("reward/element_coverage", "关键要素覆盖率项均值（候选对人工摘要的覆盖）"),
+    "term_element_coverage_group_std": (
+        "reward/element_coverage_group_std", "★ 覆盖率项的组内标准差",
+    ),
     "gating_rate": ("reward/gate_rate", "被门控拦下的比例；高 = 问题在生成不在奖励"),
     # ---- 组与优势：GRPO 特有的诊断 ----
     "advantage_abs_mean": ("group/advantage_abs_mean", "|优势| 均值；≈0 = 整组没方差"),

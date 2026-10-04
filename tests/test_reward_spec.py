@@ -163,6 +163,35 @@ def test_rouge_l没有内部权重字段():
         spec({"fact_consistency": {**fact_term(), "weights": dict(ELEMENT_WEIGHTS)}})
 
 
+# ---------------------------------------------------------------- 两个 judge 项
+
+def test_两个judge项各有各的内部权重():
+    s = spec({
+        "fact_consistency": fact_term(weight=0.6),
+        "element_coverage": {"enabled": True, "weight": 0.4,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+    })
+    assert s.required_signals == {"fact_consistency", "element_coverage"}
+    assert set(s.judge_term_options()) == {"fact_consistency", "element_coverage"}
+    assert s.normalized_weights() == {
+        "fact_consistency": pytest.approx(0.6), "element_coverage": pytest.approx(0.4),
+    }
+
+
+def test_启用覆盖率却没写内部权重要报错():
+    with pytest.raises(RewardConfigError, match="element_weights"):
+        spec({"fact_consistency": fact_term(),
+              "element_coverage": {"enabled": True, "weight": 0.5}})
+
+
+def test_覆盖率的内部权重和也必须为1():
+    bad = dict(ELEMENT_WEIGHTS)
+    bad["court_facts"] = 0.50
+    with pytest.raises(RewardConfigError, match="之和必须为 1"):
+        spec({"element_coverage": {"enabled": True, "weight": 1.0,
+                                   "element_weights": bad}})
+
+
 def test_未知字段要报错():
     with pytest.raises(RewardConfigError, match="不认识的字段"):
         spec({"rouge_l": {"enabled": True, "weight": 1.0, "typo": 1}})
@@ -262,3 +291,17 @@ def test_a100配置用bf16全精度裁判():
     cfg = _load("grpo_fact_only_a100.yaml")
     assert cfg.path_("semantic.dtype") == "bfloat16"
     assert cfg.path_("semantic.load_in_4bit") is False
+
+
+@pytest.mark.parametrize("name", ["grpo_fact_coverage_t4.yaml", "grpo_fact_coverage_a100.yaml"])
+def test_合并配置同时开两个reward(name):
+    cfg = _load(name)
+    s = RewardSpec.from_config(cfg.path_("rl.reward"))
+    assert [t.name for t in s.enabled_terms] == ["fact_consistency", "element_coverage"]
+    assert s.normalized_weights() == {
+        "fact_consistency": pytest.approx(0.7), "element_coverage": pytest.approx(0.3),
+    }
+    assert s.required_signals == {"fact_consistency", "element_coverage"}
+    # 两个 reward 的内部权重都是配置给的那一份
+    for term in s.enabled_terms:
+        assert term.options["element_weights"] == ELEMENT_WEIGHTS

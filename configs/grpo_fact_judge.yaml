@@ -1,151 +1,118 @@
-defaults: sft_cloud
-
-# GRPO：事实一致性 Judge 作奖励 —— **双卡分居方案**。
+# ============================================================================
+# GRPO：事实一致性 + ROUGE —— 通用版（2× 24GB，例如 4090）
 #
-#   RTX 4090 #0（24GB）  策略：ChatGLM3-6B 4-bit NF4 冻结 + 可训练 LoRA
-#                        + 优化器 + 激活 + rollout
-#   RTX 4090 #1（24GB）  裁判：Qwen2.5-7B-Instruct 4-bit NF4，完全冻结
-#                        只做 inference，批量评价 candidate
+#   GPU0  策略：ChatGLM3-6B 4-bit NF4（冻结）+ LoRA + 优化器 + rollout
+#   GPU1  裁判：Qwen2.5-7B-Instruct 4-bit NF4（冻结，只做 inference）
 #
-# 这是 GRPO 唯一的奖励口径：`rl.reward.mode = fact_judge`
-# （门控 + 六要素 Judge 加权分 + ROUGE-L）。rouge_only / flat / gated /
-# gated_judge 四种旧模式与点式/排序/API/缓存裁判后端均已删除。
+# 这份配置**自包含**：不继承任何其它 yaml。T4 / A100 的版本见
+# configs/grpo_fact_only_*.yaml 与 configs/grpo_fact_coverage_*.yaml。
 #
-# 上线前务必先过验收：
-#   python scripts/judge_probe.py  --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
-#       --device cuda:1 --load-in-4bit
-#   python scripts/judge_test.py   --model /root/autodl-tmp/models/Qwen2.5-7B-Instruct \
-#       --device cuda:1 --load-in-4bit \
+# 上线前先过裁判验收（判据不达标就只是噪声）：
+#   python scripts/judge_probe.py --model <裁判模型> --device cuda:1 --load-in-4bit
+#   python scripts/judge_test.py  --model <裁判模型> --device cuda:1 --load-in-4bit \
 #       --cases data/judge/fact_cases.jsonl
-# 三条判据（good > bad > core、每个文档内 A/B 都高于 C~G）全过才接 GRPO，
-# 否则奖励只是噪声。
+#
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml
+# ============================================================================
 
-model_config: configs/model_chatglm3_6b_nf4.yaml
+seed: 42
+device: auto
+
+data_config: configs/data_splits.yaml
+
+model:
+  model_name_or_path: /root/autodl-tmp/chatglm3-6b   # 换成你机器上的路径
+  trust_remote_code: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+  torch_dtype: bfloat16
+  device_map: {"": 0}
+  max_length: 4096
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0                # RL 必须关掉（见 grpo_fact_only_t4.yaml 的说明）
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
 
 rl:
   output_dir: outputs/grpo_chatglm3
   prompt_style: structured
   prompt_file: data/splits/rl_prompts.jsonl
-  # GRPO 的起点（SFT 产出的 LoRA checkpoint）。写在这里，
-  # `python scripts/train_grpo.py --config <本文件>` 就不用再传 --sft-adapter。
-  sft_adapter: outputs/sft_chatglm3/step_000336.pt
+  sft_adapter: outputs/sft_chatglm3/step_000336.pt   # 换成你机器上的路径
+  limit_prompts: null
 
-  # 策略底座走 4-bit NF4（对应 model_config 里的 load_in_4bit）。
-  # 等价于在命令行加 --quantize，但写进配置更不容易忘。
   quantize: true
 
-  # ==================== rollout（2× RTX 4090 24GB 的推荐值）====================
-  # 每条 prompt 采 G 条。G 越大组内基线越稳，但**显存和耗时都线性涨**
-  # （一次要前向 prompts_per_step × G 条序列）。
-  #
-  # 为什么是 4 而不是 8：实测 8 × seq_len 4096 的单次前向在 24GB 上直接 OOM
-  # （`scripts/check_memory.py --batch-size 8 --seq-len 4096`，卡在 fp32 的
-  # LoRA 旁路上）。要上 8 必须先量：
-  #     python scripts/check_memory.py --config configs/model_chatglm3_6b_nf4.yaml \
-  #         --batch-size 8 --seq-len 2432
-  # 判据写在那个脚本里：backward 后余量 < 1GiB 就别用。
   group_size: 4
-  prompts_per_step: 1          # 每步 1×4=4 条序列；显存不够先降这个再降 G
-  max_length: 2048             # 源文档 token 中位数 ≈2000；截断的是尾部
-  max_new_tokens: 384          # 参考摘要中位数 293 字，够用；它直接加在 L 上
-  temperature: 0.9             # 要有方差才能算出 advantage，别调低
+  prompts_per_step: 1
+  max_length: 2048
+  max_new_tokens: 384
+  temperature: 0.9
   top_p: 0.95
 
-  # ==================== 显存与稳定性（这两项是关键）====================
-  # 梯度检查点：不生效的话激活按「每层完整保存」算，24GB 也不够。
-  # 注意它生效的前提是**模型处在 train 模式**（HF 的 from_pretrained 默认给
-  # eval），trainer 里已经显式切了，这里写出来是防止有人又改回去。
   gradient_checkpointing: true
-  # 策略 logprob 前向的批内切分。只压**瞬时**峰值（不减少最终保留的激活
-  # 总量），但正是那一瞬时会 OOM。1 最省显存，2 快一些。
   logprob_micro_batch: 2
 
-  # ==================== 算法 ====================
   clip_ratio: 0.2
-  kl_coef: 0.0                 # 要做对照：0.0 / 0.01 / 0.05 各跑一遍
-  length_norm: sqrt            # 输出长度差 13 倍，必须归一化
+  kl_coef: 0.0                # 要做对照：0.0 / 0.01 / 0.05 各跑一遍
+  length_norm: sqrt
   learning_rate: 1.0e-5
   max_grad_norm: 1.0
   grad_accum_steps: 1
 
-  # ==================== 存档与日志 ====================
-  save_every_n_steps: 25       # 500 步的 run 存 20 次，够回滚
+  save_every_n_steps: 25
   keep_last_n_checkpoints: 2
   log_every_n_steps: 1
   resume_from: null
 
+  # ---- 奖励 ----
   reward:
-    # 多 reward：每个 term 可以单独开关，权重按启用项归一到 1。
-    # ★ 所有权重都只在这里指定：term 的权重是 terms.<名字>.weight，
-    #   term 内部的权重是 terms.<名字>.<内部字段>，代码里不存默认值。
     normalize_weights: true
     terms:
-      rouge_l:
-        enabled: true
-        weight: 0.3              # 官方评测口径的锚
+      rouge_l: {enabled: true, weight: 0.3}      # 官方评测口径的锚
       fact_consistency:
         enabled: true
-        weight: 0.7              # ★ 六要素事实一致性 Judge
-        # 这个 reward **内部**的六要素权重（键固定六个，之和必须为 1）
+        weight: 0.7
         element_weights:
-          case_type:          0.05   # 案件类型
-          plaintiff_claims:   0.15   # 原告诉讼请求
-          defendant_defenses: 0.10   # 被告辩称
-          court_facts:        0.25   # 法院查明事实
-          legal_basis:        0.15   # 法律依据
-          judgment_result:    0.30   # 裁判结果
-    # gate 不写就用默认（enabled: true + 默认阈值）；写成 {enabled: false} 可整块关掉
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
+      # 关键要素覆盖率：要启用就把 enabled 改成 true，并把 weight 调好
+      element_coverage:
+        enabled: false
+        weight: 0.3
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.10
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.30
 
-  # SFT 基线锚：需要 prompt 池带 sft_output，现在的 rl_prompts.jsonl 没有，
-  # 保持关闭；要开就先按 tools/select_rl_prompts.py --triples 重新生成池子。
   anchor:
     enabled: false
     slack: 0.05
 
-# ==================== LoRA ====================
-# 只覆盖 dropout，r/alpha/target_modules 沿用 sft_cloud（必须和 SFT 一致，
-# 否则载入 SFT 权重时会 shape mismatch）。
-lora:
-  # ★ RL 必须关掉 dropout（SFT 那边是 0.05）。
-  # 原因：old_logprobs 和策略 logprobs 是**背靠背两次前向**，权重完全没变，
-  # ratio 本应恒等于 1、裁剪率恒为 0。dropout 开着时两次前向的 mask 不同，
-  # 序列级 logprob 是几百个 token 的和，差值被放大 —— 实测 step 1 的裁剪率
-  # 直接飙到 50%，一半的梯度信号被 PPO 的保守裁剪吃掉。
-  # 判断标准很简单：改完 step 1 的 clip 应该 ≈ 0%。
-  dropout: 0.0
-
 semantic:
   backend: fact
-  # 裁判模型：Qwen2.5-7B-Instruct。仓库里已带 models/Qwen2.5-1.5B-Instruct，
-  # 想先用小模型验接线就换成它（判定力较弱，见 docs/fact_judge.md 第 2 节）。
-  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct
-  device: cuda:1               # ★ 裁判钉卡 1，策略吃卡 0
-  dtype: bfloat16              # 4090 支持 bf16；T4（Turing）要改 float16
-
-  # ---- 裁判侧 4-bit NF4（完全冻结、只做 inference）----
+  model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct   # 换成你机器上的路径
+  trust_remote_code: false
+  device: cuda:1
+  dtype: bfloat16
   load_in_4bit: true
   bnb_4bit_compute_dtype: bfloat16
-  trust_remote_code: false     # Qwen2.5 是官方架构，不需要远程代码
+  max_batch_size: 8
+  extract_max_new_tokens: 1024
+  min_document_elements: 2
+  doc_fallback: true
 
-  # ---- backend=fact 时用（都有合理默认值，这里显式写出来方便调）----
-  max_batch_size: 8            # 6 要素 × G 候选组成的 batch 上限（一次前向）
-  extract_max_new_tokens: 1024 # 六要素提取的生成预算；截断会自动用双倍重试
-  min_document_elements: 2     # 抽到的要素少于这个数直接报错（奖励会恒 0）
-  judge_variant: spec          # 判定 Prompt 版本：spec（需求原文）/ fewshot
-  doc_fallback: true           # 要素抽空时拿整篇原文兜底判定，避免反向梯度
-
-# ==================== 实验跟踪（swanlab）====================
-# 训练时看什么、每个指标怎么读：见 src/sfzy/utils/tracking.py 的 GRPO_METRICS。
-# 上报的键会带 `/<分组>` 前缀，面板上自动分成
-#   train/  reward/  group/  judge/  length/
-# 五块；history 里仍是原始键名，离线分析不受影响。
-#
-# 首次使用要先登录一次（或把 key 写进环境变量）：
-#     pip install swanlab -i https://pypi.tuna.tsinghua.edu.cn/simple
-#     swanlab login            # 交互式，key 存到 ~/.swanlab
-#     # 或者：export SWANLAB_API_KEY=xxx
-# 完全没有外网时用离线模式，跑完再把目录上传：
-#     export SWANLAB_MODE=offline
 tracking:
-  backend: swanlab             # none | swanlab | wandb
+  backend: swanlab
   project: sfzy
