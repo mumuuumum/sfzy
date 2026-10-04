@@ -3,7 +3,7 @@ defaults: base
 # 正式实验的底座模型（Kaggle 2x T4 上运行）
 model:
   # model_name_or_path: THUDM/chatglm3-6b
-  model_name_or_path: /kaggle/input/models/marquis03/chatglm3/transformers/6b/1
+  model_name_or_path: THUDM/chatglm3-6b
   # ChatGLM3 自带建模代码，必须开启；这也是它比 Qwen 多踩坑的原因
   trust_remote_code: true
 

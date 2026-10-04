@@ -69,8 +69,7 @@ semantic:
   device: cuda:1                 # 裁判钉卡 1，策略在卡 0
   max_batch_size: 4
   extract_max_new_tokens: 768
-  # model: Qwen/Qwen2.5-7B-Instruct
-  model: /kaggle/input/models/arpit1bansal/qwen-2.5-7b-instruct/transformers/default/1
+  model: Qwen/Qwen2.5-7B-Instruct
   trust_remote_code: false
 
 tracking:
