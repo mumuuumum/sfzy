@@ -45,7 +45,7 @@ rl:
 
   group_size: 4
   prompts_per_step: 1
-  max_length: 1536
+  max_length: 2048
   max_new_tokens: 320
   temperature: 0.9
   top_p: 0.95
@@ -75,21 +75,21 @@ rl:
         weight: 0.7
         element_weights:
           case_type:          0.05
-          plaintiff_claims:   0.15
-          defendant_defenses: 0.10
+          plaintiff_claims:   0.20
+          defendant_defenses: 0.15
           court_facts:        0.25
           legal_basis:        0.15
-          judgment_result:    0.30
+          judgment_result:    0.20
       element_coverage:
         enabled: true
         weight: 0.3
         element_weights:
           case_type:          0.05
-          plaintiff_claims:   0.15
-          defendant_defenses: 0.10
+          plaintiff_claims:   0.20
+          defendant_defenses: 0.15
           court_facts:        0.25
           legal_basis:        0.15
-          judgment_result:    0.30
+          judgment_result:    0.20
 
   anchor:
     enabled: false

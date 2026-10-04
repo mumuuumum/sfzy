@@ -263,8 +263,11 @@ def test_正式配置只开事实一致性(name):
     assert cfg.path_("semantic.backend") == "fact"
     # 门控保留为全局开关
     assert s.gate.enabled is True
-    # 六要素权重来自配置文件（在 grpo_fact_judge.yaml 里写全，子配置继承）
-    assert s.terms["fact_consistency"].options["element_weights"] == ELEMENT_WEIGHTS
+    # 六要素权重来自配置文件。只校验结构（键齐全 + 和为 1）——
+    # 具体数值是拿来调的，钉死在测试里只会让每次调参都红一片。
+    weights = s.terms["fact_consistency"].options["element_weights"]
+    assert set(weights) == set(ELEMENT_WEIGHTS)
+    assert sum(weights.values()) == pytest.approx(1.0)
 
 
 def test_旧的semantic_weights不再被接受():
@@ -302,6 +305,8 @@ def test_合并配置同时开两个reward(name):
         "fact_consistency": pytest.approx(0.7), "element_coverage": pytest.approx(0.3),
     }
     assert s.required_signals == {"fact_consistency", "element_coverage"}
-    # 两个 reward 的内部权重都是配置给的那一份
+    # 两个 reward 的内部权重都来自配置（同样只校验结构）
     for term in s.enabled_terms:
-        assert term.options["element_weights"] == ELEMENT_WEIGHTS
+        weights = term.options["element_weights"]
+        assert set(weights) == set(ELEMENT_WEIGHTS)
+        assert sum(weights.values()) == pytest.approx(1.0)

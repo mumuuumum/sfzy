@@ -129,8 +129,13 @@ def reference_model_context(model: Any) -> Iterator[Any]:
     非 LoRA 模型（没有 disable_adapter）时应当直接 yield model 不做任何事，
     这样同一个函数能同时服务两种场景。有测试会检查这一点。
     """
-    # TODO
-    raise NotImplementedError("TODO: 实现 reference_model_context")
+    disable = getattr(model, "disable_adapter", None)
+    if not callable(disable):
+        # 全参数微调：模型本身就是参考模型，什么都不用做
+        yield model
+        return
+    with disable():
+        yield model
 
 
 def dpo_loss(
@@ -175,8 +180,10 @@ def dpo_loss(
     **数值稳定性。**
     用 F.logsigmoid 而不是手写 -log(1+exp(-x))，前者在 |x| 很大时不会溢出。
     """
-    # TODO
-    raise NotImplementedError("TODO: 实现 dpo_loss")
+    chosen_reward = beta * (policy_chosen_logps - reference_chosen_logps)
+    rejected_reward = beta * (policy_rejected_logps - reference_rejected_logps)
+    loss = -F.logsigmoid(chosen_reward - rejected_reward).mean()
+    return loss, chosen_reward, rejected_reward
 
 
 def evaluate_preference_accuracy(
@@ -187,5 +194,6 @@ def evaluate_preference_accuracy(
     这是 DPO 最直观的监控指标，会进 history 和 tracker。
     随机猜测是 0.5，收敛良好通常能到 0.7 以上。
     """
-    # TODO
-    raise NotImplementedError("TODO: 实现 evaluate_preference_accuracy")
+    if chosen_rewards.numel() == 0:
+        return float("nan")
+    return float((chosen_rewards > rejected_rewards).float().mean().item())

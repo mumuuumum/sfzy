@@ -115,3 +115,11 @@ CUDA_VISIBLE_DEVICES=1 python scripts/generate_triples_vllm.py ... --shard 1/2
   这点数值差异不影响结论；不要把两份文件当作可精确对比的复现实验。
 * 之前用 HF 生成的 `sft_val.jsonl` / `sft_test.jsonl` 可以继续用。
   vLLM 只为 train 生成即可（默认就是同一个输出路径，id 不会重复）。
+
+## 五、给 val 三元组打奖励分（验证 reward 设计）
+
+生成了 `sft_val_shard*of2.jsonl` 之后，用
+`scripts/score_reward_vllm.py` 在两张 T4 上各打一个分片，比较**候选摘要
+（output）**和**人工摘要（reference）**的奖励分。同样是 vLLM 裁判、同样
+直接把 token id 喂给 vLLM。跑法和 T4 的显存注意事项见
+`docs/vllm_reward_eval.md`。
