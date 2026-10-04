@@ -109,11 +109,24 @@ CUDA_VISIBLE_DEVICES=1 python scripts/score_reward_vllm.py \
 等两个进程都结束后，产物在 `data/judge/`：
 
 ```
-data/judge/sft_val_shard0of2.reward.jsonl          每行一条记录的一臂奖励
-data/judge/sft_val_shard0of2.reward.summary.json   两臂均值 / 胜负率 / 门控率
+data/judge/sft_val_shard0of2.reward.jsonl          每行一条记录的一臂奖励 / ROUGE
+data/judge/sft_val_shard0of2.reward.summary.json   两条结论的检验结果 + 分项统计
+data/judge/sft_val_shard0of2.reward.report.md      人读报告（结论 + 支撑数据）
 data/judge/sft_val_shard1of2.reward.jsonl
 data/judge/sft_val_shard1of2.reward.summary.json
+data/judge/sft_val_shard1of2.reward.report.md
 ```
+
+两个分片跑完后，把逐条结果合成一份**全量**总报告（纯 CPU，几秒，不加载裁判）：
+
+```bash
+python scripts/score_reward_vllm.py --merge \
+    data/judge/sft_val_shard0of2.reward.jsonl \
+    data/judge/sft_val_shard1of2.reward.jsonl
+# -> data/judge/merged.reward.summary.json / merged.reward.report.md / merged.reward.jsonl
+```
+
+最终对外汇报用这份 `merged.reward.report.md`，各分片的报告留作排查。
 
 ### 常用参数
 
@@ -139,29 +152,67 @@ CUDA_VISIBLE_DEVICES=0 python scripts/score_reward_vllm.py \
 
 ## 四、怎么读结果
 
-每个 `*.reward.summary.json` 里最关键的是：
+脚本会验证并输出**两条结论**。`*.reward.report.md` 是给人看的版本，
+`*.reward.summary.json` 里的 `conclusions` 是同一份数据的机器可读版。
+
+### 结论 1：候选摘要的奖励一般比人工摘要小
+
+同一篇文书上做配对比较（人工奖励 − 候选奖励），判据是：
+
+- 配对差均值 > 0，且人工胜多于负；
+- **符号检验**（精确二项，双侧）p < 0.05 → 判定成立。
+
+用符号检验而不是只看均值，是因为"一般更小"本质是个方向性命题；t 检验也一起
+报了，但当样本量小（`--limit`）时它的正态近似偏乐观，不作为判定依据。
 
 ```json
 {
-  "delta_reward(human-candidate)": 0.13,
-  "human_win_rate": 0.94,
-  "verdict": "✓ reward 能稳定把人工摘要排在候选之上，设计合理"
+  "candidate_reward_lt_human_reward": {
+    "mean_delta": 0.13, "win_rate": 0.94,
+    "sign_test_p": 1.2e-40, "p_value": 3e-42,
+    "pass": true,
+    "verdict": "✓ 成立：候选摘要奖励显著低于人工摘要"
+  }
 }
 ```
 
-判定标准：
+### 结论 2：候选的 reward 与 ROUGE 正相关
 
-* **Δ > 0 且胜率 ≥ 0.9**：reward 有判别力，可以接 GRPO；
-* **Δ > 0 但胜率 0.7 ~ 0.9**：方向对但偏弱，去看分项 —— 通常是
-  `mean_fact_consistency` 或 `mean_element_coverage` 两臂差距太小，或
-  `gate_rate` 把人工摘要误伤（人工摘要没有"判决如下"这类结果标记时会这样）；
-* **Δ ≤ 0**：reward 把人工摘要排到了候选下面，接 GRPO 只会得到噪声梯度，
-  必须重修提示词或权重。
+对每条记录取候选摘要的 `reward` 和它相对人工摘要的 `rouge-l-f`，跨文书算
+Pearson 和 Spearman：
+
+- Spearman ρ > 0 且 p < 0.05 → 判定成立。
+
+主口径是**真正进训练的 gated reward**；同时报告 `reward_ungated`（不含门控）
+的口径，用来判断相关性是不是被门控的一堆 0 分"制造"出来的。ROUGE 是官方
+评测口径，reward 若和它反向，优化目标就和最终指标打架。
+
+```json
+{
+  "reward_rouge_positive_correlation": {
+    "primary": "reward(含门控) vs rouge-l-f",
+    "gated":   {"n": 670, "pearson": 0.41, "spearman": 0.44, "spearman_p": 1e-30},
+    "ungated": {"n": 670, "pearson": 0.52, "spearman": 0.55, "spearman_p": 1e-50},
+    "pass": true,
+    "verdict": "✓ 成立：候选 reward 与 ROUGE-L 显著正相关"
+  }
+}
+```
+
+### 总判定与排查
+
+- 两条都成立 → `verdict` 为「✓ 两条结论都成立」，可以接 GRPO；
+- 只有一条成立 → 去看报告里的分项：结论 1 弱通常是
+  `mean_fact_consistency` / `mean_element_coverage` 两臂差距太小，或
+  `gate_rate` 误伤人工摘要（人工摘要没有"判决如下"这类结果标记时会这样）；
+  结论 2 弱通常是 reward 被门控的 0 分主导，或裁判分与 ROUGE 系统性相悖；
+- 两条都不成立 → reward 没有判别力，接 GRPO 只会得到噪声梯度。
 
 逐条 `*.reward.jsonl` 里每行是 `arm=candidate|human` 的一条，字段包括
 `reward`（含门控）、`reward_ungated`（不含门控）、`terms`（各分项）、
-`fact_raw`（六要素 0-4 原始分）、`element_coverage`、`gate_reason`。要定位
-"是哪一篇文书、哪个要素判反了"，直接看这一列。
+`rouge`（rouge-1/2/l 的 p/r/f 与 overall）、`rouge_l`、`fact_raw`（六要素
+0-4 原始分）、`element_coverage`、`gate_reason`。要定位"是哪一篇文书、哪个
+要素判反了"，直接看这一列。
 
 ## 五、和 HF 版的关系
 

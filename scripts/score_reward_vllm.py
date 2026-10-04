@@ -1,16 +1,24 @@
 """用 vLLM 版六要素 Judge 给 val 三元组离线打「完整奖励」分（候选 vs 人工）。
 
-============================ 这个脚本回答什么问题 ============================
+============================ 这个脚本要验证的两条结论 ============================
 `data/triples/sft_val_shard*of2.jsonl` 每行是
 
     {"id", "source"(文书原文), "reference"(人工摘要), "output"(SFT 候选摘要)}
 
-我们要验证 GRPO 的 reward 设计是否合理，判据是：
+用同一套 reward 给两臂打分（候选臂 candidate=output；人工臂 candidate=reference），
+然后验证两条结论：
 
-    **人工摘要（reference）拿到的奖励，应该稳定高于模型候选（output）。**
+  结论 1  **候选摘要的奖励一般比人工摘要小。**
+          配对差（人工 − 候选）> 0、胜率 > 0.5，且配对 t 检验 p < 0.05。
+          不成立就说明 reward 没有判别力，接进 GRPO 只是噪声梯度。
 
-如果 reward 把人工摘要排在候选下面，或两者几乎没差距，那这个 reward 就
-没有判别力，接进 GRPO 只会得到噪声梯度。这个脚本就是先把这条基线量出来。
+  结论 2  **不同候选摘要之间，reward 与 ROUGE 分数正相关。**
+          跨文书对「候选的 reward」和「候选 vs 人工摘要的 ROUGE-L F1」算
+          Pearson / Spearman，要求 ρ > 0 且 p < 0.05。ROUGE 是官方评测口径，
+          reward 若和它反向，优化目标就和最终指标打架。
+
+两条结论连同支撑数据（均值、配对检验、相关系数、分项均值）都会落到
+`*.summary.json` 和一份人读的 `*.report.md` 里。
 
 ============================ 和训练是同一个口径 ============================
 奖励完全走训练那条路径：
@@ -87,10 +95,17 @@ Qwen2.5-7B 的 fp16 权重约 15GB，单张 T4（16GB）装不下，所以必须
 
 输出（默认 `data/judge/`）：
 
-  * `<stem>.reward.jsonl`：每行一条记录的一臂奖励与分项；
-  * `<stem>.reward.summary.json`：两臂均值、分项均值、胜负率、门控率。
+  * `<stem>.reward.jsonl`：每行一条记录的一臂奖励、分项与 ROUGE；
+  * `<stem>.reward.summary.json`：两臂均值、分项均值、两条结论的检验结果；
+  * `<stem>.reward.report.md`：把上面两条结论和支撑数据写成可读报告。
 
 支持断点续跑（输出里已有的 id 跳过）、`--limit`、多个 `--input`。
+
+两个分片跑完后，把逐条结果合成一份全量总报告（纯 CPU，不加载裁判）：
+
+    python scripts/score_reward_vllm.py --merge \
+        data/judge/sft_val_shard0of2.reward.jsonl \
+        data/judge/sft_val_shard1of2.reward.jsonl
 """
 
 from __future__ import annotations
@@ -108,6 +123,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                          # noqa: E402
+from sfzy.eval.rouge import score_pair                       # noqa: E402
 from sfzy.rl.reward import compute_reward                    # noqa: E402
 from sfzy.rl.reward_spec import RewardSpec                   # noqa: E402
 from sfzy.utils.logging import get_logger                    # noqa: E402
@@ -122,6 +138,21 @@ from sfzy.judge.schema import (                              # noqa: E402
 )
 
 logger = get_logger("score_reward_vllm")
+
+_ROUGE_WARNED = False
+
+
+def _warn_rouge_once(exc: Exception) -> None:
+    """ROUGE 全线失败时说清楚原因，别让结论 2 静默变成“样本不足”。"""
+    global _ROUGE_WARNED
+    if _ROUGE_WARNED:
+        return
+    _ROUGE_WARNED = True
+    logger.warning(
+        "计算 ROUGE 失败（结论 2 会因此缺数据）：%s: %s。"
+        "最常见的原因是 rouge_mode=jieba 但环境里没装 jieba —— pip install jieba。",
+        type(exc).__name__, exc,
+    )
 
 
 def resolve(path: Any) -> Path:
@@ -478,6 +509,24 @@ def score_chunk(
             except Exception as exc:  # noqa: BLE001
                 error = f"{type(exc).__name__}: {exc}"
 
+        # ROUGE 始终独立计算一遍：它是“结论 2”的自变量，不能依赖它是否被
+        # 配成 reward 项（覆盖率的配置里 rouge_l 是关掉的）。人工臂的候选就是
+        # 人工摘要本身，ROUGE 自然是 1.0。
+        rouge: Dict[str, float] = {}
+        if entry["candidate"].strip() and entry["reference"].strip():
+            try:
+                rouge = {
+                    key: round(float(value), 6)
+                    for key, value in score_pair(
+                        entry["candidate"].strip(),
+                        entry["reference"].strip(),
+                        mode=spec.rouge_mode,
+                    ).items()
+                }
+            except Exception as exc:  # noqa: BLE001 — ROUGE 失败不该毁掉 reward
+                _warn_rouge_once(exc)
+                rouge = {}
+
         rows.append({
             "id": entry["id"],
             "arm": entry["arm"],
@@ -486,6 +535,8 @@ def score_chunk(
             "gated": gated,
             "gate_reason": gate_reason,
             "terms": terms,
+            "rouge": rouge,
+            "rouge_l": rouge.get("rouge-l-f"),
             "fact_consistency": (fact_result.weighted_reward if fact_result else None),
             "min_element_score": (fact_result.min_element_score if fact_result else None),
             "judgment_result_score": (
@@ -568,11 +619,123 @@ def _mean(values: Sequence[Optional[float]]) -> Optional[float]:
     return sum(clean) / len(clean) if clean else None
 
 
+def _median(values: Sequence[Optional[float]]) -> Optional[float]:
+    clean = sorted(v for v in values if v is not None)
+    if not clean:
+        return None
+    mid = len(clean) // 2
+    return clean[mid] if len(clean) % 2 else (clean[mid - 1] + clean[mid]) / 2.0
+
+
+# ---------------------------------------------------------------------------
+# 相关性与配对检验（纯标准库，不依赖 scipy / numpy）
+# ---------------------------------------------------------------------------
+def _pearson(xs: Sequence[float], ys: Sequence[float]) -> Optional[float]:
+    n = len(xs)
+    if n < 2 or n != len(ys):
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxx = sum((x - mx) ** 2 for x in xs)
+    syy = sum((y - my) ** 2 for y in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    return sxy / math.sqrt(sxx * syy)
+
+
+def _rank_avg(values: Sequence[float]) -> List[float]:
+    """平均秩（并列取平均），Spearman 用它替换原值。"""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(order):
+        j = i
+        while j + 1 < len(order) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    return ranks
+
+
+def _fisher_z_p(r: Optional[float], n: int) -> Optional[float]:
+    """Fisher z 变换的正态近似双侧 p 值（n 大时与 t 检验几乎一致）。"""
+    if r is None or n < 4:
+        return None
+    if abs(r) >= 1.0:
+        # 完全相关，z 发散；样本量够就直接判显著（小样本会在 n<4 被拦掉）
+        return 0.0
+    z = math.atanh(r) * math.sqrt(n - 3)
+    return math.erfc(abs(z) / math.sqrt(2))
+
+
+def _corr_block(
+    xs: Sequence[Optional[float]], ys: Sequence[Optional[float]]
+) -> Dict[str, Any]:
+    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    n = len(pairs)
+    if n < 2:
+        return {"n": n, "pearson": None, "pearson_p": None,
+                "spearman": None, "spearman_p": None}
+    x = [p[0] for p in pairs]
+    y = [p[1] for p in pairs]
+    pearson = _pearson(x, y)
+    spearman = _pearson(_rank_avg(x), _rank_avg(y))
+    return {
+        "n": n,
+        "pearson": pearson,
+        "pearson_p": _fisher_z_p(pearson, n),
+        "spearman": spearman,
+        "spearman_p": _fisher_z_p(spearman, n),
+    }
+
+
+def _paired_delta_stats(deltas: Sequence[float]) -> Dict[str, Any]:
+    """配对差（人工 − 候选）的均值 / 显著性。"""
+    n = len(deltas)
+    if n == 0:
+        return {"n": 0, "mean_delta": None, "median_delta": None, "sd_delta": None,
+                "win": 0, "tie": 0, "lose": 0, "win_rate": None,
+                "t_stat": None, "p_value": None, "sign_test_p": None}
+    mean = sum(deltas) / n
+    sd = math.sqrt(sum((d - mean) ** 2 for d in deltas) / (n - 1)) if n > 1 else 0.0
+    win = sum(1 for d in deltas if d > 1e-9)
+    lose = sum(1 for d in deltas if d < -1e-9)
+    tie = n - win - lose
+    if n > 1 and sd > 0:
+        t_stat = mean / (sd / math.sqrt(n))
+        p_value = math.erfc(abs(t_stat) / math.sqrt(2))     # 正态近似双侧
+    else:
+        t_stat = None
+        p_value = 1.0 if mean == 0 else 0.0
+    return {
+        "n": n, "mean_delta": mean, "median_delta": _median(deltas), "sd_delta": sd,
+        "win": win, "tie": tie, "lose": lose, "win_rate": win / n,
+        "t_stat": t_stat, "p_value": p_value,
+        # 符号检验是精确的（不依赖正态假设），"候选一般比人工小"本质是符号命题，
+        # 所以判定用它、t 检验只作参考。
+        "sign_test_p": _sign_test_p(win, lose),
+    }
+
+
+def _sign_test_p(win: int, lose: int) -> Optional[float]:
+    """双侧二项精确检验（p=0.5），只看胜/负、忽略平局。"""
+    n = win + lose
+    if n == 0:
+        return None
+    k = min(win, lose)
+    tail = sum(math.comb(n, i) for i in range(k + 1))
+    # 用整数除法再转 float：tail 可能大到 1e300+，先乘 2.0 会溢出成 inf。
+    # Python 的 int/int 真除法会自己正确处理大整数，商 ≤ 1 一定可表示。
+    return min(1.0, 2 * tail / (2 ** n))
+
+
 def summarize(
     rows_by_id: Dict[str, Dict[str, Dict[str, Any]]],
     terms: Sequence[str],
 ) -> Dict[str, Any]:
-    """按 id 把两臂配对后统计。"""
+    """按 id 把两臂配对，产出两条待验证结论 + 分项统计。"""
     cand = [pair["candidate"] for pair in rows_by_id.values()]
     hum = [pair["human"] for pair in rows_by_id.values()]
     paired = [
@@ -593,20 +756,69 @@ def summarize(
             ),
             "mean_fact_consistency": _mean([a.get("fact_consistency") for a in ok]),
             "mean_element_coverage": _mean([a.get("element_coverage") for a in ok]),
-            "mean_rouge_l": _mean([a.get("terms", {}).get("rouge_l") for a in ok]),
+            "mean_rouge_l": _mean([a.get("rouge_l") for a in ok]),
+            "mean_rouge_overall": _mean(
+                [a.get("rouge", {}).get("overall") for a in ok]
+            ),
         }
         for term in terms:
-            out[f"mean_{term}"] = _mean([a.get("terms", {}).get(term) for a in ok])
+            key = f"mean_{term}"
+            # 别覆盖上面按信号直接算的那几个（terms 里缺键时会把它们冲成 None）
+            if key not in out:
+                out[key] = _mean([a.get("terms", {}).get(term) for a in ok])
         return out
 
-    wins = sum(1 for c, h in paired if h["reward"] > c["reward"] + 1e-9)
-    ties = sum(1 for c, h in paired if abs(h["reward"] - c["reward"]) <= 1e-9)
-    losses = len(paired) - wins - ties
     cand_stats, hum_stats = arm_stats(cand), arm_stats(hum)
     delta = None
     if cand_stats["mean_reward"] is not None and hum_stats["mean_reward"] is not None:
         delta = hum_stats["mean_reward"] - cand_stats["mean_reward"]
-    win_rate = wins / len(paired) if paired else None
+
+    # ---- 结论 1：候选摘要的奖励一般比人工摘要小（配对检验） ----
+    c1 = _paired_delta_stats([h["reward"] - c["reward"] for c, h in paired])
+    c1_pass = (
+        c1["n"] > 0
+        and c1["mean_delta"] is not None and c1["mean_delta"] > 0
+        and c1["win"] > c1["lose"]
+        and c1["sign_test_p"] is not None and c1["sign_test_p"] < 0.05
+    )
+    if c1["n"] == 0:
+        c1_verdict = "样本不足，无法判定"
+    elif c1_pass:
+        c1_verdict = "✓ 成立：候选摘要奖励显著低于人工摘要"
+    elif c1["mean_delta"] > 0 and c1["win"] > c1["lose"]:
+        c1_verdict = "△ 方向成立但不显著"
+    else:
+        c1_verdict = "✗ 不成立：候选奖励没有低于人工摘要"
+
+    # ---- 结论 2：候选的 reward 与 ROUGE 正相关（跨文书） ----
+    # 主口径用真正进训练的 gated reward；不含门控的那份一并报告，用来判断
+    # 相关性是不是被门控的一堆 0 分"制造"出来的。
+    corr_gated = _corr_block(
+        [a.get("reward") for a in cand], [a.get("rouge_l") for a in cand]
+    )
+    corr_ungated = _corr_block(
+        [a.get("reward_ungated") for a in cand], [a.get("rouge_l") for a in cand]
+    )
+    rho = corr_gated["spearman"]
+    c2_pass = (
+        corr_gated["n"] >= 3 and rho is not None and rho > 0
+        and corr_gated["spearman_p"] is not None and corr_gated["spearman_p"] < 0.05
+    )
+    if corr_gated["n"] < 3:
+        c2_verdict = "样本不足，无法判定"
+    elif c2_pass:
+        c2_verdict = "✓ 成立：候选 reward 与 ROUGE-L 显著正相关"
+    elif rho is not None and rho > 0:
+        c2_verdict = "△ 正相关但不显著"
+    else:
+        c2_verdict = "✗ 不成立：候选 reward 与 ROUGE-L 非正相关"
+
+    if c1_pass and c2_pass:
+        overall = "✓ 两条结论都成立"
+    elif c1_pass or c2_pass:
+        overall = "△ 只有一条结论成立"
+    else:
+        overall = "✗ 两条结论都不成立"
 
     return {
         "n_records": len(rows_by_id),
@@ -614,22 +826,23 @@ def summarize(
         "candidate": cand_stats,
         "human": hum_stats,
         "delta_reward(human-candidate)": delta,
-        "human_win": wins,
-        "tie": ties,
-        "human_lose": losses,
-        "human_win_rate": win_rate,
-        "verdict": _verdict(delta, win_rate),
+        "human_win": c1["win"],
+        "tie": c1["tie"],
+        "human_lose": c1["lose"],
+        "human_win_rate": c1["win_rate"],
+        "verdict": overall,
+        "conclusions": {
+            "candidate_reward_lt_human_reward": {**c1, "pass": c1_pass,
+                                                 "verdict": c1_verdict},
+            "reward_rouge_positive_correlation": {
+                "primary": "reward(含门控) vs rouge-l-f",
+                "gated": corr_gated,
+                "ungated": corr_ungated,
+                "pass": c2_pass,
+                "verdict": c2_verdict,
+            },
+        },
     }
-
-
-def _verdict(delta: Optional[float], win_rate: Optional[float]) -> str:
-    if delta is None or win_rate is None:
-        return "样本不足，无法判定"
-    if delta > 0 and win_rate >= 0.9:
-        return "✓ reward 能稳定把人工摘要排在候选之上，设计合理"
-    if delta > 0 and win_rate >= 0.7:
-        return "△ reward 方向正确但判别力偏弱，建议检查分项权重/门控"
-    return "✗ reward 未能把人工摘要排在候选之上，接 GRPO 前必须重修"
 
 
 def pair_rows(
@@ -672,7 +885,94 @@ def print_summary(title: str, stats: Dict[str, Any]) -> None:
             f"  人工胜 / 平 / 负 = {stats['human_win']} / {stats['tie']} / "
             f"{stats['human_lose']}（胜率 {stats['human_win_rate']:.1%}）"
         )
-    print(f"\n  结论：{stats['verdict']}")
+    _print_conclusions(stats)
+    print(f"\n  总判定：{stats['verdict']}")
+
+
+def _print_conclusions(stats: Dict[str, Any]) -> None:
+    if "conclusions" not in stats:
+        return
+    c1 = stats["conclusions"]["candidate_reward_lt_human_reward"]
+    print(f"\n  结论 1（候选奖励 < 人工奖励）：{c1['verdict']}")
+    print(f"    配对 n={c1['n']}  Δ均值={_fmt(c1['mean_delta'])}  "
+          f"胜率={_fmt(c1['win_rate'])}  符号检验 p={_fmt(c1['sign_test_p'])}  "
+          f"t 检验 p={_fmt(c1['p_value'])}")
+
+    c2 = stats["conclusions"]["reward_rouge_positive_correlation"]
+    g, u = c2["gated"], c2["ungated"]
+    print(f"\n  结论 2（候选 reward 与 ROUGE 正相关）：{c2['verdict']}")
+    print(f"    {c2['primary']}：n={g['n']}  Pearson r={_fmt(g['pearson'])}"
+          f"  Spearman ρ={_fmt(g['spearman'])}  p={_fmt(g['spearman_p'])}")
+    print(f"    不含门控 reward vs rouge-l-f：n={u['n']}  "
+          f"Pearson r={_fmt(u['pearson'])}  Spearman ρ={_fmt(u['spearman'])}  "
+          f"p={_fmt(u['spearman_p'])}")
+
+
+def _fmt(value: Optional[float], digits: int = 4) -> str:
+    return f"{value:.{digits}f}" if isinstance(value, float) else "-"
+
+
+def render_report(title: str, stats: Dict[str, Any]) -> str:
+    """把两条结论连同支撑数据写成 Markdown。"""
+    c, h = stats["candidate"], stats["human"]
+    c1 = stats["conclusions"]["candidate_reward_lt_human_reward"]
+    c2 = stats["conclusions"]["reward_rouge_positive_correlation"]
+    g, u = c2["gated"], c2["ungated"]
+
+    lines = [
+        f"# reward 设计验证报告：{title}",
+        "",
+        f"- 记录数：{stats['n_records']}（两臂都可用的配对 {stats['n_paired']}）",
+        f"- 输入：`{stats.get('input', '')}`",
+        f"- 逐条输出：`{stats.get('output', '')}`",
+        f"- 总判定：**{stats['verdict']}**",
+        "",
+        "## 结论 1：候选摘要的奖励一般比人工摘要小",
+        "",
+        f"**{c1['verdict']}**",
+        "",
+        "| 指标 | 候选(output) | 人工(reference) |",
+        "|---|---:|---:|",
+        f"| 奖励均值（含门控） | {_fmt(c['mean_reward'])} | {_fmt(h['mean_reward'])} |",
+        f"| 奖励均值（不含门控） | {_fmt(c['mean_reward_ungated'])} | "
+        f"{_fmt(h['mean_reward_ungated'])} |",
+        f"| 门控拦截率 | {_fmt(c['gate_rate'])} | {_fmt(h['gate_rate'])} |",
+        "",
+        f"- 配对差（人工 − 候选）：均值 {_fmt(c1['mean_delta'])}，"
+        f"中位数 {_fmt(c1['median_delta'])}，标准差 {_fmt(c1['sd_delta'])}",
+        f"- 配对胜负：胜 {c1['win']} / 平 {c1['tie']} / 负 {c1['lose']}"
+        f"（胜率 {_fmt(c1['win_rate'])}）",
+        f"- 符号检验（精确，双侧）：p={_fmt(c1['sign_test_p'])} ← 判定依据",
+        f"- 配对 t 检验（正态近似，双侧）：t={_fmt(c1['t_stat'])}，"
+        f"p={_fmt(c1['p_value'])}（参考）",
+        "",
+        "## 结论 2：候选的 reward 与 ROUGE 正相关",
+        "",
+        f"**{c2['verdict']}**",
+        "",
+        f"主口径：`{c2['primary']}`",
+        "",
+        "| 口径 | n | Pearson r | Pearson p | Spearman ρ | Spearman p |",
+        "|---|---:|---:|---:|---:|---:|",
+        f"| 含门控 reward | {g['n']} | {_fmt(g['pearson'])} | {_fmt(g['pearson_p'])} "
+        f"| {_fmt(g['spearman'])} | {_fmt(g['spearman_p'])} |",
+        f"| 不含门控 reward | {u['n']} | {_fmt(u['pearson'])} | {_fmt(u['pearson_p'])} "
+        f"| {_fmt(u['spearman'])} | {_fmt(u['spearman_p'])} |",
+        "",
+        "## 分项均值",
+        "",
+        "| 指标 | 候选(output) | 人工(reference) |",
+        "|---|---:|---:|",
+        f"| 事实一致性 | {_fmt(c['mean_fact_consistency'])} | "
+        f"{_fmt(h['mean_fact_consistency'])} |",
+        f"| 要素覆盖率 | {_fmt(c['mean_element_coverage'])} | "
+        f"{_fmt(h['mean_element_coverage'])} |",
+        f"| ROUGE-L F1 | {_fmt(c['mean_rouge_l'])} | {_fmt(h['mean_rouge_l'])} |",
+        f"| ROUGE overall | {_fmt(c['mean_rouge_overall'])} | "
+        f"{_fmt(h['mean_rouge_overall'])} |",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -731,9 +1031,54 @@ def run_input(
     summary_path.write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
     )
+    report_path = Path(str(out_path.with_suffix("")) + ".report.md")
+    report_path.write_text(render_report(path.name, stats), encoding="utf-8")
     print_summary(path.name, stats)
-    logger.info("逐条输出：%s\n汇总：%s", out_path, summary_path)
+    logger.info("逐条输出：%s\n汇总：%s\n报告：%s", out_path, summary_path, report_path)
     return stats
+
+
+def run_merge(args: argparse.Namespace) -> None:
+    """把多份 `*.reward.jsonl` 合成一份总报告（不加载裁判）。
+
+    两个分片是分别跑、分别落盘的，最终那两条结论要在**全量**上成立才有意义。
+    这个模式只读逐条结果、重新统计，所以 CPU 上几秒就能出总报告：
+
+        python scripts/score_reward_vllm.py --merge \
+            data/judge/sft_val_shard0of2.reward.jsonl \
+            data/judge/sft_val_shard1of2.reward.jsonl
+    """
+    rows: List[Dict[str, Any]] = []
+    inputs: List[str] = []
+    for raw in args.merge:
+        path = resolve(raw)
+        if not path.exists():
+            raise SystemExit(f"输入文件不存在：{path}")
+        rows.extend(load_records(path))
+        inputs.append(str(path))
+
+    rows_by_id = pair_rows(rows)
+    terms = sorted({key for row in rows for key in (row.get("terms") or {})})
+    stats = summarize(rows_by_id, terms)
+    stats["input"] = inputs
+
+    out_dir = resolve(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    merged_jsonl = out_dir / f"{args.merge_name}.reward.jsonl"
+    merged_jsonl.write_text(
+        "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
+        encoding="utf-8",
+    )
+    stats["output"] = str(merged_jsonl)
+    summary_path = out_dir / f"{args.merge_name}.reward.summary.json"
+    summary_path.write_text(
+        json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+    report_path = out_dir / f"{args.merge_name}.reward.report.md"
+    report_path.write_text(render_report(args.merge_name, stats), encoding="utf-8")
+
+    print_summary(f"{args.merge_name}（{len(inputs)} 个文件合并）", stats)
+    logger.info("合并输出：%s\n汇总：%s\n报告：%s", merged_jsonl, summary_path, report_path)
 
 
 def main() -> None:
@@ -742,8 +1087,12 @@ def main() -> None:
     )
     ap.add_argument("--config", default="configs/grpo_fact_coverage_t4.yaml",
                     help="读 rl.reward（奖励口径）和 semantic（裁判配置）")
-    ap.add_argument("--input", nargs="+", required=True,
+    ap.add_argument("--input", nargs="+", default=None,
                     help="三元组 jsonl（id/source/reference/output），可给多个")
+    ap.add_argument("--merge", nargs="+", default=None, metavar="REWARD_JSONL",
+                    help="合并多份 *.reward.jsonl 出一份总报告（不加载裁判，CPU 即可）")
+    ap.add_argument("--merge-name", default="merged",
+                    help="--merge 时的输出前缀，默认 merged")
     ap.add_argument("--out-dir", default="data/judge")
     ap.add_argument("--candidate-key", default="output", help="候选摘要字段名")
     ap.add_argument("--reference-key", default="reference", help="人工摘要字段名")
@@ -780,6 +1129,12 @@ def main() -> None:
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    if args.merge:
+        run_merge(args)
+        return
+    if not args.input:
+        raise SystemExit("要么 --input（打分），要么 --merge（合并报告）")
 
     cfg = load_config(resolve(args.config))
     reward_raw = cfg.get("rl", {}).get("reward") if cfg.get("rl") else None
@@ -853,12 +1208,18 @@ def main() -> None:
 
     if len(all_stats) > 1:
         print(f"\n{'=' * 78}\n跨文件汇总\n{'=' * 78}")
+        print(f"  {'文件':<30}{'Δ(人-候)':>11}{'胜率':>8}{'ρ(reward,rouge)':>18}")
+        print("  " + "-" * 66)
         for path, stats in zip(args.input, all_stats):
             delta = stats["delta_reward(human-candidate)"]
             win_rate = stats["human_win_rate"]
+            rho = stats["conclusions"][
+                "reward_rouge_positive_correlation"
+            ]["gated"]["spearman"]
             delta_s = f"{delta:+.4f}" if delta is not None else "-"
             rate_s = f"{win_rate:.1%}" if win_rate is not None else "-"
-            print(f"  {Path(path).name:<34} Δ={delta_s:>10}  胜率={rate_s:>8}")
+            rho_s = f"{rho:+.4f}" if isinstance(rho, float) else "-"
+            print(f"  {Path(path).name:<30}{delta_s:>11}{rate_s:>8}{rho_s:>18}")
 
 
 if __name__ == "__main__":
