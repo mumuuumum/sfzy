@@ -16,6 +16,10 @@
     # 先跑 100 条看速度和输出质量
     python scripts/generate_triples.py --config configs/sft_kaggle.yaml \
         --adapter outputs/sft_chatglm3/best.pt --split val --limit 100
+
+全量 train（10738 条）跑得慢的话，用 vLLM 版本做同一件事：
+    scripts/generate_triples_vllm.py（见 docs/vllm_triples.md）。
+产物格式、断点续跑、--shard 语义都与本脚本一致，可以直接接在一起用。
 """
 
 from __future__ import annotations

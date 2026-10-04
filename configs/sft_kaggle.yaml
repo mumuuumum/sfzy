@@ -115,8 +115,8 @@ lora:
   # r=4 / alpha=8 → scaling = alpha/r = 2，与原来 r=16/alpha=32 完全相同。
   # 保持 scaling 不变，学习率就不用跟着重调（这也是"调 r 时固定 alpha/r"
   # 这条经验被反复推荐的原因）。
-  r: 4
-  alpha: 8
+  r: 16
+  alpha: 32
   dropout: 0.05
   # 四个目标层等价于 LLaMA-Factory 的 `lora_target: all`。
   # 依据：LLaMA-Factory 的 find_all_linear_modules() 收集的是**所有叶子
