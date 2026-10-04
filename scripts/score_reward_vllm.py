@@ -305,13 +305,29 @@ def build_vllm(
     if args.dtype and args.dtype != "auto":
         llm_kwargs["dtype"] = args.dtype
     if args.quantization and args.quantization != "none":
-        # vLLM 的量化是加载时决定的：AWQ / GPTQ 走这里，bitsandbytes 不走。
+        # 量化在加载时决定：AWQ / GPTQ / bitsandbytes 都在这里选。
         llm_kwargs["quantization"] = args.quantization
+        if args.quantization == "bitsandbytes":
+            # vLLM 的 create_engine_config 有条硬校验：
+            #   quantization="bitsandbytes" 必须搭配 load_format="bitsandbytes"，
+            # 否则直接抛
+            #   ValueError: BitsAndBytes quantization and QLoRA adapter only
+            #               support 'bitsandbytes' load format, but got auto
+            # 这个 loader 同时负责两件事：
+            #   * 预量化 checkpoint（权重里带 quant_state.bitsandbytes__*）
+            #   * in-flight 量化（fp16 权重没有 quant_state → 现 quantize_4bit）
+            # 我们要的是后者，所以 load_format 必须显式给上。
+            llm_kwargs["load_format"] = "bitsandbytes"
+    # 允许显式覆盖 load_format（GGUF / 预量化 bnb checkpoint 等）。
+    # 默认 "auto"，上面已经按量化方案填好，这里只在用户真的指定时才盖。
+    if getattr(args, "load_format", "auto") not in (None, "", "auto"):
+        llm_kwargs["load_format"] = args.load_format
 
     logger.info(
-        "加载 vLLM 裁判：%s（dtype=%s, quantization=%s, tp=%d, max_model_len=%d）",
-        model_name, args.dtype, args.quantization, args.tensor_parallel_size,
-        max_model_len,
+        "加载 vLLM 裁判：%s（dtype=%s, quantization=%s, load_format=%s, tp=%d, max_model_len=%d）",
+        model_name, args.dtype, args.quantization,
+        llm_kwargs.get("load_format", "auto"),
+        args.tensor_parallel_size, max_model_len,
     )
     llm = LLM(**llm_kwargs)
     runtime = VLLMRuntime(
@@ -746,6 +762,9 @@ def main() -> None:
                     help="none | bitsandbytes | awq | gptq。T4 上 7B 装不下 fp16，"
                          "必须显式指定一个 4-bit 方案（bitsandbytes 可对现有 fp16 "
                          "权重现量化，awq/gptq 则要换成量化好的 checkpoint）")
+    ap.add_argument("--load-format", default="auto",
+                    help="auto | bitsandbytes | safetensors | gguf ...。"
+                         "量化选 bitsandbytes 时会自动设成 bitsandbytes（vLLM 的硬校验）")
     ap.add_argument("--dtype", default="float16",
                     help="T4 必须 float16；4090/A100 可用 bfloat16")
     ap.add_argument("--tensor-parallel-size", type=int, default=1)

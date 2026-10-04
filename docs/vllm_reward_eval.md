@@ -52,6 +52,13 @@ vLLM 的 bnb 支持 **in-flight 量化**（加载时把 fp16 权重现量化成 
 预量化 checkpoint 两种，Turing(sm_75)/T4 在官方支持列表里。代价是 bnb 走
 "反量化再算"的通用内核，吞吐不如 AWQ/GPTQ/Marlin。
 
+> 脚本会在 `--quantization bitsandbytes` 时自动补上 `--load-format bitsandbytes`。
+> 这不是可选项：vLLM 的 `create_engine_config` 有一条硬校验，bnb 量化必须配
+> `bitsandbytes` load format，否则直接抛
+> `ValueError: BitsAndBytes quantization ... only support 'bitsandbytes' load format`。
+> 这个 loader 对没有 `quant_state` 的 fp16 权重做 `quantize_4bit`，也就是
+> in-flight 量化。
+
 **B. AWQ / GPTQ 4-bit checkpoint（serving 内核更快，推荐）**
 
 ```bash
@@ -115,6 +122,7 @@ data/judge/sft_val_shard1of2.reward.summary.json
 | `--config` | 读 `rl.reward`（奖励口径）和 `semantic`（裁判抽取预算等），默认 `configs/grpo_fact_coverage_t4.yaml` |
 | `--model` / `--tokenizer` | 覆盖 `semantic.model`；AWQ 目录缺 tokenizer 文件时单独指 |
 | `--quantization` | `none` / `bitsandbytes` / `awq` / `gptq`。T4 必须显式指定一个 4-bit 方案 |
+| `--load-format` | 默认 `auto`；选 `bitsandbytes` 时脚本会自动设成 `bitsandbytes`（vLLM 硬校验） |
 | `--dtype` | T4 用 `float16`；4090/A100 可用 `bfloat16` |
 | `--chunk-size` | 一批几条记录（默认 16）。显存紧调小，吞吐优先调大 |
 | `--limit` / `--no-resume` | 冒烟 / 强制重跑。默认按 id 断点续跑 |

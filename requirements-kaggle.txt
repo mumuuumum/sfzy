@@ -32,9 +32,10 @@
 # 另外 Kaggle 镜像**预装**了 bitsandbytes，所以安装时必须加 -U，
 # 否则 pip 会因为 "Requirement already satisfied" 跳过升级。
 transformers==4.40.2
-bitsandbytes==0.46.1
+bitsandbytes>=0.46.1
 accelerate==1.0.1
 peft==0.13.0
+vllm==0.6.6
 
 # 稠密检索索引，CPU 版足够（检索不需要 GPU）
 faiss-cpu>=1.8
