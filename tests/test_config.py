@@ -7,9 +7,14 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from sfzy.config import Config, apply_overrides, deep_merge, load_config
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def make_cfg() -> Config:
@@ -133,3 +138,67 @@ def test_真实配置上覆盖resume_from():
     cfg = load_config(root / "configs/sft_cloud.yaml")
     apply_overrides(cfg, ["sft.resume_from=./outputs/sft_chatglm3/step_000200.pt"])
     assert cfg.path_("sft.resume_from") == "./outputs/sft_chatglm3/step_000200.pt"
+
+
+# ---------------------------------------------------------------- 实际生效的配置
+
+def test_继承链从根到叶():
+    from sfzy.config import config_chain
+
+    names = [p.name for p in config_chain(ROOT / "configs" / "grpo_fact_only_t4.yaml")]
+    assert names == [
+        "base.yaml",
+        "sft.yaml",
+        "sft_cloud.yaml",
+        "grpo_fact_judge.yaml",
+        "grpo_fact_only_t4.yaml",
+    ]
+
+
+def test_渲染出来的是展开后的值():
+    """光看 t4 那份 yaml 看不到 seed / element_weights 这些继承来的键。"""
+    from sfzy.config import render_config
+
+    data = yaml.safe_load(render_config(load_config(ROOT / "configs" / "grpo_fact_only_t4.yaml")))
+
+    # 来自 base / sft_cloud
+    assert data["seed"] == 42
+    assert data["lora"]["target_modules"] == [
+        "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
+    ]
+    # 来自 grpo_fact_judge.yaml（子配置只覆盖了非继承项）
+    assert data["rl"]["learning_rate"] == pytest.approx(1e-5)
+    weights = data["rl"]["reward"]["terms"]["fact_consistency"]["element_weights"]
+    assert weights["judgment_result"] == pytest.approx(0.30)
+    assert data["rl"]["reward"]["terms"]["rouge_l"]["enabled"] is False
+    # 本层自己写的
+    assert data["rl"]["max_length"] == 1536
+    assert data["semantic"]["dtype"] == "float16"
+
+
+def test_渲染可以附加运行时信息():
+    from sfzy.config import render_config
+
+    cfg = load_config(ROOT / "configs" / "grpo_fact_only_t4.yaml")
+    data = yaml.safe_load(render_config(cfg, {
+        "_config_chain": "base → … → grpo_fact_only_t4",
+        "_overrides": ["rl.group_size=2"],
+    }))
+    assert data["_config_chain"] == "base → … → grpo_fact_only_t4"
+    assert data["_overrides"] == ["rl.group_size=2"]
+
+
+def test_存档实际配置(tmp_path):
+    from sfzy.config import save_config
+
+    cfg = load_config(ROOT / "configs" / "grpo_fact_only_t4.yaml")
+    path = save_config(cfg, tmp_path / "nested" / "resolved_config.yaml", {"_x": 1})
+    assert path.exists()
+    assert yaml.safe_load(path.read_text(encoding="utf-8"))["_x"] == 1
+
+
+def test_渲染结果带得来原始配置路径():
+    from sfzy.config import render_config
+
+    data = yaml.safe_load(render_config(load_config(ROOT / "configs" / "grpo_fact_judge.yaml")))
+    assert data["_config_path"].endswith("grpo_fact_judge.yaml")

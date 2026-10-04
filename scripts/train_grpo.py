@@ -34,7 +34,12 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from sfzy.config import load_config                       # noqa: E402
+from sfzy.config import (                                 # noqa: E402
+    config_chain,
+    load_config,
+    render_config,
+    save_config,
+)
 from sfzy.eval.metrics import build_scorer                # noqa: E402
 from sfzy.models.loader import (                          # noqa: E402
     build_quant_config,
@@ -125,6 +130,10 @@ def main() -> None:
     logger.info("SFT 起点: %s", sft_adapter)
     logger.info("续训: %s", resume_from or "从头开始")
 
+    # 奖励规格尽早解析：配置写错（缺权重、缺内部权重、和不为 1）当场报错，
+    # 不要等模型加载完、跑了半小时才发现。
+    reward_spec = RewardSpec.from_config(rl_cfg.get("reward"))
+
     local_rank = init_distributed()
     set_seed(cfg.get("seed", 42))
     device = pick_device(cfg.get("device", "auto"))
@@ -137,8 +146,6 @@ def main() -> None:
     if local_path is not None and local_path.is_dir():
         model_cfg = {**model_cfg, "model_name_or_path": str(local_path)}
 
-    logger.info("加载模型: %s", model_cfg.get("model_name_or_path"))
-    tokenizer = load_tokenizer(model_cfg)
     # 和 generate_triples.py 同一条约束：**策略模型的精度必须和 SFT 一致**。
     # LoRA adapter 是在非量化底座上训出来的，换成 4-bit 底座会引入量化误差；
     # 而 RL 阶段是在这个（已经带误差的）策略上继续优化，误差会被放大。
@@ -170,6 +177,40 @@ def main() -> None:
         want_quant, model_cfg.get("device_map"),
     )
 
+    # ---------------- 训练前固化"实际生效的配置" ----------------
+    # 配置链是多层继承（base → sft → sft_cloud → grpo_*），再加上 --override，
+    # 光看启动时给的那份 yaml 判断不出最终用了什么。这里把**展开后**的结果
+    # 打印出来并落盘，作为这次 run 唯一的配置事实来源。
+    chain_text = " → ".join(p.name for p in config_chain(resolve(args.config)))
+    effective_extra = {
+        "_config_chain": chain_text,
+        "_overrides": list(args.override),
+        # 策略底座那一份是多文件间接引用的（model_config 指向另一个 yaml），
+        # 单独展开挂在下面，避免"改了 A 文件、其实生效的是 B 文件"。
+        "_resolved_model": model_cfg,
+        "_resolved_reward": {
+            "enabled_terms": [t.name for t in reward_spec.enabled_terms],
+            "normalized_weights": {
+                name: round(value, 6)
+                for name, value in reward_spec.normalized_weights().items()
+            },
+            "term_options": reward_spec.judge_term_options(),
+            "gate": {"enabled": reward_spec.gate.enabled, **reward_spec.gate.cfg},
+            "rouge_mode": reward_spec.rouge_mode,
+        },
+    }
+    logger.info("配置继承链: %s", chain_text)
+    logger.info("实际生效的配置（defaults 已展开、--override 已应用）：\n%s",
+                render_config(cfg, effective_extra))
+    saved_config = save_config(
+        cfg,
+        resolve(rl_cfg.get("output_dir", "outputs/grpo")) / "resolved_config.yaml",
+        effective_extra,
+    )
+    logger.info("实际配置已存档: %s", saved_config)
+
+    logger.info("加载模型: %s", model_cfg.get("model_name_or_path"))
+    tokenizer = load_tokenizer(model_cfg)
     model = load_model(model_cfg, quant_config=build_quant_config(model_cfg),
                        gradient_checkpointing=rl_cfg.get("gradient_checkpointing", True))
     if model_cfg.get("device_map") in (None, "", "none"):
@@ -225,7 +266,6 @@ def main() -> None:
     # ---------------- 语义裁判 ----------------
     # 裁判是独立模型，和策略**分卡放**：策略吃满卡 0，裁判在卡 1。
     # 需不需要裁判由 reward 规格决定：只要有一个启用的 judge 项就要加载它。
-    reward_spec = RewardSpec.from_config(rl_cfg.get("reward"))
     want_judge = reward_spec.needs_judge() and args.judge_backend != "none"
     semantic_cfg = dict(cfg.get("semantic") or {})
     scorer = (

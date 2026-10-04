@@ -90,6 +90,62 @@ def load_config(
     return Config(merged)
 
 
+def config_chain(path: Union[str, Path]) -> List[Path]:
+    """沿 `defaults` 链返回配置继承顺序：[最底层父配置, ..., 这个配置]。
+
+    配置链是多层的（base → sft → sft_cloud → grpo_*），光看启动时给的那份
+    yaml 看不出最终生效的值来自哪一层，把链打印出来至少能知道去哪找。
+    """
+    chain: List[Path] = []
+    seen = set()
+    current = Path(path).resolve()
+    while True:
+        if current in seen:
+            break                       # 防御性的：load_config 已经会拦循环继承
+        seen.add(current)
+        chain.append(current)
+        if not current.exists():
+            break
+        raw = yaml.safe_load(current.read_text(encoding="utf-8")) or {}
+        parent = raw.get("defaults") if isinstance(raw, Mapping) else None
+        if not parent:
+            break
+        current = current.parent / f"{parent}.yaml"
+    return list(reversed(chain))
+
+
+def _to_plain(value: Any) -> Any:
+    """把 Config / 嵌套 Mapping 递归转成普通 dict，保证能安全 dump。"""
+    if isinstance(value, Mapping):
+        return {str(key): _to_plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_plain(item) for item in value]
+    return value
+
+
+def render_config(cfg: Mapping[str, Any], extra: Optional[Mapping[str, Any]] = None) -> str:
+    """把**已展开 `defaults` 继承**的配置渲染成 YAML 文本。
+
+    训练前打印并落盘它，是为了回答"这次 run 到底用的什么配置"。
+    注释不会被带出来（那是给人读源码的），但所有键的最终取值都在这里。
+    """
+    data = _to_plain(dict(cfg))
+    if extra:
+        for key, value in extra.items():
+            data[key] = _to_plain(value)
+    return yaml.safe_dump(data, allow_unicode=True, sort_keys=False, default_flow_style=False)
+
+
+def save_config(
+    cfg: Mapping[str, Any], path: Union[str, Path], extra: Optional[Mapping[str, Any]] = None
+) -> Path:
+    """把展开后的配置写到 `path`（会创建父目录），返回实际路径。"""
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(render_config(cfg, extra), encoding="utf-8")
+    return target
+
+
 def main() -> None:
     if len(sys.argv) < 2:
         print("用法：python -m sfzy.config <配置文件路径>", file=sys.stderr)
