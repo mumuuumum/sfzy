@@ -75,7 +75,12 @@ class SixElementScorer:
 
         只开覆盖率时，事实一致性那一路根本不会被算，也就不会出现在这里。
         """
-        return set(self.judge.tasks)
+        out = set(self.judge.tasks)
+        # 开了事实一致性就顺带产出六要素最小原始分（事实硬门控要用）。
+        # 名字与 sfzy/rl/reward_spec.py 的 FACT_GATE_SIGNAL 一致。
+        if "fact_consistency" in out:
+            out.add("fact_consistency_min_raw")
+        return out
 
     def _score_item_signals(
         self, items: Sequence[Dict[str, Any]]

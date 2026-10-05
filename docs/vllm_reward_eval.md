@@ -199,7 +199,41 @@ Pearson 和 Spearman：
 }
 ```
 
+### 分项单独作为 reward
+
+报告里还有一节「分项单独作为 reward」:把 `fact_consistency`、`element_coverage`
+各自单独当作 reward,重跑上面两条结论(含门控 / 不含门控两种口径),
+`*.reward.summary.json` 里对应 `per_term`。这一步用来回答"到底是哪个分项在
+撑着结论"。
+
+有两个必须注意的读法:
+
+* **`element_coverage` 的人工臂恒为 1.0**(ref vs ref),所以它的结论 1 是
+  **结构性成立**,不能当作判别力;它真正有意义的是结论 2(与 ROUGE 的相关性)。
+* **`fact_consistency` 才是需要检验判别力的那一项**:如果它单独当 reward 时
+  结论 1 不过,说明"人工 > 候选"其实只由覆盖率撑着,事实一致性这一路没有把
+  人工排上去。
+
 ### 总判定与排查
+
+#### 门控（决定 reward 是否为 0）
+
+`gate` 是全局硬开关，命中任意一条整条 reward 直接 0，后面所有分项都不算。
+当前（所有配置默认）有两大类：
+
+1. **文本门控**：候选 < 60 字；候选/人工长度比不在 `[0.5, 1.5]`；以
+   `以下是/摘要：/摘要:/本摘要/这是` 开头；不含 `判决如下/判令/驳回/本院认为/
+   判决/裁定` 任一标记。对应 `gate_reason`：`too_short` / `length_too_short` /
+   `length_too_long` / `prefix:…` / `no_result_marker`。
+2. **事实一致性硬门控**（`gate.fact_consistency_min_raw: 1`）：六要素的
+   **原始分（0-4）** 只要有任意一个 `< 1`（即得 0 分），整条 reward 直接 0，
+   覆盖率 / ROUGE 都不再参与；六项都 ≥ 1 时，`fact_consistency` 才按配置权重
+   进入混合奖励。把该值设成 `0` 就关闭这条规则。对应 `gate_reason`：
+   `fact_element_raw<1`。
+
+注意这是**全局**门控，离线验证时人工臂（candidate=reference）也会被同一条
+规则拦下；`*.reward.jsonl` 的 `gated`/`gate_reason` 和报告里的「门控原因」
+分布能看出各臂被拦在哪一条。
 
 - 两条都成立 → `verdict` 为「✓ 两条结论都成立」，可以接 GRPO；
 - 只有一条成立 → 去看报告里的分项：结论 1 弱通常是

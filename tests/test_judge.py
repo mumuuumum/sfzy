@@ -420,10 +420,27 @@ def test_两个任务共用一次候选抽取():
     )
     results = j.judge_candidates("DOC", ["CAND"], reference="REF")
     assert j.extract_calls == 3                    # 文档 + 候选 + 参考，各一次
-    assert set(results[0].signals) == {"fact_consistency", "element_coverage"}
+    assert set(results[0].signals) == {
+        "fact_consistency", "fact_consistency_min_raw", "element_coverage",
+    }
     # 两个任务的判定都发出去了，但走的是同一次批量前向
     assert [p[0] for p in j.sent_pairs] == ["court_facts", "judgment_result"]
     assert [p[0] for p in j.sent_coverage] == ["court_facts", "judgment_result"]
+
+
+def test_事实门控信号_取六要素最小原始分():
+    """fact_consistency_min_raw 供 reward 侧的事实硬门控使用。"""
+    doc = SixElements(court_facts="借款属实")
+    cand_bad = SixElements(court_facts="借款不属实")
+    j = _FakeJudge(score_map={"court_facts": 0},
+                   extract_map={"DOC": doc, "CAND": cand_bad})
+    res = j.judge_candidates("DOC", ["CAND"])[0]
+    assert res.signals["fact_consistency_min_raw"] == 0.0
+
+    cand_ok = SixElements(court_facts="借款属实")
+    j2 = _FakeJudge(extract_map={"DOC": doc, "CAND": cand_ok})
+    assert j2.judge_candidates("DOC", ["CAND"])[0].signals[
+        "fact_consistency_min_raw"] == 4.0
 
 
 def test_覆盖率权重可单独配置():

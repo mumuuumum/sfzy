@@ -52,7 +52,16 @@ DEFAULT_GATE: Dict[str, Any] = {
     "length_ratio_range": [0.5, 1.5],
     "forbidden_prefixes": ["以下是", "摘要：", "摘要:", "本摘要", "这是"],
     "require_result_marker": True,
+    # 事实一致性硬门控：六个要素里只要有一个**原始分 < 这个值**，整条 reward
+    # 直接 0（不再算覆盖率/ROUGE）。1 就是需求里的"任一个要素得 0 分即出局"；
+    # 设 0 关闭这条规则。只在 fact_consistency 这个 term 被启用时生效。
+    "fact_consistency_min_raw": 1,
 }
+
+# 事实一致性硬门控要读的裁判信号名：六个要素原始分（0-4）的最小值。
+# judge.py / scorer.py 里也硬编码了同一个字符串 —— judge 层不 import 本模块，
+# 否则会把 torch 拉进纯 CPU 的 reward 路径。两边一致性由 tests 钉住。
+FACT_GATE_SIGNAL = "fact_consistency_min_raw"
 
 # term 配置里除了内部权重字段、只能写这两个保留字段
 _RESERVED_FIELDS = ("enabled", "weight")
@@ -239,15 +248,48 @@ class RewardSpec:
 
     @property
     def required_signals(self) -> Set[str]:
-        """启用项里，需要模型 B 产出的信号名集合。"""
+        """启用项里，需要模型 B 产出的**任务**信号名集合。"""
         out: Set[str] = set()
         for term in self.enabled_terms:
             if term.source == "judge" and term.spec.signal:
                 out.add(term.spec.signal)
         return out
 
+    @property
+    def gate_signals(self) -> Set[str]:
+        """门控（不是 reward term）额外需要的裁判信号。"""
+        out: Set[str] = set()
+        if self.fact_element_gate_enabled:
+            out.add(FACT_GATE_SIGNAL)
+        return out
+
+    @property
+    def needed_signals(self) -> Set[str]:
+        """要从裁判取回来的**全部**信号 = 任务信号 + 门控辅助信号。"""
+        return self.required_signals | self.gate_signals
+
     def needs_judge(self) -> bool:
-        return bool(self.required_signals)
+        return bool(self.needed_signals)
+
+    # ---------------------------------------------------------------- 事实门控
+    @property
+    def fact_consistency_enabled(self) -> bool:
+        term = self.terms.get("fact_consistency")
+        return bool(term and term.enabled)
+
+    @property
+    def fact_element_min_raw(self) -> int:
+        """六个要素原始分的最低要求；<=0 表示不做事实一致性硬门控。"""
+        if not self.gate.enabled:
+            return 0
+        try:
+            return int(self.gate.cfg.get("fact_consistency_min_raw", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def fact_element_gate_enabled(self) -> bool:
+        return self.fact_consistency_enabled and self.fact_element_min_raw > 0
 
     def judge_term_options(self) -> Dict[str, Dict[str, Any]]:
         """{裁判信号名: 该 reward 的内部权重}，交给裁判后端构造时使用。"""

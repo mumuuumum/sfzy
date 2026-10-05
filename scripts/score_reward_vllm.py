@@ -116,6 +116,7 @@ import json
 import math
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -140,6 +141,10 @@ from sfzy.judge.schema import (                              # noqa: E402
 logger = get_logger("score_reward_vllm")
 
 _ROUGE_WARNED = False
+
+# 诊断开关：--dump-elements 打开后，逐条输出里带上原文/人工/候选三种六要素
+# 的抽取结果。定位"某个要素为什么判 0"时用它（配合 --limit 跑一小批）。
+_DUMP_ELEMENTS = False
 
 
 def _warn_rouge_once(exc: Exception) -> None:
@@ -440,6 +445,10 @@ def score_chunk(
                 "candidate": cand_text,
                 "reference": reference,
                 "error": error,
+                # 诊断用（不落盘，除非 --dump-elements）
+                "_cand_el": cand_el,
+                "_doc_el": doc_el,
+                "_ref_el": ref_el,
             }
             if "fact_consistency" in tasks:
                 cons_pairs = judge.build_pairs(doc_el, cand_el, document)
@@ -477,6 +486,10 @@ def score_chunk(
                     candidate_id=f"{entry['id']}:{entry['arm']}",
                 )
                 signals["fact_consistency"] = fact_result.weighted_reward
+                # 事实硬门控要读的六要素最小原始分（与 reward_spec 的信号同名）
+                signals["fact_consistency_min_raw"] = float(
+                    min(fact_result.raw_scores.values())
+                )
             if "element_coverage" in tasks and "cov_slice" in entry:
                 a, b = entry["cov_slice"]
                 raw = dict(entry["cov_pre"])
@@ -527,7 +540,7 @@ def score_chunk(
                 _warn_rouge_once(exc)
                 rouge = {}
 
-        rows.append({
+        row = {
             "id": entry["id"],
             "arm": entry["arm"],
             "reward": reward,
@@ -546,7 +559,14 @@ def score_chunk(
             "fact_raw": (dict(fact_result.raw_scores) if fact_result else {}),
             "element_coverage": coverage,
             "error": error,
-        })
+        }
+        if _DUMP_ELEMENTS:
+            row["elements"] = {
+                "document": entry["_doc_el"].to_dict(),
+                "reference": entry["_ref_el"].to_dict(),
+                "candidate": entry["_cand_el"].to_dict(),
+            }
+        rows.append(row)
     return rows
 
 
@@ -731,6 +751,54 @@ def _sign_test_p(win: int, lose: int) -> Optional[float]:
     return min(1.0, 2 * tail / (2 ** n))
 
 
+def _c1_verdict(c1: Dict[str, Any], passed: bool, subject: str = "候选摘要奖励") -> str:
+    if c1["n"] == 0:
+        return "样本不足，无法判定"
+    if passed:
+        return f"✓ 成立：{subject}显著低于人工摘要"
+    if (c1["mean_delta"] or 0) > 0 and c1["win"] > c1["lose"]:
+        return "△ 方向成立但不显著"
+    return f"✗ 不成立：{subject}没有低于人工摘要"
+
+
+def _c2_verdict(corr: Dict[str, Any], passed: bool, subject: str = "候选 reward") -> str:
+    if corr["n"] < 3:
+        return "样本不足，无法判定"
+    if passed:
+        return f"✓ 成立：{subject} 与 ROUGE-L 显著正相关"
+    if (corr["spearman"] or 0) > 0:
+        return "△ 正相关但不显著"
+    return f"✗ 不成立：{subject} 与 ROUGE-L 非正相关"
+
+
+# 分项单独当 reward 时的显示名
+_TERM_LABELS: Dict[str, str] = {
+    "fact_consistency": "候选摘要的事实一致性",
+    "element_coverage": "候选摘要的要素覆盖率",
+    "rouge_l": "候选摘要的 ROUGE-L",
+}
+
+
+def _term_label(name: str) -> str:
+    return _TERM_LABELS.get(name, f"候选摘要的 {name}")
+
+
+def _term_value(row: Dict[str, Any], name: str) -> Optional[float]:
+    """取出某个分项的信号值（judge 信号在顶层，规则项在 terms 里）。"""
+    value = row.get(name)
+    if value is None:
+        value = (row.get("terms") or {}).get(name)
+    return float(value) if value is not None else None
+
+
+def _term_value_gated(row: Dict[str, Any], name: str) -> Optional[float]:
+    """把分项单独当 reward 时也套上全局门控：被拦下就是 0。"""
+    value = _term_value(row, name)
+    if value is None:
+        return None
+    return 0.0 if row.get("gated") else value
+
+
 def summarize(
     rows_by_id: Dict[str, Dict[str, Dict[str, Any]]],
     terms: Sequence[str],
@@ -754,6 +822,9 @@ def summarize(
             "gate_rate": (
                 sum(1 for a in arms if a.get("gated")) / len(arms) if arms else None
             ),
+            "gate_reasons": dict(Counter(
+                a.get("gate_reason") or "?" for a in arms if a.get("gated")
+            )),
             "mean_fact_consistency": _mean([a.get("fact_consistency") for a in ok]),
             "mean_element_coverage": _mean([a.get("element_coverage") for a in ok]),
             "mean_rouge_l": _mean([a.get("rouge_l") for a in ok]),
@@ -781,14 +852,7 @@ def summarize(
         and c1["win"] > c1["lose"]
         and c1["sign_test_p"] is not None and c1["sign_test_p"] < 0.05
     )
-    if c1["n"] == 0:
-        c1_verdict = "样本不足，无法判定"
-    elif c1_pass:
-        c1_verdict = "✓ 成立：候选摘要奖励显著低于人工摘要"
-    elif c1["mean_delta"] > 0 and c1["win"] > c1["lose"]:
-        c1_verdict = "△ 方向成立但不显著"
-    else:
-        c1_verdict = "✗ 不成立：候选奖励没有低于人工摘要"
+    c1_verdict = _c1_verdict(c1, c1_pass)
 
     # ---- 结论 2：候选的 reward 与 ROUGE 正相关（跨文书） ----
     # 主口径用真正进训练的 gated reward；不含门控的那份一并报告，用来判断
@@ -804,14 +868,51 @@ def summarize(
         corr_gated["n"] >= 3 and rho is not None and rho > 0
         and corr_gated["spearman_p"] is not None and corr_gated["spearman_p"] < 0.05
     )
-    if corr_gated["n"] < 3:
-        c2_verdict = "样本不足，无法判定"
-    elif c2_pass:
-        c2_verdict = "✓ 成立：候选 reward 与 ROUGE-L 显著正相关"
-    elif rho is not None and rho > 0:
-        c2_verdict = "△ 正相关但不显著"
-    else:
-        c2_verdict = "✗ 不成立：候选 reward 与 ROUGE-L 非正相关"
+    c2_verdict = _c2_verdict(corr_gated, c2_pass)
+
+    # ---- 分项单独作为 reward：同样的两条结论各跑一遍 ----
+    # 目的：看清楚"人工 > 候选"和"与 ROUGE 正相关"到底是哪个分项撑起来的。
+    # element_coverage 要特别注意：人工臂是 ref vs ref，恒等于 1.0，
+    # 所以它的结论 1 是**结构性成立**，不代表判别力。
+    per_term: Dict[str, Any] = {}
+    for name in terms:
+        variants: Dict[str, Any] = {}
+        for variant, value_fn in (
+            ("gated", lambda row, n=name: _term_value_gated(row, n)),
+            ("ungated", lambda row, n=name: _term_value(row, n)),
+        ):
+            deltas = [
+                value_fn(h) - value_fn(c) for c, h in paired
+                if value_fn(c) is not None and value_fn(h) is not None
+            ]
+            t1 = _paired_delta_stats(deltas)
+            t1_pass = (
+                t1["n"] > 0 and t1["mean_delta"] is not None and t1["mean_delta"] > 0
+                and t1["win"] > t1["lose"]
+                and t1["sign_test_p"] is not None and t1["sign_test_p"] < 0.05
+            )
+            corr = _corr_block(
+                [value_fn(a) for a in cand], [a.get("rouge_l") for a in cand]
+            )
+            rho_t = corr["spearman"]
+            t2_pass = (
+                corr["n"] >= 3 and rho_t is not None and rho_t > 0
+                and corr["spearman_p"] is not None and corr["spearman_p"] < 0.05
+            )
+            variants[variant] = {
+                "conclusion1": {**t1, "pass": t1_pass,
+                                "verdict": _c1_verdict(t1, t1_pass, _term_label(name))},
+                "conclusion2": {**corr, "pass": t2_pass,
+                                "verdict": _c2_verdict(corr, t2_pass, _term_label(name))},
+            }
+        human_values = [_term_value(h, name) for _, h in paired]
+        variants["candidate_mean"] = _mean([_term_value(c, name) for c, _ in paired])
+        variants["human_mean"] = _mean(human_values)
+        # 人工臂在该分项上恒为 1.0 → 它的结论 1 是结构性成立，不代表判别力
+        variants["human_constant_one"] = bool(human_values) and all(
+            abs(v - 1.0) < 1e-9 for v in human_values
+        )
+        per_term[name] = variants
 
     if c1_pass and c2_pass:
         overall = "✓ 两条结论都成立"
@@ -842,6 +943,7 @@ def summarize(
                 "verdict": c2_verdict,
             },
         },
+        "per_term": per_term,
     }
 
 
@@ -897,6 +999,8 @@ def _print_conclusions(stats: Dict[str, Any]) -> None:
     print(f"    配对 n={c1['n']}  Δ均值={_fmt(c1['mean_delta'])}  "
           f"胜率={_fmt(c1['win_rate'])}  符号检验 p={_fmt(c1['sign_test_p'])}  "
           f"t 检验 p={_fmt(c1['p_value'])}")
+    print(f"    门控原因：候选 {stats['candidate'].get('gate_reasons')} / "
+          f"人工 {stats['human'].get('gate_reasons')}")
 
     c2 = stats["conclusions"]["reward_rouge_positive_correlation"]
     g, u = c2["gated"], c2["ungated"]
@@ -906,6 +1010,21 @@ def _print_conclusions(stats: Dict[str, Any]) -> None:
     print(f"    不含门控 reward vs rouge-l-f：n={u['n']}  "
           f"Pearson r={_fmt(u['pearson'])}  Spearman ρ={_fmt(u['spearman'])}  "
           f"p={_fmt(u['spearman_p'])}")
+
+    per_term = stats.get("per_term") or {}
+    if per_term:
+        print("\n  分项单独作为 reward（含门控）：")
+        for name, entry in per_term.items():
+            blk = entry["gated"]
+            c1, c2 = blk["conclusion1"], blk["conclusion2"]
+            note = "（人工恒 1.0，结论1结构性成立）" if entry.get(
+                "human_constant_one") else ""
+            print(
+                f"    {name:<18} 结论1 {'✓' if c1['pass'] else '✗'}"
+                f"（Δ={_fmt(c1['mean_delta'])}）  "
+                f"结论2 {'✓' if c2['pass'] else '✗'}"
+                f"（ρ={_fmt(c2['spearman'])}）{note}"
+            )
 
 
 def _fmt(value: Optional[float], digits: int = 4) -> str:
@@ -945,6 +1064,7 @@ def render_report(title: str, stats: Dict[str, Any]) -> str:
         f"- 符号检验（精确，双侧）：p={_fmt(c1['sign_test_p'])} ← 判定依据",
         f"- 配对 t 检验（正态近似，双侧）：t={_fmt(c1['t_stat'])}，"
         f"p={_fmt(c1['p_value'])}（参考）",
+        f"- 门控原因：候选 `{c['gate_reasons']}`；人工 `{h['gate_reasons']}`",
         "",
         "## 结论 2：候选的 reward 与 ROUGE 正相关",
         "",
@@ -972,6 +1092,39 @@ def render_report(title: str, stats: Dict[str, Any]) -> str:
         f"{_fmt(h['mean_rouge_overall'])} |",
         "",
     ]
+    per_term = stats.get("per_term") or {}
+    if per_term:
+        lines += [
+            "## 分项单独作为 reward",
+            "",
+            "把每个分项单独当作 reward，重跑上面两条结论（同一套配对与相关检验）。"
+            "「含门控」= 被门控拦下的候选按 0 分算；「不含门控」= 只看分项本身。",
+            "",
+        ]
+        for name, entry in per_term.items():
+            flag = (
+                "（人工臂恒为 1.0 → 结论 1 属结构性成立，不代表判别力）"
+                if entry.get("human_constant_one") else ""
+            )
+            lines += [
+                f"### {_term_label(name)}",
+                f"- 候选均值 {_fmt(entry.get('candidate_mean'))} / "
+                f"人工均值 {_fmt(entry.get('human_mean'))}{flag}",
+                "",
+                "| 口径 | Δ均值 | 胜率 | 符号检验 p | 结论1 | "
+                "Spearman ρ | ρ p | 结论2 |",
+                "|---|---:|---:|---:|---|---:|---:|---|",
+            ]
+            for variant, label in (("gated", "含门控"), ("ungated", "不含门控")):
+                blk = entry[variant]
+                t1, t2 = blk["conclusion1"], blk["conclusion2"]
+                lines.append(
+                    f"| {label} | {_fmt(t1['mean_delta'])} | {_fmt(t1['win_rate'])} | "
+                    f"{_fmt(t1['sign_test_p'])} | {'✓' if t1['pass'] else '✗'} | "
+                    f"{_fmt(t2['spearman'])} | {_fmt(t2['spearman_p'])} | "
+                    f"{'✓' if t2['pass'] else '✗'} |"
+                )
+            lines.append("")
     return "\n".join(lines)
 
 
@@ -990,6 +1143,11 @@ def run_input(
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     records = load_records(path)
+    if args.ids:
+        wanted = {str(x) for x in args.ids}
+        records = [r for r in records if str(r.get("id")) in wanted]
+        if not records:
+            logger.warning("--ids 过滤后没有记录：%s（文件 %s）", sorted(wanted), path.name)
     if args.limit:
         records = records[: args.limit]
     done = set() if args.no_resume else load_done_ids(out_path)
@@ -1097,10 +1255,15 @@ def main() -> None:
     ap.add_argument("--candidate-key", default="output", help="候选摘要字段名")
     ap.add_argument("--reference-key", default="reference", help="人工摘要字段名")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--ids", nargs="+", default=None,
+                    help="只跑这些 id（调试单条用，配合 --dump-elements）")
     ap.add_argument("--no-resume", action="store_true",
                     help="默认跳过输出里已有的 id（可断点续跑）")
     ap.add_argument("--chunk-size", type=int, default=16,
                     help="一批几条记录。显存紧就调小，吞吐优先就调大")
+    ap.add_argument("--dump-elements", action="store_true",
+                    help="逐条结果里带上抽取出的六要素（原文/人工/候选），"
+                         "用来定位某个要素为什么判 0；配合 --limit 跑一小批")
 
     # ---- 裁判模型 / vLLM ----
     ap.add_argument("--model", default=None,
@@ -1129,6 +1292,9 @@ def main() -> None:
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    global _DUMP_ELEMENTS
+    _DUMP_ELEMENTS = bool(args.dump_elements)
 
     if args.merge:
         run_merge(args)
@@ -1180,9 +1346,23 @@ def main() -> None:
         "奖励口径：%s",
         ", ".join(f"{t.name}(w={weights[t.name]:.3f})" for t in spec.enabled_terms),
     )
-    logger.info("裁判任务：%s", sorted(spec.required_signals) or ["(无)"])
 
-    from sfzy.judge.judge import FactConsistencyJudge
+    from sfzy.judge.judge import SUPPORTED_TASKS, FactConsistencyJudge
+
+    # 只把真正的 judge task 拿去构造 Judge；事实硬门控要读的
+    # fact_consistency_min_raw 是 gate 辅助信号（在 score_chunk 里手工塞进
+    # judge_signals），不是 task。
+    judge_tasks = [
+        t for t in sorted(spec.required_signals) if t in SUPPORTED_TASKS
+    ] or ["fact_consistency"]
+    logger.info("裁判任务：%s（事实硬门控阈值=%d）",
+                judge_tasks, spec.fact_element_min_raw)
+
+    if spec.fact_element_gate_enabled:
+        logger.info(
+            "事实一致性硬门控已启用：六要素原始分任一 < %d → 整条 reward=0",
+            spec.fact_element_min_raw,
+        )
 
     runtime, _tokenizer = build_vllm(args, model_name, trust_remote_code, max_model_len)
     options = spec.judge_term_options()
@@ -1190,7 +1370,7 @@ def main() -> None:
         runtime=runtime,
         weights=(options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(options.get("element_coverage") or {}).get("element_weights"),
-        tasks=sorted(spec.required_signals) or ["fact_consistency"],
+        tasks=judge_tasks,
         max_input_tokens=args.max_input_tokens,
         extract_max_new_tokens=extract_max_new_tokens,
         min_document_elements=min_document_elements,

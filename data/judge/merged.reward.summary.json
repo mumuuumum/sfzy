@@ -1,0 +1,189 @@
+{
+  "n_records": 544,
+  "n_paired": 537,
+  "candidate": {
+    "n": 544,
+    "n_ok": 537,
+    "mean_reward": 0.7051341130353818,
+    "mean_reward_ungated": 0.7573415009310986,
+    "gate_rate": 0.06985294117647059,
+    "mean_fact_consistency": 0.7586824953445066,
+    "mean_element_coverage": 0.7542125139664804,
+    "mean_rouge_l": 0.5941078454376164,
+    "mean_rouge_overall": 0.5682018230912477
+  },
+  "human": {
+    "n": 544,
+    "n_ok": 537,
+    "mean_reward": 0.8210032588454376,
+    "mean_reward_ungated": 0.8227676908752327,
+    "gate_rate": 0.001838235294117647,
+    "mean_fact_consistency": 0.7468109869646183,
+    "mean_element_coverage": 1.0,
+    "mean_rouge_l": 1.0,
+    "mean_rouge_overall": 1.0
+  },
+  "delta_reward(human-candidate)": 0.1158691458100558,
+  "human_win": 391,
+  "tie": 30,
+  "human_lose": 116,
+  "human_win_rate": 0.7281191806331471,
+  "verdict": "✓ 两条结论都成立",
+  "conclusions": {
+    "candidate_reward_lt_human_reward": {
+      "n": 537,
+      "mean_delta": 0.11586914581005586,
+      "median_delta": 0.06249999999999989,
+      "sd_delta": 0.23091374868658562,
+      "win": 391,
+      "tie": 30,
+      "lose": 116,
+      "win_rate": 0.7281191806331471,
+      "t_stat": 11.628003570766182,
+      "p_value": 2.9696165829414833e-31,
+      "sign_test_p": 7.514808806726232e-36,
+      "pass": true,
+      "verdict": "✓ 成立：候选摘要奖励显著低于人工摘要"
+    },
+    "reward_rouge_positive_correlation": {
+      "primary": "reward(含门控) vs rouge-l-f",
+      "gated": {
+        "n": 537,
+        "pearson": 0.30410514917320025,
+        "pearson_p": 3.960538080010463e-13,
+        "spearman": 0.2901396903424178,
+        "spearman_p": 5.094246429020523e-12
+      },
+      "ungated": {
+        "n": 537,
+        "pearson": 0.2444514059431018,
+        "pearson_p": 8.135586855861826e-09,
+        "spearman": 0.23480325688631443,
+        "spearman_p": 3.219025518813874e-08
+      },
+      "pass": true,
+      "verdict": "✓ 成立：候选 reward 与 ROUGE-L 显著正相关"
+    }
+  },
+  "per_term": {
+    "element_coverage": {
+      "gated": {
+        "conclusion1": {
+          "n": 537,
+          "mean_delta": 0.29204985288640595,
+          "median_delta": 0.25,
+          "sd_delta": 0.26598864624737284,
+          "win": 466,
+          "tie": 70,
+          "lose": 1,
+          "win_rate": 0.8677839851024208,
+          "t_stat": 25.443745067827745,
+          "p_value": 8.27953419361236e-143,
+          "sign_test_p": 2.4562234518292168e-138,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率显著低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 544,
+          "pearson": 0.4599477977224116,
+          "pearson_p": 6.154120682676522e-31,
+          "spearman": 0.5001073990666123,
+          "spearman_p": 2.124352956927025e-37,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率 与 ROUGE-L 显著正相关"
+        }
+      },
+      "ungated": {
+        "conclusion1": {
+          "n": 537,
+          "mean_delta": 0.24578748603351955,
+          "median_delta": 0.235294,
+          "sd_delta": 0.18188012910700724,
+          "win": 466,
+          "tie": 71,
+          "lose": 0,
+          "win_rate": 0.8677839851024208,
+          "t_stat": 31.315666300589278,
+          "p_value": 2.8559087667432474e-215,
+          "sign_test_p": 1.0496681418073576e-140,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率显著低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 544,
+          "pearson": 0.47882789362142125,
+          "pearson_p": 7.423486344574382e-34,
+          "spearman": 0.48204043998319557,
+          "spearman_p": 2.2564599587918167e-34,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率 与 ROUGE-L 显著正相关"
+        }
+      },
+      "candidate_mean": 0.7542125139664804,
+      "human_mean": 1.0,
+      "human_constant_one": true
+    },
+    "fact_consistency": {
+      "gated": {
+        "conclusion1": {
+          "n": 537,
+          "mean_delta": 0.04036312849162011,
+          "median_delta": 0.0,
+          "sd_delta": 0.24877429638316848,
+          "win": 218,
+          "tie": 107,
+          "lose": 212,
+          "win_rate": 0.4059590316573557,
+          "t_stat": 3.7598148314081286,
+          "p_value": 0.00017003916774367602,
+          "sign_test_p": 0.8094952502327275,
+          "pass": false,
+          "verdict": "△ 方向成立但不显著"
+        },
+        "conclusion2": {
+          "n": 544,
+          "pearson": 0.2197259376971993,
+          "pearson_p": 2.0426905501614464e-07,
+          "spearman": 0.13966760341704232,
+          "spearman_p": 0.001075627878501674,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的事实一致性 与 ROUGE-L 显著正相关"
+        }
+      },
+      "ungated": {
+        "conclusion1": {
+          "n": 537,
+          "mean_delta": -0.011871508379888266,
+          "median_delta": 0.0,
+          "sd_delta": 0.14604315730263448,
+          "win": 195,
+          "tie": 110,
+          "lose": 232,
+          "win_rate": 0.36312849162011174,
+          "t_stat": -1.8837004124833314,
+          "p_value": 0.05960551061685542,
+          "sign_test_p": 0.08135894953577795,
+          "pass": false,
+          "verdict": "✗ 不成立：候选摘要的事实一致性没有低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 544,
+          "pearson": 0.08273430170266995,
+          "pearson_p": 0.0537607138007707,
+          "spearman": 0.058073579173616746,
+          "spearman_p": 0.17628621692935864,
+          "pass": false,
+          "verdict": "△ 正相关但不显著"
+        }
+      },
+      "candidate_mean": 0.7586824953445066,
+      "human_mean": 0.7468109869646183,
+      "human_constant_one": false
+    }
+  },
+  "input": [
+    "/home/yukino/projects/sfzy/data/judge/sft_val_shard0of2.reward.jsonl",
+    "/home/yukino/projects/sfzy/data/judge/sft_val_shard1of2.reward.jsonl"
+  ],
+  "output": "/home/yukino/projects/sfzy/data/judge/merged.reward.jsonl"
+}

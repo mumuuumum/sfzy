@@ -133,10 +133,10 @@ class GRPOTrainer:
             if self.scorer is None:
                 raise ValueError(
                     "奖励里有 judge 项（"
-                    f"{sorted(self.reward_spec.required_signals)}），但没传裁判（scorer）。\n"
+                    f"{sorted(self.reward_spec.needed_signals)}），但没传裁判（scorer）。\n"
                     "  在配置里写 semantic.backend=fact。"
                 )
-            missing = self.reward_spec.required_signals - set(self.scorer.available_signals())
+            missing = self.reward_spec.needed_signals - set(self.scorer.available_signals())
             if missing:
                 raise ValueError(
                     f"奖励需要的裁判信号 {sorted(missing)} 这个裁判产不出来，"
@@ -171,7 +171,7 @@ class GRPOTrainer:
             )
         return {
             name: [rec.get(name) for rec in records]
-            for name in sorted(self.reward_spec.required_signals)
+            for name in sorted(self.reward_spec.needed_signals)
         }
 
     def prepare_baseline(self, prompts: List[Dict[str, Any]]) -> None:
@@ -203,7 +203,7 @@ class GRPOTrainer:
             signals = {}
         # 基线锚是每 prompt 一条（不是每 prompt G 条），不能用组内均值补缺 ——
         # 缺信号的 SFT 输出直接跳过，填 0 会把它变成一个假的低锚。
-        required = sorted(self.reward_spec.required_signals)
+        required = sorted(self.reward_spec.needed_signals)
         keep = [
             i for i in range(len(with_out))
             if all(signals.get(name, [None] * len(with_out))[i] is not None for name in required)

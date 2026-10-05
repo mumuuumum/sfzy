@@ -68,6 +68,12 @@ rl:
   # ---- 奖励：两个 judge 项，各有各的内部权重 ----
   reward:
     normalize_weights: true
+    # 事实一致性硬门控：六个要素原始分（0-4）里只要有一个 < 这个值，
+    # 整条 reward 直接 0，fact_consistency / element_coverage 都不再参与。
+    # 设 1 = "任一要素得 0 分即出局"；设 0 关闭这条规则（其余门控项沿默认）。
+    # 注意：这是全局硬门控，离线验证时人工摘要也会被同一条规则拦下。
+    gate:
+      fact_consistency_min_raw: 1
     terms:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:

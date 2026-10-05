@@ -33,7 +33,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from sfzy.rl.reward_spec import RewardSpec
+from sfzy.rl.reward_spec import FACT_GATE_SIGNAL, RewardSpec
 from sfzy.rl.reward_terms import compute_rule_term
 
 # --------------------------------------------------------------------------
@@ -156,6 +156,35 @@ def check_gate(candidate: str, reference: str, gate_cfg: Mapping[str, Any]) -> O
     return None
 
 
+def check_fact_element_gate(
+    spec: "RewardSpec",
+    judge_signals: Mapping[str, Optional[float]],
+) -> Optional[str]:
+    """事实一致性硬门控：六个要素有一个低于阈值就整条出局。
+
+    为什么要做成**全局门控**而不是把 fact_consistency 这项清零：需求是
+    "任一要素 0 分 → reward 直接 0"，而加权求和里 fact 权重是 0.7，清零它
+    还会剩下 0.3 的覆盖率分，达不到"直接 0"。
+
+    信号缺失（裁判失败被组内均值补过、或外部只传了聚合分）时**不拦**，
+    保证向后兼容、也不让裁判抖动变成惩罚。threshold<=0 或 fact 项没启用
+    时这条规则整体不生效。
+    """
+    min_raw = spec.fact_element_min_raw
+    if min_raw <= 0 or not spec.fact_consistency_enabled:
+        return None
+    value = judge_signals.get(FACT_GATE_SIGNAL)
+    if value is None:
+        return None
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if value < min_raw:
+        return f"fact_element_raw<{min_raw}"
+    return None
+
+
 def _as_spec(spec: Optional[Any]) -> RewardSpec:
     """允许直接传字典（测试/工具方便），但只解析一次。"""
     return spec if isinstance(spec, RewardSpec) else RewardSpec.from_config(spec)
@@ -173,6 +202,13 @@ def _compute_one(
     # ---- 第一层：全局硬门控 ----
     if spec.gate.enabled:
         reason = check_gate(candidate, reference, spec.gate.cfg)
+        if reason is not None:
+            bd.gated = True
+            bd.gate_reason = reason
+            bd.total = 0.0
+            return 0.0, bd
+        # 事实一致性硬门控：六要素里有 0 分 → 整条 reward 0
+        reason = check_fact_element_gate(spec, judge_signals)
         if reason is not None:
             bd.gated = True
             bd.gate_reason = reason

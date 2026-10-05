@@ -226,6 +226,64 @@ def test_门控可以整块关掉():
     assert "rouge_l" in bd.values
 
 
+# ---------------------------------------------------------------- 事实一致性硬门控
+
+def test_事实门控_任一要素0分整条reward归0():
+    score, bd = compute_reward(
+        REF, REF, spec=SPEC,
+        judge_signals={"fact_consistency": 0.9, "fact_consistency_min_raw": 0.0},
+    )
+    assert bd.gated is True
+    assert bd.gate_reason == "fact_element_raw<1"
+    assert score == 0.0
+    assert bd.values == {}          # 门控命中就不再算任何分项
+
+
+def test_事实门控_六要素都非0则按配置权重正常混合():
+    score, bd = compute_reward(
+        REF, REF, spec=SPEC,
+        judge_signals={"fact_consistency": 0.8, "fact_consistency_min_raw": 1.0},
+    )
+    assert bd.gated is False
+    assert score == pytest.approx(0.3 * bd.values["rouge_l"] + 0.7 * 0.8)
+
+
+def test_事实门控_缺信号时不拦_保持向后兼容():
+    _, bd = compute_reward(REF, REF, spec=SPEC, judge_signals={"fact_consistency": 0.8})
+    assert bd.gated is False
+
+
+def test_事实门控_阈值设0等于关闭():
+    spec = {**SPEC, "gate": {"fact_consistency_min_raw": 0}}
+    _, bd = compute_reward(
+        REF, REF, spec=spec,
+        judge_signals={"fact_consistency": 0.9, "fact_consistency_min_raw": 0.0},
+    )
+    assert bd.gated is False
+
+
+def test_事实门控_没开事实项就不生效():
+    spec = {
+        "terms": {"rouge_l": {"enabled": True, "weight": 1.0}},
+        "gate": {"fact_consistency_min_raw": 1},
+    }
+    _, bd = compute_reward(REF, REF, spec=spec, judge_signals={})
+    assert bd.gated is False
+
+
+def test_事实门控信号名在judge与scorer里一致():
+    """judge/scorer 层刻意不 import reward_spec（避免 torch 倒灌），
+    所以信号名是硬编码的；这里钉住三处一致。"""
+    from pathlib import Path
+    from sfzy.rl.reward_spec import FACT_GATE_SIGNAL
+
+    root = Path(__file__).resolve().parents[1]
+    judge_src = (root / "src/sfzy/judge/judge.py").read_text(encoding="utf-8")
+    scorer_src = (root / "src/sfzy/judge/scorer.py").read_text(encoding="utf-8")
+    assert f'"{FACT_GATE_SIGNAL}"' in judge_src
+    assert f'"{FACT_GATE_SIGNAL}"' in scorer_src
+
+
 # ---------------------------------------------------------------- 批量与统计
 
 def test_批量打分_带多信号():

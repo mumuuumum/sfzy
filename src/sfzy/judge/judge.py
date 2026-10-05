@@ -647,6 +647,13 @@ class FactConsistencyJudge:
                     candidate_id=ids[ci],
                 )
                 signals["fact_consistency"] = result.weighted_reward
+                # 事实一致性硬门控要读的六要素原始分最小值。
+                # 名字必须与 sfzy/rl/reward_spec.py 的 FACT_GATE_SIGNAL 一致
+                # （judge 层刻意不 import 那一层，免得把 torch 依赖倒灌进
+                #  纯 CPU 的 reward 路径）；一致性由 tests/test_reward.py 钉住。
+                signals["fact_consistency_min_raw"] = float(
+                    min(result.raw_scores.values())
+                )
 
             if "element_coverage" in self.tasks:
                 present = cov_present[ci]

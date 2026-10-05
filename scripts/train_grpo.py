@@ -264,7 +264,7 @@ def main() -> None:
         else None
     )
     if scorer is not None:
-        missing = reward_spec.required_signals - set(scorer.available_signals())
+        missing = reward_spec.needed_signals - set(scorer.available_signals())
         if missing:
             raise ValueError(
                 f"奖励需要的裁判信号 {sorted(missing)} 这个裁判产不出来，"

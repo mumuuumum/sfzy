@@ -243,6 +243,30 @@ def test_门控可只覆盖部分阈值():
     assert s.gate.cfg["require_result_marker"] == DEFAULT_GATE["require_result_marker"]
 
 
+def test_事实硬门控默认开启且需要额外信号():
+    s = spec({"fact_consistency": fact_term()})
+    assert s.gate.cfg["fact_consistency_min_raw"] == 1
+    assert s.fact_element_gate_enabled is True
+    assert s.gate_signals == {"fact_consistency_min_raw"}
+    assert s.needed_signals == {"fact_consistency", "fact_consistency_min_raw"}
+    # required_signals 仍然只表示 judge **任务**信号，不被门控辅助信号污染
+    assert s.required_signals == {"fact_consistency"}
+
+
+def test_事实硬门控可关闭():
+    s = spec({"fact_consistency": fact_term()},
+             gate={"fact_consistency_min_raw": 0})
+    assert s.fact_element_gate_enabled is False
+    assert s.gate_signals == set()
+    assert s.needed_signals == {"fact_consistency"}
+
+
+def test_没开事实项就不需要硬门控信号():
+    s = spec({"rouge_l": {"weight": 1.0}})
+    assert s.fact_element_gate_enabled is False
+    assert s.needed_signals == set()
+
+
 # ---------------------------------------------------------------- 随仓库的配置
 
 def _load(name: str):
