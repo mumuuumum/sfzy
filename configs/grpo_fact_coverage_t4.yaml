@@ -121,6 +121,10 @@ semantic:
   extract_max_new_tokens: 1536
   min_document_elements: 2
   doc_fallback: true
+  # 逐要素判定时附上原文/摘要各自的完整六要素，高亮本次对比项，其余五项作
+  # 辅助。用来弥补抽取的边界误差（同一件事可能一边抽进 court_facts、另一边
+  # 抽进 legal_basis），避免把"分类不同"误判成"编造"。
+  element_context: true
   # 方案 A：抽取走 API（换更强模型、不占本地显存），判定仍用本地裁判。
   # 取消注释并填好 base_url / model；密钥只从环境变量读，不写进配置。
   extract_api:

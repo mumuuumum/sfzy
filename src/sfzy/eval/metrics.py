@@ -148,6 +148,8 @@ def _build_six_element_scorer(
         tasks=tasks,
         min_document_elements=int(spec.get("min_document_elements", 2)),
         doc_fallback=bool(spec.get("doc_fallback", True)),
+        # 判定时附上两边完整六要素，其余五项作辅助，弥补抽取边界误差
+        use_element_context=bool(spec.get("element_context", False)),
         # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，位置由
         # device_map 定在 semantic.device 指的卡上，与策略分居两卡。
         load_in_4bit=bool(spec.get("load_in_4bit", False)),

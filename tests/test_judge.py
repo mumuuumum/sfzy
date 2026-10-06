@@ -312,6 +312,47 @@ def test_判官按类型选择抽取prompt():
     assert rt.systems == [EXTRACT_SYSTEM, EXTRACT_SUMMARY_SYSTEM]
 
 
+def test_上下文判定prompt_原文给六项摘要只给目标项():
+    from sfzy.judge.prompts import ELEMENT_ZH, build_judge_messages_with_context
+
+    doc = SixElements(case_type="劳动纠纷", court_facts="原文查明的事实",
+                      legal_basis="原文法条")
+    cand = SixElements(case_type="劳动纠纷", court_facts="摘要概括的事实",
+                       legal_basis="摘要法条")
+    user = build_judge_messages_with_context("court_facts", doc, cand)[1]["content"]
+    for name in ELEMENTS:
+        assert ELEMENT_ZH[name] in user          # 原文的六要素都在
+    highlighted = [l for l in user.splitlines() if "← 本次对比的要素" in l]
+    assert len(highlighted) == 1                 # 只有原文侧高亮
+    assert "court_facts" in highlighted[0]
+    summary_block = user.split("【待评价摘要的要素】")[1]
+    assert "court_facts" in summary_block
+    assert "legal_basis" not in summary_block    # 摘要侧只给要判的那一项
+
+
+def test_开关开启时判定带上其它要素作辅助():
+    class _RT:
+        def __init__(self):
+            self.rendered = []
+            self.stats = {}
+
+        def render(self, messages):
+            self.rendered.append(messages[1]["content"])
+            return "prompt"
+
+        def score_digits_batch(self, prompts, digits=""):
+            n = len(prompts)
+            return [4] * n, [1.0] * n, [[1.0, 0, 0, 0, 0]] * n
+
+    rt = _RT()
+    j = FactConsistencyJudge(runtime=rt, use_element_context=True)
+    doc = SixElements(court_facts="原文事实", legal_basis="《中华人民共和国劳动法》第七条")
+    cand = SixElements(court_facts="摘要事实")
+    j.judge_elements_batch(j.build_pairs(doc, cand, None))
+    # 判 court_facts 时，原文的其它要素（legal_basis）也出现在 prompt 里
+    assert any("《中华人民共和国劳动法》第七条" in p for p in rt.rendered)
+
+
 def test_抽取用独立的extract_runtime():
     """给 extract_runtime 时，抽取走它、判定仍走裁判模型。"""
     class _RT:

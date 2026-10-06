@@ -32,6 +32,7 @@ from sfzy.judge.prompts import (
     build_coverage_messages,
     build_extract_messages,
     build_judge_messages,
+    build_judge_messages_with_context,
 )
 from sfzy.judge.runtime import (
     DIGITS,
@@ -72,6 +73,23 @@ class JudgeRequest:
     element: str
     left: str    # 被对照的一方：原文要素（一致性）/ 参考摘要要素（覆盖率）
     right: str   # 候选摘要要素
+    # 事实一致性开启"六要素上下文"时，附上两边的完整六要素（其余五项作辅助）。
+    doc_elements: Optional[SixElements] = None
+    cand_elements: Optional[SixElements] = None
+
+
+class FactPair(tuple):
+    """`(name, doc_value, cand_value)` 三元组，额外携带两边的六要素上下文。
+
+    做成 tuple 子类是为了不破坏按三元组解包的旧调用；上下文以属性挂在上面，
+    渲染判定 prompt 时用。
+    """
+
+    def __new__(cls, name, doc_value, cand_value, doc_elements=None, cand_elements=None):
+        self = super().__new__(cls, (name, doc_value, cand_value))
+        self.doc_elements = doc_elements
+        self.cand_elements = cand_elements
+        return self
 
 
 class ExtractionFailure(RuntimeError):
@@ -174,6 +192,7 @@ class FactConsistencyJudge:
         runtime: Optional[TorchRuntime] = None,
         extract_runtime: Optional[TorchRuntime] = None,
         doc_fallback: bool = True,
+        use_element_context: bool = False,
         load_in_4bit: bool = False,
         bnb_4bit_compute_dtype: Optional[str] = None,
         trust_remote_code: bool = True,
@@ -213,6 +232,8 @@ class FactConsistencyJudge:
                 f"未知的 judge task：{unknown}（支持：{list(SUPPORTED_TASKS)}）"
             )
         self.doc_fallback = doc_fallback
+        # 判定时是否附上两边的完整六要素（其余五项作辅助），弥补抽取边界误差
+        self.use_element_context = bool(use_element_context)
         self.extract_max_new_tokens = extract_max_new_tokens
         self.max_input_tokens = max_input_tokens
         # 截断后的文档缓存（doc_fallback 每条要素都要用同一段截断文本，
@@ -266,8 +287,9 @@ class FactConsistencyJudge:
             )
         except Exception:  # noqa: BLE001
             system_tokens = 1024
-        # 512 留给候选要素与模板
-        budget = max(256, self.max_input_tokens - system_tokens - 512)
+        # 1500 留给"候选要素 + 另一边的其余五项 + 模板"：开了六要素上下文后，
+        # prompt 里除了这段兜底原文，还要装下另外 5+6 个要素。
+        budget = max(256, self.max_input_tokens - system_tokens - 1500)
         fitted = runtime.truncate_text(document, budget)
         self._doc_fit_cache[document] = fitted
         return fitted
@@ -400,6 +422,16 @@ class FactConsistencyJudge:
             messages = build_coverage_messages(
                 request.element, request.left, request.right
             )
+        elif (
+            self.use_element_context
+            and request.doc_elements is not None
+            and request.cand_elements is not None
+        ):
+            # 逐要素给分不变，只是把两边的六要素都摆出来、高亮本次对比项。
+            messages = build_judge_messages_with_context(
+                request.element, request.doc_elements, request.cand_elements,
+                document_target=request.left, candidate_target=request.right,
+            )
         else:
             messages = build_judge_messages(
                 request.element, request.left, request.right
@@ -439,8 +471,12 @@ class FactConsistencyJudge:
     ) -> Tuple[List[int], List[float], List[List[float]]]:
         """真正调模型的那一层。**不做**空字段规则，调用方负责。"""
         requests = [
-            JudgeRequest("fact_consistency", name, left, right)
-            for name, left, right in pairs
+            JudgeRequest(
+                "fact_consistency", item[0], item[1], item[2],
+                doc_elements=getattr(item, "doc_elements", None),
+                cand_elements=getattr(item, "cand_elements", None),
+            )
+            for item in pairs
         ]
         return self._score_requests(requests)
 
@@ -522,26 +558,32 @@ class FactConsistencyJudge:
         document_elements: SixElements,
         candidate_elements: SixElements,
         document: Optional[str] = None,
-    ) -> List[Tuple[str, str, str]]:
+    ) -> List[FactPair]:
         """按空字段规则组装 (要素名, 原文要素, 摘要要素) 三元组。
 
         抽成独立方法是因为它有**两条调用路径**：`judge_summary`（只给分数）
         和演示程序（还要打印 pmax）。两边必须用同一套规则，否则演示看到的
         和生产跑的就不是一个东西。
+
+        返回的 `FactPair` 就是三元组（旧代码可照常解包），额外带上两边的
+        六要素上下文，供"逐要素判定 + 其余五项辅助"用。
         """
-        pairs: List[Tuple[str, str, str]] = []
+        pairs: List[FactPair] = []
         for name in ELEMENTS:
             doc_v = document_elements.get(name).strip()
             cand_v = candidate_elements.get(name).strip()
             if not cand_v:
                 # 规则一 / 规则二：候选省略 → 4 分，不会真的发请求
-                pairs.append((name, doc_v, ""))
+                pairs.append(FactPair(name, doc_v, "", document_elements, candidate_elements))
             elif doc_v:
-                pairs.append((name, doc_v, cand_v))
+                pairs.append(FactPair(name, doc_v, cand_v, document_elements, candidate_elements))
             elif self.doc_fallback and document:
-                pairs.append((name, self._fit_document_for_judge(document), cand_v))
+                pairs.append(FactPair(
+                    name, self._fit_document_for_judge(document), cand_v,
+                    document_elements, candidate_elements,
+                ))
             else:
-                pairs.append((name, "", cand_v))
+                pairs.append(FactPair(name, "", cand_v, document_elements, candidate_elements))
         return pairs
 
     def build_coverage_pairs(
@@ -623,7 +665,8 @@ class FactConsistencyJudge:
                         cons_precomputed[(ci, name)] = MAX_SCORE
                     elif doc_v:
                         cons_requests.append(
-                            JudgeRequest("fact_consistency", name, doc_v, cand_v)
+                            JudgeRequest("fact_consistency", name, doc_v, cand_v,
+                                         doc_el, ce)
                         )
                         cons_slots.append((ci, name))
                     elif self.doc_fallback and document:
@@ -635,13 +678,15 @@ class FactConsistencyJudge:
                             JudgeRequest(
                                 "fact_consistency", name,
                                 self._fit_document_for_judge(document), cand_v,
+                                doc_el, ce,
                             )
                         )
                         cons_slots.append((ci, name))
                         fallback_slots.add((ci, name))
                     else:
                         cons_requests.append(
-                            JudgeRequest("fact_consistency", name, "", cand_v)
+                            JudgeRequest("fact_consistency", name, "", cand_v,
+                                         doc_el, ce)
                         )
                         cons_slots.append((ci, name))
 

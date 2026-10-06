@@ -26,12 +26,12 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-from sfzy.judge.schema import ELEMENT_ZH
+from sfzy.judge.schema import ELEMENT_ZH, ELEMENTS
 
 # ---------------------------------------------------------------------------
 # 六要素提取（需求第二节）
 # ---------------------------------------------------------------------------
-EXTRACT_PROMPT_VERSION = "v3-verbatim-procedure"
+EXTRACT_PROMPT_VERSION = "v4-verbatim-procedure-reasoning"
 EXTRACT_SUMMARY_PROMPT_VERSION = "s1-summary"
 
 # EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
@@ -299,6 +299,76 @@ def build_judge_messages(
 {candidate_element}
 
     请判断待评价摘要要素与裁判文书原文要素的事实一致性。"""
+    return [
+        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+def _element_block(elements, highlight: str, highlight_value: str = None) -> str:
+    """把六要素排成清单，标出本次要对比的那一项。
+
+    `highlight_value` 是实际送判的对比文本（正常就是对应要素本身；原文抽空、
+    改用整篇原文兜底时是兜底文本）。
+    """
+    values = elements.to_dict() if hasattr(elements, "to_dict") else dict(elements)
+    lines = []
+    for name in ELEMENTS:
+        raw = highlight_value if (name == highlight and highlight_value is not None) \
+            else values.get(name)
+        value = (raw or "").strip() or "（空）"
+        mark = "   ← 本次对比的要素" if name == highlight else ""
+        lines.append(f"- {ELEMENT_ZH[name]}（{name}）：{value}{mark}")
+    return "\n".join(lines)
+
+
+def build_judge_messages_with_context(
+    element_name: str,
+    document_elements,
+    candidate_elements=None,
+    document_target: str = None,
+    candidate_target: str = None,
+) -> List[Dict[str, str]]:
+    """带原文六要素上下文的判定 prompt（本次只判 `element_name` 这一项）。
+
+    每次判定给：
+      * 原文的**全部六要素**（高亮本次对比项，其余五项作辅助）；
+      * 摘要的**仅本次要判的那一个要素**。
+
+    为什么这样不对称：抽取的边界有噪声，同一件事可能被原文抽进 court_facts、
+    却被摘要抽进 legal_basis（或反过来）。只给"要对比的两小段"时，这种边界
+    误差会被当成"编造/不一致"。把原文六项都摆出来，只要摘要该项的陈述在原文
+    **任意一项**里出现过，就按一致处理。摘要侧不需要展示其它五项——它们既不
+    参与本次判定，还会引入无关信息。
+
+    `document_target` / `candidate_target` 是实际送判的对比文本。正常就是对应
+    要素本身；原文该要素抽空、改用整篇原文兜底时，`document_target` 放兜底文本。
+    """
+    zh = ELEMENT_ZH.get(element_name, element_name)
+    doc_block = _element_block(document_elements, element_name, document_target)
+    if candidate_target is None and candidate_elements is not None:
+        values = (candidate_elements.to_dict()
+                  if hasattr(candidate_elements, "to_dict") else dict(candidate_elements))
+        candidate_target = values.get(element_name) or ""
+    cand_value = (candidate_target or "").strip() or "（空）"
+
+    user = f"""当前评价要素类型：
+{zh}（{element_name}）
+
+判断方向：原文 → 摘要。本次**只**评价摘要的【{zh}】。
+
+【裁判文书原文的六要素】（高亮的是本次对比的要素；其余五项只作辅助——抽取时可能把本要素的内容归到别的要素里）
+{doc_block}
+
+【待评价摘要的要素】
+{zh}（{element_name}）：{cand_value}
+
+辅助规则（原文六要素的边界划分并不严格，用来弥补抽取误差）：
+- 判断摘要的【{zh}】时，只要它的陈述在原文**任意一项**里出现过、能被支持，就按一致处理，不算编造或新增。
+- 摘要省略、概括不扣分。
+- 仍要区分“当事人主张”和“法院认定”，二者互换仍然算不一致。
+
+请判断摘要的【{zh}】是否受原文支持。只输出 0、1、2、3、4 中的一个整数。"""
     return [
         {"role": "system", "content": JUDGE_SYSTEM},
         {"role": "user", "content": user},

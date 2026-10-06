@@ -1458,6 +1458,7 @@ def main() -> None:
         extract_max_new_tokens=extract_max_new_tokens,
         min_document_elements=min_document_elements,
         doc_fallback=bool(semantic.get("doc_fallback", True)),
+        use_element_context=bool(semantic.get("element_context", False)),
     )
 
     all_stats = []
