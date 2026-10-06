@@ -169,7 +169,7 @@ class FactConsistencyJudge:
         weights: Optional[Dict[str, float]] = None,
         coverage_weights: Optional[Dict[str, float]] = None,
         tasks: Optional[Sequence[str]] = None,
-        max_input_tokens: int = 4096,
+        max_input_tokens: int = 8192,
         min_document_elements: int = 2,
         runtime: Optional[TorchRuntime] = None,
         extract_runtime: Optional[TorchRuntime] = None,
@@ -214,6 +214,10 @@ class FactConsistencyJudge:
             )
         self.doc_fallback = doc_fallback
         self.extract_max_new_tokens = extract_max_new_tokens
+        self.max_input_tokens = max_input_tokens
+        # 截断后的文档缓存（doc_fallback 每条要素都要用同一段截断文本，
+        # 不缓存的话一篇文书要 tokenize 六次）
+        self._doc_fit_cache: Dict[str, str] = {}
         # 文档要素少于这个数就认定提取失败（见 ExtractionFailure 的说明）。
         # 真实的判决书至少有案由、诉请、查明、结果四项，2 已经是很松的下限。
         self.min_document_elements = min_document_elements
@@ -231,9 +235,45 @@ class FactConsistencyJudge:
         self.last_probs: List[List[float]] = []
 
     # ---------------------------------------------------------------- 提取
+    def _fit_for_extract(self, text: str) -> str:
+        """把抽取输入压到预算内（头 + 尾），system 指令始终保留。"""
+        runtime = self.extract_runtime
+        if not hasattr(runtime, "truncate_text"):
+            return text
+        try:
+            system_tokens = runtime.count_tokens(
+                runtime.render([build_extract_messages("")[0]])
+            )
+        except Exception:  # noqa: BLE001
+            system_tokens = 1024
+        budget = max(256, self.max_input_tokens - system_tokens - 32)
+        return runtime.truncate_text(text, budget)
+
+    def _fit_document_for_judge(self, document: str) -> str:
+        """doc_fallback 时把整篇原文压到判定预算内（同样的头+尾策略）。"""
+        cached = self._doc_fit_cache.get(document)
+        if cached is not None:
+            return cached
+        runtime = self.runtime
+        if not hasattr(runtime, "truncate_text"):
+            self._doc_fit_cache[document] = document
+            return document
+        try:
+            system_tokens = runtime.count_tokens(
+                runtime.render(build_judge_messages("case_type", "", "")[:1])
+            )
+        except Exception:  # noqa: BLE001
+            system_tokens = 1024
+        # 512 留给候选要素与模板
+        budget = max(256, self.max_input_tokens - system_tokens - 512)
+        fitted = runtime.truncate_text(document, budget)
+        self._doc_fit_cache[document] = fitted
+        return fitted
+
     def _extract_once(
         self, texts: Sequence[str], max_new_tokens: int
     ) -> Tuple[List[SixElements], List[str]]:
+        texts = [self._fit_for_extract(t) for t in texts]
         prompts = [
             self.extract_runtime.render(build_extract_messages(t)) for t in texts
         ]
@@ -328,6 +368,7 @@ class FactConsistencyJudge:
     def clear_cache(self) -> None:
         self._doc_cache.clear()
         self._ref_cache.clear()
+        self._doc_fit_cache.clear()
 
     def reference_elements(self, reference: str) -> SixElements:
         """参考摘要（人工摘要）的六要素，按 sha1 缓存。
@@ -486,7 +527,7 @@ class FactConsistencyJudge:
             elif doc_v:
                 pairs.append((name, doc_v, cand_v))
             elif self.doc_fallback and document:
-                pairs.append((name, document, cand_v))
+                pairs.append((name, self._fit_document_for_judge(document), cand_v))
             else:
                 pairs.append((name, "", cand_v))
         return pairs
@@ -579,7 +620,10 @@ class FactConsistencyJudge:
                         # 奖励就变成"提取器漏过的要素千万别写"，而且不报错。
                         # 拿整篇原文去判，裁判才有东西可核对。
                         cons_requests.append(
-                            JudgeRequest("fact_consistency", name, document, cand_v)
+                            JudgeRequest(
+                                "fact_consistency", name,
+                                self._fit_document_for_judge(document), cand_v,
+                            )
                         )
                         cons_slots.append((ci, name))
                         fallback_slots.add((ci, name))

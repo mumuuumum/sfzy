@@ -128,6 +128,8 @@ from sfzy.eval.rouge import score_pair                       # noqa: E402
 from sfzy.rl.reward import compute_reward                    # noqa: E402
 from sfzy.rl.reward_spec import RewardSpec                   # noqa: E402
 from sfzy.utils.logging import get_logger                    # noqa: E402
+from sfzy.utils.text_fit import count_tokens as _count_tokens  # noqa: E402
+from sfzy.utils.text_fit import truncate_text as _truncate_text  # noqa: E402
 
 # 六要素 Judge 的受限解码头，和 sfzy/judge/runtime.py 用同一个词表
 from sfzy.judge.runtime import DIGITS                        # noqa: E402
@@ -193,7 +195,7 @@ class VLLMRuntime:
         llm: Any,
         tokenizer: Any,
         *,
-        max_input_tokens: int = 4096,
+        max_input_tokens: int = 8192,
         max_logprobs: int = 50,
     ) -> None:
         self.llm = llm
@@ -225,6 +227,13 @@ class VLLMRuntime:
             max_length=self.max_input_tokens,
         )
         return list(enc["input_ids"])
+
+    # 和 TorchRuntime 同一套：只截输入文本、保留头尾，system 与生成标记不动
+    def count_tokens(self, text: str) -> int:
+        return _count_tokens(self.tokenizer, text)
+
+    def truncate_text(self, text: str, max_tokens: int, tail_ratio: float = 0.5) -> str:
+        return _truncate_text(self.tokenizer, text, max_tokens, tail_ratio)
 
     def _generate(self, prompts: Sequence[str], sampling: Any) -> List[Any]:
         ids = self._encode(prompts)
@@ -1186,6 +1195,7 @@ def run_input(
     stats["input"] = str(path)
     stats["output"] = str(out_path)
     stats["extract_model"] = getattr(args, "extract_model", None)
+    stats["max_input_tokens"] = args.max_input_tokens
     try:  # 记录抽取 prompt 版本，换过 prompt 的结果才不会混在一起比
         from sfzy.judge.prompts import EXTRACT_PROMPT_VERSION
 
@@ -1297,8 +1307,10 @@ def main() -> None:
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--swap-space", type=int, default=4)
-    ap.add_argument("--max-input-tokens", type=int, default=4096,
-                    help="prompt 截断长度（和 Judge 的 max_input_tokens 一致）")
+    ap.add_argument("--max-input-tokens", type=int, default=8192,
+                    help="抽取/判定 prompt 的输入预算。4096 会把长判决书的抽取 "
+                         "prompt 截断（实测抽取直接返回原文片段、全要素为空），"
+                         "默认提到 8192；超预算的输入按头+尾截断，system 不丢")
     ap.add_argument("--extract-max-new-tokens", type=int, default=None,
                     help="六要素抽取的生成预算，默认取 semantic.extract_max_new_tokens")
     ap.add_argument("--max-model-len", type=int, default=None)

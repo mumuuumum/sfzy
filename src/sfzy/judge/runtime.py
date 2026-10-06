@@ -56,6 +56,8 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from sfzy.models.compat import greedy_generation_kwargs
+from sfzy.utils.text_fit import count_tokens as _count_tokens
+from sfzy.utils.text_fit import truncate_text as _truncate_text
 
 ROOT = Path(__file__).resolve().parents[3]
 
@@ -75,7 +77,7 @@ class TorchRuntime:
         tokenizer: Any,
         device: Optional[str] = None,
         max_batch_size: int = 8,
-        max_input_tokens: int = 4096,
+        max_input_tokens: int = 8192,
         context: Optional[Callable[[], Any]] = None,
         native_generation: Optional[bool] = None,
     ) -> None:
@@ -135,6 +137,22 @@ class TorchRuntime:
         finally:
             tok.padding_side = old_side
         return enc["input_ids"].to(self.device), enc["attention_mask"].to(self.device)
+
+    # ------------------------------------------------------------------
+    def count_tokens(self, text: str) -> int:
+        return _count_tokens(self.tokenizer, text)
+
+    def truncate_text(self, text: str, max_tokens: int, tail_ratio: float = 0.5) -> str:
+        """输入文本超预算时保留头 + 尾、砍掉中间，返回同一文本的缩短版。
+
+        **只截输入文本，不截整段 prompt。** 整段 prompt 用 tokenizer 的
+        truncation_side 截断两头都有害：
+          * 从左边切会把 system 指令切掉，模型于是接着复述原文（实测症状）；
+          * 从右边切会把"该你回答了"的生成标记切掉。
+        判决书的关键信息一头一尾（当事人/诉请 + 本院认为/判决结果），所以
+        保留头尾、丢掉中间是最不坏的选择。
+        """
+        return _truncate_text(self.tokenizer, text, max_tokens, tail_ratio)
 
     @staticmethod
     def _batched(items: Sequence[Any], size: int):
@@ -245,7 +263,7 @@ def build_runtime(
     device: str = "auto",
     dtype: str = "bfloat16",
     max_batch_size: int = 8,
-    max_input_tokens: int = 4096,
+    max_input_tokens: int = 8192,
     load_in_4bit: bool = False,
     bnb_4bit_compute_dtype: Optional[str] = None,
     trust_remote_code: bool = True,

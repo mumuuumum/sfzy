@@ -107,6 +107,7 @@ def _build_six_element_scorer(
     # 不给就共用裁判模型。注意这会在显存里多放一份权重。
     extract_model = spec.get("extract_model")
     extract_runtime = None
+    max_input_tokens = int(spec.get("max_input_tokens", 8192))
     if extract_model and extract_model != model:
         from sfzy.judge.runtime import build_runtime, resolve_model_path
 
@@ -115,7 +116,7 @@ def _build_six_element_scorer(
             device=spec.get("extract_device", spec.get("device", "cuda:1")),
             dtype=spec.get("extract_dtype", spec.get("dtype", "bfloat16")),
             max_batch_size=int(spec.get("max_batch_size", 8)),
-            max_input_tokens=int(spec.get("max_input_tokens", 4096)),
+            max_input_tokens=max_input_tokens,
             load_in_4bit=bool(
                 spec.get("extract_load_in_4bit", spec.get("load_in_4bit", False))
             ),
@@ -132,6 +133,7 @@ def _build_six_element_scorer(
         max_batch_size=int(spec.get("max_batch_size", 8)),
         extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
         extract_runtime=extract_runtime,
+        max_input_tokens=max_input_tokens,
         # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),

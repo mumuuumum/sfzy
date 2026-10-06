@@ -111,7 +111,12 @@ semantic:
   load_in_4bit: true
   # 两个 judge 项的判定会合并成一次批量前向，batch 上限仍然按"6 要素 × G 候选"估
   max_batch_size: 4
-  extract_max_new_tokens: 768
+  # 抽取/判定 prompt 的输入预算：4096 会把长判决书（≥4000 字）的抽取 prompt
+  # 截掉 system 指令，实测抽取直接返回原文片段、六要素全为空 → 后面全判 0。
+  # 8192 覆盖 val 的 p99（约 6500 字）；超预算的输入按头+尾截断，system 不丢。
+  max_input_tokens: 8192
+  # v2 抽取 prompt 更长、输出也更长（要逐字保留细节），768 容易把 JSON 截断
+  extract_max_new_tokens: 1024
   min_document_elements: 2
   doc_fallback: true
 

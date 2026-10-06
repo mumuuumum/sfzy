@@ -293,6 +293,35 @@ def test_抽取用独立的extract_runtime():
     assert extract_rt.calls == 1 and judge_rt.calls == 0
 
 
+def test_抽取输入超预算时按头尾截断():
+    """长判决书的抽取 prompt 一旦整段截断就会丢 system 指令、抽成原文片段；
+    现在改成只把输入文本按头+尾压到预算内。"""
+    class _RT:
+        def __init__(self):
+            self.seen = []
+            self.stats = {}
+
+        def render(self, messages):
+            return messages[-1]["content"]
+
+        def count_tokens(self, text):
+            return len(text)
+
+        def truncate_text(self, text, max_tokens, tail_ratio=0.5):
+            self.seen.append((text, max_tokens))
+            return text[:max_tokens]
+
+        def generate_batch(self, prompts, max_new_tokens=512):
+            return ['{"case_type": "X"}'] * len(prompts)
+
+    rt = _RT()
+    j = FactConsistencyJudge(runtime=rt, max_input_tokens=2000)
+    j._extract_once(["文" * 5000], 16)
+    assert rt.seen, "长输入没有被截断"
+    budget = rt.seen[0][1]
+    assert 0 < budget < 2000
+
+
 def test_空字段不送进模型():
     """候选什么都没写时不该浪费一次前向。"""
     doc = SixElements(case_type="借款合同纠纷", court_facts="借款属实")
