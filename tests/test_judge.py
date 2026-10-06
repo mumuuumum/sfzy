@@ -275,6 +275,43 @@ def test_抽取prompt_v2_含逐字保真约束():
         assert kw in system
 
 
+def test_原文与摘要用不同的抽取prompt():
+    from sfzy.judge.prompts import (
+        EXTRACT_SYSTEM,
+        EXTRACT_SUMMARY_SYSTEM,
+        build_extract_messages,
+    )
+
+    assert EXTRACT_SYSTEM != EXTRACT_SUMMARY_SYSTEM
+    assert build_extract_messages("x", "document")[0]["content"] == EXTRACT_SYSTEM
+    assert build_extract_messages("x", "summary")[0]["content"] == EXTRACT_SUMMARY_SYSTEM
+    with pytest.raises(ValueError, match="未知的抽取类型"):
+        build_extract_messages("x", "bogus")
+
+
+def test_判官按类型选择抽取prompt():
+    """document_elements 用原文 prompt；候选/参考摘要用摘要 prompt。"""
+    from sfzy.judge.prompts import EXTRACT_SYSTEM, EXTRACT_SUMMARY_SYSTEM
+
+    class _RT:
+        def __init__(self):
+            self.systems = []
+            self.stats = {}
+
+        def render(self, messages):
+            self.systems.append(messages[0]["content"])
+            return "prompt"
+
+        def generate_batch(self, prompts, max_new_tokens=512):
+            return ['{"case_type": "x", "court_facts": "y"}'] * len(prompts)
+
+    rt = _RT()
+    j = FactConsistencyJudge(runtime=rt, min_document_elements=0)
+    j.document_elements("DOC")
+    j.extract_six_elements("SUMMARY")          # 默认 kind="summary"
+    assert rt.systems == [EXTRACT_SYSTEM, EXTRACT_SUMMARY_SYSTEM]
+
+
 def test_抽取用独立的extract_runtime():
     """给 extract_runtime 时，抽取走它、判定仍走裁判模型。"""
     class _RT:

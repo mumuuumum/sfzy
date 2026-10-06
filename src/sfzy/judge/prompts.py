@@ -14,6 +14,10 @@
     引用的陈述）和"何涛未答辩。本院认定事实如下…"（本案记录），抽取器会
     抓前者，把本案的 defendant_defenses 写错；现在明确要求以本案的
     "未答辩/未到庭/缺席审理"和"本院查明"为准。
+另外原文和摘要**分两套 prompt**：`EXTRACT_SYSTEM` 抽判决书原文（长文、要素
+齐全、要防"仲裁阶段的辩称"），`EXTRACT_SUMMARY_SYSTEM` 抽人工/候选摘要
+（短、大量要素为空、要防"把别的要素挪过来硬凑"）。调用方用
+`build_extract_messages(text, kind="document"|"summary")` 选择。
 版本号见 EXTRACT_PROMPT_VERSION，换了 prompt 要重跑 judge_probe / judge_test
 重新出基线。
 """
@@ -28,12 +32,11 @@ from sfzy.judge.schema import ELEMENT_ZH
 # 六要素提取（需求第二节）
 # ---------------------------------------------------------------------------
 EXTRACT_PROMPT_VERSION = "v3-verbatim-procedure"
+EXTRACT_SUMMARY_PROMPT_VERSION = "s1-summary"
 
 EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
 
 你的任务是从输入的裁判文书中提取裁判文书本身的六个核心要素（不要混淆其它案件描述：如裁判文书引用的仲裁、之前的裁判文书等）。
-
-只能根据输入文本提取信息，不得补充、猜测或推断文本中没有明确表达的事实。
 
 六个要素分别为：
 
@@ -41,32 +44,19 @@ EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
 2. plaintiff_claims：当前裁判中原告的诉讼请求
 3. defendant_defenses：当前裁判中被告的辩称、抗辩意见
 4. court_facts：当前裁判中法院审理查明、认定的案件事实
-5. legal_basis：当前裁判中法院裁判所依据的法律、司法解释、法律条文及主要裁判理由
+5. legal_basis：当前裁判中法院裁判所依据的法律、司法解释、法律条文
 6. judgment_result：当前裁判中法院最终裁判结果
 
 特别注意：
 
 - 一般六个要素是按顺序依次出现的，根据位置判断六个要素的提取范围；
 - 是当前裁判文书的六个要素还是其它案件的事实、观点、陈述；
-- 如果文本明确写了“被告未答辩”“被告未到庭”“缺席审理”，那么
-  defendant_defenses 就写“未答辩”（可注明“被告经合法传唤未到庭，未答辩”）。
-  不要把这个案子之外（仲裁阶段、另案、上诉）的陈述，或别人转述的观点，
-  当成本案被告的答辩；
-- 法院认定的事实以“本院查明”“本院认定事实如下”“经审理查明”之后的表述为准。
-  出现在它之前的原告“事实与理由”“被告辩称”等段落，都不是 court_facts。
-
-抽取是“摘录”，不是“转述”或“概括”。以下内容必须与输入文本**逐字一致**：
-
-- 日期与时间：年 / 月 / 日 / 时段原样保留。文本里同时出现多个日期时，每个日期必须仍然对应它原本描述的那件事，绝不能把一件事的日期挪到另一件事上。
-- 主体与称谓：人名、公司名、当事人身份照抄原文用词。
-- 肯否与结果：肯定 / 否定、“支持 / 驳回 / 不予支持”不得反转。
+- 如果文本明确写了“被告未答辩”“被告未到庭”“缺席审理”，那么 defendant_defenses 就写“未答辩”；
+- plaintiff_claims、defendant_defenses、court_facts三部分选择对最终判决真正有帮助的进行表述。
 
 写作要求：
 
 - 一句话包含多个事实点时，逐条分开写（用分号或编号并列），不要合并成一句概括。
-- 原文表述含糊、前后有出入时，照抄原文措辞，不要替它补充、澄清或纠正。
-- 不要把法院的裁判理由、法律评价写进 court_facts；也不要把当事人的主张写进 court_facts。
-- 不要把其它的仲裁、之前的裁判写入 court_facts；只写本案的内容。
 
 如果某个要素在输入文本中不存在，返回空字符串。
 
@@ -84,9 +74,61 @@ EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
 }"""
 
 
-def build_extract_messages(text: str) -> List[Dict[str, str]]:
+# ---------------------------------------------------------------------------
+# 六要素提取：摘要版（和原文版分开）
+# ---------------------------------------------------------------------------
+# 为什么分开：判决书原文长、要素齐全，陷阱在"仲裁阶段引用的辩称 vs 本案未答辩"；
+# 摘要很短、大量要素根本没写，陷阱在"把别的要素挪过来硬凑"。同一段 prompt 顾
+# 不上两头，所以原文用 EXTRACT_SYSTEM，摘要用下面这段。
+EXTRACT_SUMMARY_SYSTEM = """你是一个裁判文书摘要的信息抽取模型。
+
+输入是一段裁判文书摘要（对判决书原文的压缩），请从这段摘要里抽取案件的六个核心要素。
+
+六个要素分别为：
+
+1. case_type：案件类型或案由
+2. plaintiff_claims：原告的诉讼请求
+3. defendant_defenses：被告的辩称、抗辩意见
+4. court_facts：法院审理查明、认定的案件事实
+5. legal_basis：法院裁判所依据的法律、司法解释、法律条文及主要裁判理由
+6. judgment_result：法院最终裁判结果
+
+抽取原则：
+
+- 只需要抽取。
+- 摘要通常很短，某些要素可能根本没写。没写就返回空字符串。
+
+只输出合法 JSON，不输出 Markdown，不解释。
+
+输出格式严格为：
+
+{
+  "case_type": "",
+  "plaintiff_claims": "",
+  "defendant_defenses": "",
+  "court_facts": "",
+  "legal_basis": "",
+  "judgment_result": ""
+}"""
+
+
+# 原文 / 摘要两套抽取 prompt。默认 document，保持旧调用不变。
+EXTRACT_PROMPTS: Dict[str, str] = {
+    "document": EXTRACT_SYSTEM,
+    "summary": EXTRACT_SUMMARY_SYSTEM,
+}
+
+
+def build_extract_messages(text: str, kind: str = "document") -> List[Dict[str, str]]:
+    """`kind`：`document`=裁判文书原文，`summary`=判决书摘要（人工/候选）。"""
+    try:
+        system = EXTRACT_PROMPTS[kind]
+    except KeyError as exc:
+        raise ValueError(
+            f"未知的抽取类型 {kind!r}（可用：{sorted(EXTRACT_PROMPTS)}）"
+        ) from exc
     return [
-        {"role": "system", "content": EXTRACT_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content": text},
     ]
 

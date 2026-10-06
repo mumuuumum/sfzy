@@ -235,14 +235,14 @@ class FactConsistencyJudge:
         self.last_probs: List[List[float]] = []
 
     # ---------------------------------------------------------------- 提取
-    def _fit_for_extract(self, text: str) -> str:
+    def _fit_for_extract(self, text: str, kind: str = "summary") -> str:
         """把抽取输入压到预算内（头 + 尾），system 指令始终保留。"""
         runtime = self.extract_runtime
         if not hasattr(runtime, "truncate_text"):
             return text
         try:
             system_tokens = runtime.count_tokens(
-                runtime.render([build_extract_messages("")[0]])
+                runtime.render([build_extract_messages("", kind)[0]])
             )
         except Exception:  # noqa: BLE001
             system_tokens = 1024
@@ -273,23 +273,29 @@ class FactConsistencyJudge:
         return fitted
 
     def _extract_once(
-        self, texts: Sequence[str], max_new_tokens: int
+        self, texts: Sequence[str], max_new_tokens: int, kind: str = "summary"
     ) -> Tuple[List[SixElements], List[str]]:
-        texts = [self._fit_for_extract(t) for t in texts]
-        prompts = [
-            self.extract_runtime.render(build_extract_messages(t)) for t in texts
-        ]
+        texts = [self._fit_for_extract(t, kind) for t in texts]
+        conversations = [build_extract_messages(t, kind) for t in texts]
         # === 调试：打印提取阶段的输入 Prompt ===
         if _VERBOSE:
-            for i, (t, p) in enumerate(zip(texts, prompts)):
+            for i, (t, conv) in enumerate(zip(texts, conversations)):
                 print(f"\n{'='*20} [Extract] 样本 {i+1} 输入 {'='*20}")
                 print(f"原始文本（前300字）: {t[:300]}...")
-                print(f"构造的完整 Prompt:\n{p}\n")
+                print(f"抽取类型: {kind}")
+                print(f"构造的完整 Prompt:\n{conv}\n")
         # ====================================
 
-        raws = self.extract_runtime.generate_batch(
-            prompts, max_new_tokens=max_new_tokens
-        )
+        # 会话式 runtime（如 API）直接吃 messages；本地 runtime 先 render 再前向。
+        if hasattr(self.extract_runtime, "generate_messages"):
+            raws = self.extract_runtime.generate_messages(
+                conversations, max_new_tokens=max_new_tokens
+            )
+        else:
+            prompts = [self.extract_runtime.render(c) for c in conversations]
+            raws = self.extract_runtime.generate_batch(
+                prompts, max_new_tokens=max_new_tokens
+            )
         parsed = [parse_six_json_debug(r) for r in raws]
 
         # === 调试：打印提取阶段的模型输出与解析结果 ===
@@ -303,13 +309,17 @@ class FactConsistencyJudge:
 
         return [p[0] for p in parsed], [p[1] for p in parsed]
 
-    def extract_six_elements_batch(self, texts: Sequence[str]) -> List[SixElements]:
+    def extract_six_elements_batch(
+        self, texts: Sequence[str], kind: str = "summary"
+    ) -> List[SixElements]:
         """批量提取六要素，**解析降级时自动重试**（预算翻倍）。
 
         重试不是锦上添花：实测 2600 字的文书在 512 token 预算下会被截断，
         六个要素只捞到一个，而"文档要素为空"会让所有候选奖励归零。
         重试的判断依据是解析方式 —— 只要没能干净地 `json.loads` 成功，
         就说明输出有问题，值得花一次更大的预算重来。
+
+        `kind`：`document`=判决书原文，`summary`=摘要（人工/候选）。
         """
         if not texts:
             return []
@@ -319,14 +329,14 @@ class FactConsistencyJudge:
             return out
 
         sub = [texts[i] for i in todo]
-        els, modes = self._extract_once(sub, self.extract_max_new_tokens)
+        els, modes = self._extract_once(sub, self.extract_max_new_tokens, kind)
         self.stats["extract_calls"] += len(sub)
 
         degraded = [j for j, m in enumerate(modes) if m != "json"]
         if degraded:
             self.stats["extract_degraded"] += len(degraded)
             els2, _ = self._extract_once(
-                [sub[j] for j in degraded], self.extract_max_new_tokens * 2
+                [sub[j] for j in degraded], self.extract_max_new_tokens * 2, kind
             )
             self.stats["extract_retry"] += len(degraded)
             for k, j in enumerate(degraded):
@@ -338,8 +348,8 @@ class FactConsistencyJudge:
             out[i] = el
         return out
 
-    def extract_six_elements(self, text: str) -> SixElements:
-        return self.extract_six_elements_batch([text])[0]
+    def extract_six_elements(self, text: str, kind: str = "summary") -> SixElements:
+        return self.extract_six_elements_batch([text], kind)[0]
 
     @staticmethod
     def _cache_key(text: str) -> str:
@@ -356,7 +366,7 @@ class FactConsistencyJudge:
         """
         key = self._cache_key(document)
         if key not in self._doc_cache:
-            el = self.extract_six_elements(document)
+            el = self.extract_six_elements(document, kind="document")
             if strict and el.n_filled() < self.min_document_elements:
                 raise ExtractionFailure(
                     f"文档六要素只抽到 {el.n_filled()} 项（要求 ≥{self.min_document_elements}）：\n"

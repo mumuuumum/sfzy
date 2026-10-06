@@ -85,13 +85,40 @@ vLLM 的 bnb 支持 **in-flight 量化**（加载时把 fp16 权重现量化成 
 `*.reward.summary.json` 的 `extract_prompt_version`。**换过 prompt 的结果不要
 和旧结果混着比**；同时要重跑 `judge_probe` / `judge_test` 重新出基线。
 
+原文和摘要是**两套 prompt**：
+
+- `EXTRACT_SYSTEM`（`kind="document"`）：抽判决书原文。长文、要素齐全，重点是
+  防止"仲裁阶段引用的辩称 vs 本案未答辩"、日期挪用。
+- `EXTRACT_SUMMARY_SYSTEM`（`kind="summary"`）：抽人工/候选摘要。短、大量要素
+  为空，重点是"没写就留空，别把别的要素挪过来硬凑"，同时保持逐字摘录。
+
+调用方用 `build_extract_messages(text, kind=...)` 选择；`document_elements` 走
+原文 prompt，候选/参考摘要走摘要 prompt。换抽取 prompt 后不能和旧结果混着比。
+
+**方案 A：抽取走 API，判定留本地。** 抽取是最难的一步，可以换更强的 API 模型；
+判定要跑 `6要素 × 候选数` 次、还要受限解码的 `pmax`，放本地更划算。在配置里加：
+
+```yaml
+semantic:
+  extract_api:
+    base_url: https://api.deepseek.com/v1   # 或自建 vLLM 的 OpenAI 端口
+    api_key_env: SFZY_JUDGE_API_KEY         # 密钥只从环境变量读
+    model: deepseek-chat
+    concurrency: 16                         # 线程池并发（API 是 I/O 密集）
+    max_retries: 3
+    timeout_s: 60
+```
+
+原来的 `EXTRACT_SYSTEM` 也**不能过度删减**：v1 的"省略不扣分/合理概括"判定
+仍然由裁判负责，抽取只负责把原文/摘要里的要素如实抄下来。
+
 **输入长度**：val 原文最长约 1.2 万字，`max_input_tokens=4096/8192` 都会把长
 文书的抽取 prompt 截断（头+尾保住了，中间的事实没了 → 抽取残缺、判 0）。现在
 `max_input_tokens` 从 `semantic.max_input_tokens` 读（T4 配置里是 **16384**），
 `extract_max_new_tokens` 提到 **1536**（v3 要求逐字保留、分条列举，输出更长）。
 超预算的输入仍按头+尾截断，system 指令不丢。
 
-如果显存够，可以给抽取单独挂一个更强的模型（判定仍用原裁判）：
+如果显存够，也可以给抽取单独挂一个**本地**更强的模型（判定仍用原裁判）：
 
 ```bash
 --extract-model <更强的抽取模型> --extract-quantization awq --extract-dtype float16

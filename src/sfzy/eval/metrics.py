@@ -108,7 +108,13 @@ def _build_six_element_scorer(
     extract_model = spec.get("extract_model")
     extract_runtime = None
     max_input_tokens = int(spec.get("max_input_tokens", 8192))
-    if extract_model and extract_model != model:
+    extract_api = spec.get("extract_api")
+    if extract_api:
+        # 方案 A：抽取走 API（更强/不用本地显存），判定仍用本地裁判。
+        from sfzy.judge.api_runtime import build_api_runtime
+
+        extract_runtime = build_api_runtime(dict(extract_api))
+    elif extract_model and extract_model != model:
         from sfzy.judge.runtime import build_runtime, resolve_model_path
 
         extract_runtime = build_runtime(

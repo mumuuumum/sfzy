@@ -392,18 +392,21 @@ def _collect_unique(
     candidate_key: str,
     reference_key: str,
     seen: Dict[str, SixElements],
-) -> List[str]:
-    """收集这一批里还没抽过要素的文本（保持首次出现顺序）。"""
-    todo: List[str] = []
+) -> Tuple[List[str], List[str]]:
+    """收集这一批里还没抽过要素的文本，分成 (原文, 摘要) 两组。
+
+    判决书原文和摘要用**两套抽取 prompt**，所以必须分开批量。
+    """
+    docs: List[str] = []
+    summaries: List[str] = []
     for rec in records:
-        for text in (
-            rec.get("source") or "",
-            rec.get(reference_key) or "",
-            rec.get(candidate_key) or "",
-        ):
-            if text and text not in seen and text not in todo:
-                todo.append(text)
-    return todo
+        doc = rec.get("source") or ""
+        if doc and doc not in seen and doc not in docs:
+            docs.append(doc)
+        for text in (rec.get(reference_key) or "", rec.get(candidate_key) or ""):
+            if text and text not in seen and text not in docs and text not in summaries:
+                summaries.append(text)
+    return docs, summaries
 
 
 def score_chunk(
@@ -421,10 +424,14 @@ def score_chunk(
     tasks = set(judge.tasks)
 
     # ---- 1. 一次把这一批需要的文本都抽出来 -------------------------------
-    todo = _collect_unique(records, candidate_key, reference_key, els_cache)
-    if todo:
-        extracted = judge.extract_six_elements_batch(todo)
-        for text, el in zip(todo, extracted):
+    docs_todo, summaries_todo = _collect_unique(
+        records, candidate_key, reference_key, els_cache
+    )
+    for texts, kind in ((docs_todo, "document"), (summaries_todo, "summary")):
+        if not texts:
+            continue
+        extracted = judge.extract_six_elements_batch(texts, kind=kind)
+        for text, el in zip(texts, extracted):
             els_cache[text] = el
 
     # ---- 2. 组装两臂的判定请求（先攒起来，最后合成一次批量前向）---------
@@ -1195,11 +1202,16 @@ def run_input(
     stats["input"] = str(path)
     stats["output"] = str(out_path)
     stats["extract_model"] = getattr(args, "extract_model", None)
+    stats["extract_api_model"] = getattr(args, "extract_api_model", None)
     stats["max_input_tokens"] = args.max_input_tokens
     try:  # 记录抽取 prompt 版本，换过 prompt 的结果才不会混在一起比
-        from sfzy.judge.prompts import EXTRACT_PROMPT_VERSION
+        from sfzy.judge.prompts import (
+            EXTRACT_PROMPT_VERSION,
+            EXTRACT_SUMMARY_PROMPT_VERSION,
+        )
 
         stats["extract_prompt_version"] = EXTRACT_PROMPT_VERSION
+        stats["extract_summary_prompt_version"] = EXTRACT_SUMMARY_PROMPT_VERSION
     except Exception:  # noqa: BLE001
         pass
     summary_path = Path(str(out_path.with_suffix("")) + ".summary.json")
@@ -1421,6 +1433,18 @@ def main() -> None:
             eargs, extract_model_name,
             bool(semantic.get("extract_trust_remote_code", trust_remote_code)),
             max_model_len,
+        )
+    elif semantic.get("extract_api"):
+        # 方案 A：抽取走 API，判定仍用本地 vLLM。
+        from sfzy.judge.api_runtime import build_api_runtime
+
+        extract_api = dict(semantic["extract_api"])
+        extract_runtime = build_api_runtime(extract_api)
+        args.extract_api_model = extract_api.get("model")
+        logger.info(
+            "抽取走 API：base_url=%s model=%s concurrency=%s（判定仍用本地 %s）",
+            extract_api.get("base_url"), extract_api.get("model"),
+            extract_api.get("concurrency", 16), model_name,
         )
 
     options = spec.judge_term_options()

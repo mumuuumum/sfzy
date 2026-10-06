@@ -121,6 +121,15 @@ semantic:
   extract_max_new_tokens: 1536
   min_document_elements: 2
   doc_fallback: true
+  # 方案 A：抽取走 API（换更强模型、不占本地显存），判定仍用本地裁判。
+  # 取消注释并填好 base_url / model；密钥只从环境变量读，不写进配置。
+  extract_api:
+    base_url: https://api.deepseek.com/v1   # 或自建 vLLM 的 OpenAI 端口
+    api_key_env: SFZY_JUDGE_API_KEY
+    model: deepseek-chat
+    concurrency: 16
+    max_retries: 3
+    timeout_s: 60
 
 tracking:
   backend: none
