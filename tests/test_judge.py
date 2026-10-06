@@ -262,6 +262,37 @@ def test_候选要素批量提取只调一次():
     assert j.extract_calls == 2      # 文档一次 + 候选一批一次
 
 
+def test_抽取prompt_v2_含逐字保真约束():
+    """v1 的抽取器会把日期挪用/改写，导致正确摘要被判 0；v2 加了硬约束。"""
+    from sfzy.judge.prompts import EXTRACT_PROMPT_VERSION, build_extract_messages
+
+    assert EXTRACT_PROMPT_VERSION
+    system = build_extract_messages("x")[0]["content"]
+    for kw in ("逐字一致", "严禁改写", "日期"):
+        assert kw in system
+
+
+def test_抽取用独立的extract_runtime():
+    """给 extract_runtime 时，抽取走它、判定仍走裁判模型。"""
+    class _RT:
+        def __init__(self, out, label):
+            self.out, self.label, self.calls, self.stats = out, label, 0, {}
+
+        def render(self, messages):
+            return self.label
+
+        def generate_batch(self, prompts, max_new_tokens=512):
+            self.calls += 1
+            return [self.out for _ in prompts]
+
+    judge_rt = _RT("", "judge")
+    extract_rt = _RT('{"case_type": "M"}', "extract")
+    j = FactConsistencyJudge(runtime=judge_rt, extract_runtime=extract_rt)
+    els, _modes = j._extract_once(["x"], 16)
+    assert els[0].case_type == "M"
+    assert extract_rt.calls == 1 and judge_rt.calls == 0
+
+
 def test_空字段不送进模型():
     """候选什么都没写时不该浪费一次前向。"""
     doc = SixElements(case_type="借款合同纠纷", court_facts="借款属实")

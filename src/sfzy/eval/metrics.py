@@ -101,12 +101,37 @@ def _build_six_element_scorer(
     model = spec.get("model")
     if not model:
         raise ValueError("semantic.backend=fact 需要 semantic.model 指向裁判模型目录")
+
+    # 抽取可以用一个单独的、更强的模型（`semantic.extract_model`）。
+    # 抽取是最容易出错的一步（实测会把日期挪用/改写），换大模型比换裁判更值。
+    # 不给就共用裁判模型。注意这会在显存里多放一份权重。
+    extract_model = spec.get("extract_model")
+    extract_runtime = None
+    if extract_model and extract_model != model:
+        from sfzy.judge.runtime import build_runtime, resolve_model_path
+
+        extract_runtime = build_runtime(
+            model_path=resolve_model_path(extract_model),
+            device=spec.get("extract_device", spec.get("device", "cuda:1")),
+            dtype=spec.get("extract_dtype", spec.get("dtype", "bfloat16")),
+            max_batch_size=int(spec.get("max_batch_size", 8)),
+            max_input_tokens=int(spec.get("max_input_tokens", 4096)),
+            load_in_4bit=bool(
+                spec.get("extract_load_in_4bit", spec.get("load_in_4bit", False))
+            ),
+            bnb_4bit_compute_dtype=spec.get("extract_bnb_4bit_compute_dtype"),
+            trust_remote_code=bool(
+                spec.get("extract_trust_remote_code", spec.get("trust_remote_code", True))
+            ),
+        )
+
     judge = FactConsistencyJudge(
         model_path=model,
         device=spec.get("device", "cuda:1"),
         dtype=spec.get("dtype", "bfloat16"),
         max_batch_size=int(spec.get("max_batch_size", 8)),
         extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
+        extract_runtime=extract_runtime,
         # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),

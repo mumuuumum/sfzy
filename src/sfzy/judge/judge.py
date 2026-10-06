@@ -172,6 +172,7 @@ class FactConsistencyJudge:
         max_input_tokens: int = 4096,
         min_document_elements: int = 2,
         runtime: Optional[TorchRuntime] = None,
+        extract_runtime: Optional[TorchRuntime] = None,
         doc_fallback: bool = True,
         load_in_4bit: bool = False,
         bnb_4bit_compute_dtype: Optional[str] = None,
@@ -197,6 +198,10 @@ class FactConsistencyJudge:
                 trust_remote_code=trust_remote_code,
             )
         self.runtime = runtime
+        # 抽取和判定可以用不同的模型。抽取这一步最容易出错（实测会把日期
+        # 挪用/改写），想换更强、更大的抽取器时单独给一个 runtime 即可；
+        # 不给就沿用裁判模型（老行为，零额外显存）。
+        self.extract_runtime = extract_runtime or runtime
         self.weights = dict(weights or DEFAULT_WEIGHTS)
         # 覆盖率自己的六要素权重。没给就沿用一致性的那份（同一套要素）。
         self.coverage_weights = dict(coverage_weights or self.weights)
@@ -230,7 +235,7 @@ class FactConsistencyJudge:
         self, texts: Sequence[str], max_new_tokens: int
     ) -> Tuple[List[SixElements], List[str]]:
         prompts = [
-            self.runtime.render(build_extract_messages(t)) for t in texts
+            self.extract_runtime.render(build_extract_messages(t)) for t in texts
         ]
         # === 调试：打印提取阶段的输入 Prompt ===
         if _VERBOSE:
@@ -240,7 +245,9 @@ class FactConsistencyJudge:
                 print(f"构造的完整 Prompt:\n{p}\n")
         # ====================================
 
-        raws = self.runtime.generate_batch(prompts, max_new_tokens=max_new_tokens)
+        raws = self.extract_runtime.generate_batch(
+            prompts, max_new_tokens=max_new_tokens
+        )
         parsed = [parse_six_json_debug(r) for r in raws]
 
         # === 调试：打印提取阶段的模型输出与解析结果 ===

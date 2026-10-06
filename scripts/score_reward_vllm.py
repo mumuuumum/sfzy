@@ -1185,6 +1185,13 @@ def run_input(
     stats = summarize(rows_by_id, [t.name for t in spec.enabled_terms])
     stats["input"] = str(path)
     stats["output"] = str(out_path)
+    stats["extract_model"] = getattr(args, "extract_model", None)
+    try:  # 记录抽取 prompt 版本，换过 prompt 的结果才不会混在一起比
+        from sfzy.judge.prompts import EXTRACT_PROMPT_VERSION
+
+        stats["extract_prompt_version"] = EXTRACT_PROMPT_VERSION
+    except Exception:  # noqa: BLE001
+        pass
     summary_path = Path(str(out_path.with_suffix("")) + ".summary.json")
     summary_path.write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1270,6 +1277,14 @@ def main() -> None:
                     help="裁判模型目录或 HF 名，默认取 semantic.model")
     ap.add_argument("--tokenizer", default=None,
                     help="单独指定 tokenizer（AWQ 目录缺文件时用）")
+    ap.add_argument("--extract-model", default=None,
+                    help="可选的独立抽取模型（比裁判更强/更大）。不给就共用裁判模型。"
+                         "两份权重同时在显存里，单卡放不下就别用")
+    ap.add_argument("--extract-tokenizer", default=None)
+    ap.add_argument("--extract-quantization", default=None,
+                    help="抽取模型的量化方式，默认跟随 --quantization")
+    ap.add_argument("--extract-dtype", default=None,
+                    help="抽取模型的精度，默认跟随 --dtype")
     ap.add_argument("--quantization", default="none",
                     help="none | bitsandbytes | awq | gptq。T4 上 7B 装不下 fp16，"
                          "必须显式指定一个 4-bit 方案（bitsandbytes 可对现有 fp16 "
@@ -1365,9 +1380,37 @@ def main() -> None:
         )
 
     runtime, _tokenizer = build_vllm(args, model_name, trust_remote_code, max_model_len)
+
+    # 可选的独立抽取器：抽取是最容易出错的一步（日期挪用/改写），换更强的模型
+    # 通常比换裁判更值。代价是显存里要多放一份权重 —— 单张 T4 上两个 7B 装不下，
+    # 只有显存够（例如 A100/4090 或小抽取器）才用得上。
+    extract_runtime = None
+    extract_model_name = args.extract_model
+    if extract_model_name:
+        local = resolve(extract_model_name)
+        if is_local_dir(local):
+            extract_model_name = str(local)
+        eargs = copy.copy(args)
+        eargs.tokenizer = args.extract_tokenizer
+        if args.extract_quantization:
+            eargs.quantization = args.extract_quantization
+        if args.extract_dtype:
+            eargs.dtype = args.extract_dtype
+        logger.warning(
+            "额外加载抽取模型 %s：两份权重会同时占用显存。单张 T4 放不下两个 7B，"
+            "请确认显存预算；不够就只用 v2 抽取 prompt、不传 --extract-model。",
+            extract_model_name,
+        )
+        extract_runtime, _ = build_vllm(
+            eargs, extract_model_name,
+            bool(semantic.get("extract_trust_remote_code", trust_remote_code)),
+            max_model_len,
+        )
+
     options = spec.judge_term_options()
     judge = FactConsistencyJudge(
         runtime=runtime,
+        extract_runtime=extract_runtime,
         weights=(options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(options.get("element_coverage") or {}).get("element_weights"),
         tasks=judge_tasks,

@@ -73,6 +73,25 @@ vLLM 的 bnb 支持 **in-flight 量化**（加载时把 fp16 权重现量化成 
 > T4，各跑一个分片。`semantic.device` 会被忽略，卡由 `CUDA_VISIBLE_DEVICES`
 > 决定（vLLM 只看得到可见设备）。
 
+### 抽取器与抽取 prompt 版本
+
+事实一致性 = 抽取六要素 → 逐要素判定。**抽取这一步最容易出错**：实测 v1 的
+抽取 prompt 会把日期挪用/改写（例如把"某日出具证明、另一日合同解除"合并成
+"某日解除劳动合同"），裁判只看抽取结果，于是把逐字正确的摘要判成 0——人工
+摘要也会中招。现在的抽取 prompt 是 **v2（逐字保真）**，版本号记录在
+`sfzy/judge/prompts.py` 的 `EXTRACT_PROMPT_VERSION`，并写进每份
+`*.reward.summary.json` 的 `extract_prompt_version`。**换过 prompt 的结果不要
+和旧结果混着比**；同时要重跑 `judge_probe` / `judge_test` 重新出基线。
+
+如果显存够，可以给抽取单独挂一个更强的模型（判定仍用原裁判）：
+
+```bash
+--extract-model <更强的抽取模型> --extract-quantization awq --extract-dtype float16
+```
+
+但这会在显存里**同时放两份权重** —— 单张 T4 放不下两个 7B，所以 T4 上一般
+只用 v2 prompt，不传 `--extract-model`。
+
 ## 三、跑法（2×T4，一个分片一张卡）
 
 ```bash
@@ -134,6 +153,7 @@ python scripts/score_reward_vllm.py --merge \
 |---|---|
 | `--config` | 读 `rl.reward`（奖励口径）和 `semantic`（裁判抽取预算等），默认 `configs/grpo_fact_coverage_t4.yaml` |
 | `--model` / `--tokenizer` | 覆盖 `semantic.model`；AWQ 目录缺 tokenizer 文件时单独指 |
+| `--extract-model` | 可选的独立抽取模型（更强/更大）；默认共用裁判模型。两份权重同占显存 |
 | `--quantization` | `none` / `bitsandbytes` / `awq` / `gptq`。T4 必须显式指定一个 4-bit 方案 |
 | `--load-format` | 默认 `auto`；选 `bitsandbytes` 时脚本会自动设成 `bitsandbytes`（vLLM 硬校验） |
 | `--dtype` | T4 用 `float16`；4090/A100 可用 `bfloat16` |
