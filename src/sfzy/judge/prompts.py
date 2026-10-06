@@ -43,7 +43,7 @@ EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
 1. case_type：案件类型或案由
 2. plaintiff_claims：当前裁判中原告的诉讼请求
 3. defendant_defenses：当前裁判中被告的辩称、抗辩意见
-4. court_facts：当前裁判中法院审理查明、认定的案件事实
+4. court_facts：当前裁判中法院审理查明、认定的案件事实（选择对最终判决真正有帮助的进行表述）
 5. legal_basis：当前裁判中法院裁判所依据的法律、司法解释、法律条文
 6. judgment_result：当前裁判中法院最终裁判结果
 
