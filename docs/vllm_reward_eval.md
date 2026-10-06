@@ -78,10 +78,18 @@ vLLM 的 bnb 支持 **in-flight 量化**（加载时把 fp16 权重现量化成 
 事实一致性 = 抽取六要素 → 逐要素判定。**抽取这一步最容易出错**：实测 v1 的
 抽取 prompt 会把日期挪用/改写（例如把"某日出具证明、另一日合同解除"合并成
 "某日解除劳动合同"），裁判只看抽取结果，于是把逐字正确的摘要判成 0——人工
-摘要也会中招。现在的抽取 prompt 是 **v2（逐字保真）**，版本号记录在
+摘要也会中招。现在的抽取 prompt 是 **v3**：在 v2 的"逐字保真"之上又加了
+"程序事实优先"——文本写明"被告未答辩/未到庭/缺席审理"时，`defendant_defenses`
+必须写"未答辩"，不能被仲裁阶段/别处引用的"辩称"顶掉。版本号记录在
 `sfzy/judge/prompts.py` 的 `EXTRACT_PROMPT_VERSION`，并写进每份
 `*.reward.summary.json` 的 `extract_prompt_version`。**换过 prompt 的结果不要
 和旧结果混着比**；同时要重跑 `judge_probe` / `judge_test` 重新出基线。
+
+**输入长度**：val 原文最长约 1.2 万字，`max_input_tokens=4096/8192` 都会把长
+文书的抽取 prompt 截断（头+尾保住了，中间的事实没了 → 抽取残缺、判 0）。现在
+`max_input_tokens` 从 `semantic.max_input_tokens` 读（T4 配置里是 **16384**），
+`extract_max_new_tokens` 提到 **1536**（v3 要求逐字保留、分条列举，输出更长）。
+超预算的输入仍按头+尾截断，system 指令不丢。
 
 如果显存够，可以给抽取单独挂一个更强的模型（判定仍用原裁判）：
 
@@ -172,6 +180,7 @@ python scripts/score_reward_vllm.py --merge \
 | `--quantization` | `none` / `bitsandbytes` / `awq` / `gptq`。T4 必须显式指定一个 4-bit 方案 |
 | `--load-format` | 默认 `auto`；选 `bitsandbytes` 时脚本会自动设成 `bitsandbytes`（vLLM 硬校验） |
 | `--dtype` | T4 用 `float16`；4090/A100 可用 `bfloat16` |
+| `--max-input-tokens` | 抽取/判定输入预算，默认取 `semantic.max_input_tokens`（T4 配置 16384）；超预算按头+尾截断 |
 | `--chunk-size` | 一批几条记录（默认 16）。显存紧调小，吞吐优先调大 |
 | `--limit` / `--no-resume` | 冒烟 / 强制重跑。默认按 id 断点续跑 |
 | `--candidate-key` / `--reference-key` | 字段名，默认 `output` / `reference` |

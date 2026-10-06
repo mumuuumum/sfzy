@@ -1307,10 +1307,10 @@ def main() -> None:
     ap.add_argument("--tensor-parallel-size", type=int, default=1)
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--swap-space", type=int, default=4)
-    ap.add_argument("--max-input-tokens", type=int, default=8192,
-                    help="抽取/判定 prompt 的输入预算。4096 会把长判决书的抽取 "
-                         "prompt 截断（实测抽取直接返回原文片段、全要素为空），"
-                         "默认提到 8192；超预算的输入按头+尾截断，system 不丢")
+    ap.add_argument("--max-input-tokens", type=int, default=None,
+                    help="抽取/判定 prompt 的输入预算，默认取 semantic.max_input_tokens"
+                         "（再默认 8192）。长判决书（val 最长约 1.2 万字）要调大；"
+                         "超预算的输入按头+尾截断，system 不丢")
     ap.add_argument("--extract-max-new-tokens", type=int, default=None,
                     help="六要素抽取的生成预算，默认取 semantic.extract_max_new_tokens")
     ap.add_argument("--max-model-len", type=int, default=None)
@@ -1350,6 +1350,10 @@ def main() -> None:
     extract_max_new_tokens = int(
         args.extract_max_new_tokens or semantic.get("extract_max_new_tokens", 1024)
     )
+    # 输入预算：命令行优先，否则读配置（默认 8192）。长判决书（val 最长约
+    # 1.2 万字）需要更大预算，否则头+尾截断会砍掉中间的事实。
+    if args.max_input_tokens is None:
+        args.max_input_tokens = int(semantic.get("max_input_tokens", 8192))
     max_model_len = int(
         args.max_model_len or (args.max_input_tokens + 2 * extract_max_new_tokens)
     )

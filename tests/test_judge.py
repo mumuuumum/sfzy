@@ -263,12 +263,15 @@ def test_候选要素批量提取只调一次():
 
 
 def test_抽取prompt_v2_含逐字保真约束():
-    """v1 的抽取器会把日期挪用/改写，导致正确摘要被判 0；v2 加了硬约束。"""
+    """v1 的抽取器会把日期挪用/改写，导致正确摘要被判 0；v2/v3 加了硬约束。"""
     from sfzy.judge.prompts import EXTRACT_PROMPT_VERSION, build_extract_messages
 
     assert EXTRACT_PROMPT_VERSION
     system = build_extract_messages("x")[0]["content"]
     for kw in ("逐字一致", "严禁改写", "日期"):
+        assert kw in system
+    # v3：程序事实优先 —— 本案"未答辩/未到庭"不能被仲裁阶段/别处的"辩称"顶掉
+    for kw in ("未答辩", "未到庭", "本院查明"):
         assert kw in system
 
 

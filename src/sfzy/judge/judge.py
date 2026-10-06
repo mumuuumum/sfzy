@@ -246,7 +246,9 @@ class FactConsistencyJudge:
             )
         except Exception:  # noqa: BLE001
             system_tokens = 1024
-        budget = max(256, self.max_input_tokens - system_tokens - 32)
+        # 128 是模板开销的余量：system/user/generation 三段的 wrapper 都要算进去，
+        # 只减 system 的 token 数会低估，边界上会被 runtime 的最后一道截断切尾。
+        budget = max(256, self.max_input_tokens - system_tokens - 128)
         return runtime.truncate_text(text, budget)
 
     def _fit_document_for_judge(self, document: str) -> str:

@@ -132,8 +132,9 @@ def _build_six_element_scorer(
         dtype=spec.get("dtype", "bfloat16"),
         max_batch_size=int(spec.get("max_batch_size", 8)),
         extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
-        extract_runtime=extract_runtime,
+        # 长文书（实测最长约 1.2 万字）在 4096 下会被截断，抽取直接残缺。
         max_input_tokens=max_input_tokens,
+        extract_runtime=extract_runtime,
         # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),

@@ -111,12 +111,14 @@ semantic:
   load_in_4bit: true
   # 两个 judge 项的判定会合并成一次批量前向，batch 上限仍然按"6 要素 × G 候选"估
   max_batch_size: 4
-  # 抽取/判定 prompt 的输入预算：4096 会把长判决书（≥4000 字）的抽取 prompt
-  # 截掉 system 指令，实测抽取直接返回原文片段、六要素全为空 → 后面全判 0。
-  # 8192 覆盖 val 的 p99（约 6500 字）；超预算的输入按头+尾截断，system 不丢。
-  max_input_tokens: 8192
-  # v2 抽取 prompt 更长、输出也更长（要逐字保留细节），768 容易把 JSON 截断
-  extract_max_new_tokens: 1024
+  # 抽取/判定 prompt 的输入预算。val 原文最长约 1.2 万字，8192 token 仍会把
+  # 长文书的抽取 prompt 截断（头+尾保住了，中间的事实没了）→ 抽取残缺、判 0。
+  # 提到 16384 覆盖 val 全部；超预算的输入仍按头+尾截断，system 不丢。
+  # 注意 vLLM 的 max_model_len = max_input_tokens + 2*extract_max_new_tokens，
+  # 16384+3072=19456 < Qwen2.5-7B 的 32768。T4 上 KV 每序列约 1GB，够用。
+  max_input_tokens: 16384
+  # v3 抽取 prompt 要求逐字保留、分条列举，输出更长；1024 容易把 JSON 截断
+  extract_max_new_tokens: 1536
   min_document_elements: 2
   doc_fallback: true
 
