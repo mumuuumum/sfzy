@@ -134,7 +134,14 @@ semantic:
     concurrency: 16
     max_retries: 3
     timeout_s: 60
-
+  judge_api:
+    base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
+    api_key_env: SFZY_JUDGE_API_KEY
+    model: deepseek-chat                       # 想换更强裁判改这里
+    concurrency: 16                            # 线程池并发（API 是 I/O 密集）
+    max_retries: 3
+    timeout_s: 60
+    max_logprobs: 20         
 tracking:
   backend: none
   project: sfzy
