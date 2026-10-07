@@ -78,18 +78,41 @@ class JudgeRequest:
     cand_elements: Optional[SixElements] = None
 
 
-class FactPair(tuple):
-    """`(name, doc_value, cand_value)` 三元组，额外携带两边的六要素上下文。
+class JudgePair(tuple):
+    """`(name, left, right)` 三元组，额外携带**任务**和六要素上下文。
 
-    做成 tuple 子类是为了不破坏按三元组解包的旧调用；上下文以属性挂在上面，
-    渲染判定 prompt 时用。
+    做成 tuple 子类是为了不破坏按三元组解包的旧调用；`task` 决定渲染哪套
+    判定 prompt（事实一致性 / 覆盖率），上下文属性只在事实一致性里用。
+
+    `task` 默认 `fact_consistency`，旧代码（只传三元组）行为不变。
     """
 
-    def __new__(cls, name, doc_value, cand_value, doc_elements=None, cand_elements=None):
-        self = super().__new__(cls, (name, doc_value, cand_value))
+    def __new__(cls, name, left, right, task="fact_consistency",
+                doc_elements=None, cand_elements=None):
+        self = super().__new__(cls, (name, left, right))
+        self.task = task
         self.doc_elements = doc_elements
         self.cand_elements = cand_elements
         return self
+
+
+# 旧名字保留（build_pairs 的返回值类型，外部/测试引用过）
+FactPair = JudgePair
+
+
+def _pair_task(item) -> str:
+    return getattr(item, "task", "fact_consistency")
+
+
+def _pair_is_precomputed(item) -> bool:
+    """这个 pair 是否按空字段规则直接给分、不送模型。
+
+    **只对事实一致性**：覆盖率 pair 的两个要素本来就都非空（参考没有该项的
+    情况在 build_coverage_pairs 里已剔除，候选没写的情况已预置 0）。
+    """
+    if _pair_task(item) != "fact_consistency":
+        return False
+    return empty_field_rule(item[1], item[2]) is not None
 
 
 class ExtractionFailure(RuntimeError):
@@ -472,7 +495,7 @@ class FactConsistencyJudge:
         """真正调模型的那一层。**不做**空字段规则，调用方负责。"""
         requests = [
             JudgeRequest(
-                "fact_consistency", item[0], item[1], item[2],
+                _pair_task(item), item[0], item[1], item[2],
                 doc_elements=getattr(item, "doc_elements", None),
                 cand_elements=getattr(item, "cand_elements", None),
             )
@@ -491,13 +514,12 @@ class FactConsistencyJudge:
         scores: List[Optional[int]] = [None] * len(pairs)
         sources: List[str] = ["judge"] * len(pairs)
         pending, pending_idx = [], []
-        for i, (_, doc_el, cand_el) in enumerate(pairs):
-            rule = empty_field_rule(doc_el, cand_el)
-            if rule is None:
+        for i, item in enumerate(pairs):
+            if not _pair_is_precomputed(item):
                 pending.append(pairs[i])
                 pending_idx.append(i)
             else:
-                scores[i] = rule
+                scores[i] = empty_field_rule(item[1], item[2])
                 sources[i] = "empty_rule"
         got, pmaxs, probs = self._judge_pairs_raw(pending)
         self.last_pmax, self.last_probs = pmaxs, probs
@@ -519,8 +541,8 @@ class FactConsistencyJudge:
         # last_pmax 只覆盖真正发给模型的那部分，按顺序还原到全量位置上
         pm: List[Optional[float]] = [None] * len(pairs)
         k = 0
-        for i, (_, doc, cand) in enumerate(pairs):
-            if empty_field_rule(doc, cand) is None:
+        for i, item in enumerate(pairs):
+            if not _pair_is_precomputed(item):
                 if k < len(self.last_pmax):
                     pm[i] = self.last_pmax[k]
                 k += 1
@@ -568,22 +590,31 @@ class FactConsistencyJudge:
         返回的 `FactPair` 就是三元组（旧代码可照常解包），额外带上两边的
         六要素上下文，供"逐要素判定 + 其余五项辅助"用。
         """
-        pairs: List[FactPair] = []
+        pairs: List[JudgePair] = []
         for name in ELEMENTS:
             doc_v = document_elements.get(name).strip()
             cand_v = candidate_elements.get(name).strip()
             if not cand_v:
                 # 规则一 / 规则二：候选省略 → 4 分，不会真的发请求
-                pairs.append(FactPair(name, doc_v, "", document_elements, candidate_elements))
+                pairs.append(JudgePair(
+                    name, doc_v, "",
+                    doc_elements=document_elements, cand_elements=candidate_elements,
+                ))
             elif doc_v:
-                pairs.append(FactPair(name, doc_v, cand_v, document_elements, candidate_elements))
+                pairs.append(JudgePair(
+                    name, doc_v, cand_v,
+                    doc_elements=document_elements, cand_elements=candidate_elements,
+                ))
             elif self.doc_fallback and document:
-                pairs.append(FactPair(
+                pairs.append(JudgePair(
                     name, self._fit_document_for_judge(document), cand_v,
-                    document_elements, candidate_elements,
+                    doc_elements=document_elements, cand_elements=candidate_elements,
                 ))
             else:
-                pairs.append(FactPair(name, "", cand_v, document_elements, candidate_elements))
+                pairs.append(JudgePair(
+                    name, "", cand_v,
+                    doc_elements=document_elements, cand_elements=candidate_elements,
+                ))
         return pairs
 
     def build_coverage_pairs(
@@ -604,7 +635,7 @@ class FactConsistencyJudge:
         注意方向：左是**参考摘要要素**，右是候选。候选多写不扣分
         （参考没写的内容由别的 reward 或 ROUGE 负责罚）。
         """
-        pairs: List[Tuple[str, str, str]] = []
+        pairs: List[JudgePair] = []
         present: List[str] = []
         precomputed: Dict[str, int] = {}
         for name in ELEMENTS:
@@ -616,7 +647,9 @@ class FactConsistencyJudge:
             if not cand_v:
                 precomputed[name] = 0          # 未覆盖该要素
             else:
-                pairs.append((name, ref_v, cand_v))
+                # 覆盖率是**独立任务**：左=参考摘要要素，右=候选摘要要素，
+                # 判定时走 build_coverage_messages，绝不能套事实一致性的 prompt。
+                pairs.append(JudgePair(name, ref_v, cand_v, task="element_coverage"))
         return pairs, present, precomputed
 
     # ---------------------------------------------------------------- GRPO 入口

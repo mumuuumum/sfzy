@@ -360,6 +360,45 @@ def test_开关开启时判定带上其它要素作辅助():
     assert any("《中华人民共和国劳动法》第七条" in p for p in rt.rendered)
 
 
+def test_覆盖率pair走覆盖率prompt而不是事实一致性():
+    """离线工具里 fact 和 coverage 的 pair 会合成一批送判；
+    coverage 的 pair 必须走 COVERAGE_SYSTEM，左=参考、右=候选。"""
+    from sfzy.judge.prompts import COVERAGE_SYSTEM, JUDGE_SYSTEM
+
+    class _RT:
+        def __init__(self):
+            self.calls = []          # (system, user)
+            self.stats = {}
+
+        def render(self, messages):
+            self.calls.append((messages[0]["content"], messages[1]["content"]))
+            return "prompt"
+
+        def score_digits_batch(self, prompts, digits=""):
+            n = len(prompts)
+            return [4] * n, [1.0] * n, [[1.0, 0, 0, 0, 0]] * n
+
+    rt = _RT()
+    j = FactConsistencyJudge(
+        runtime=rt, tasks=("fact_consistency", "element_coverage")
+    )
+    doc = SixElements(court_facts="原文查明的事实")
+    ref = SixElements(court_facts="参考摘要的事实")
+    cand = SixElements(court_facts="候选摘要的事实")
+
+    fact_pairs = j.build_pairs(doc, cand, None)
+    cov_pairs, _present, _pre = j.build_coverage_pairs(ref, cand)
+    j.judge_elements_batch(list(fact_pairs) + list(cov_pairs))
+
+    systems = [s for s, _ in rt.calls]
+    assert JUDGE_SYSTEM in systems              # 事实那一条
+    assert COVERAGE_SYSTEM in systems           # 覆盖那一条（修复前这里是 JUDGE_SYSTEM）
+
+    cov_user = next(u for s, u in rt.calls if s == COVERAGE_SYSTEM)
+    assert "参考摘要要素" in cov_user and "参考摘要的事实" in cov_user
+    assert "候选摘要要素" in cov_user and "候选摘要的事实" in cov_user
+
+
 def test_抽取用独立的extract_runtime():
     """给 extract_runtime 时，抽取走它、判定仍走裁判模型。"""
     class _RT:
