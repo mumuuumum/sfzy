@@ -116,9 +116,9 @@ semantic:
   # 提到 16384 覆盖 val 全部；超预算的输入仍按头+尾截断，system 不丢。
   # 注意 vLLM 的 max_model_len = max_input_tokens + 2*extract_max_new_tokens，
   # 16384+3072=19456 < Qwen2.5-7B 的 32768。T4 上 KV 每序列约 1GB，够用。
-  max_input_tokens: 16384
+  max_input_tokens: 11288
   # v3 抽取 prompt 要求逐字保留、分条列举，输出更长；1024 容易把 JSON 截断
-  extract_max_new_tokens: 1536
+  extract_max_new_tokens: 512
   min_document_elements: 2
   doc_fallback: true
   # 逐要素判定时附上原文/摘要各自的完整六要素，高亮本次对比项，其余五项作
