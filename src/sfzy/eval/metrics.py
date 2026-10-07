@@ -99,8 +99,12 @@ def _build_six_element_scorer(
         )
 
     model = spec.get("model")
-    if not model:
-        raise ValueError("semantic.backend=fact 需要 semantic.model 指向裁判模型目录")
+    judge_api = spec.get("judge_api")
+    if not model and not judge_api:
+        raise ValueError(
+            "semantic.backend=fact 需要 semantic.model（本地裁判）"
+            "或 semantic.judge_api（API 裁判）"
+        )
 
     # 抽取可以用一个单独的、更强的模型（`semantic.extract_model`）。
     # 抽取是最容易出错的一步（实测会把日期挪用/改写），换大模型比换裁判更值。
@@ -132,10 +136,7 @@ def _build_six_element_scorer(
             ),
         )
 
-    judge = FactConsistencyJudge(
-        model_path=model,
-        device=spec.get("device", "cuda:1"),
-        dtype=spec.get("dtype", "bfloat16"),
+    common = dict(
         max_batch_size=int(spec.get("max_batch_size", 8)),
         extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
         # 长文书（实测最长约 1.2 万字）在 4096 下会被截断，抽取直接残缺。
@@ -150,6 +151,29 @@ def _build_six_element_scorer(
         doc_fallback=bool(spec.get("doc_fallback", True)),
         # 判定时附上两边完整六要素，其余五项作辅助，弥补抽取边界误差
         use_element_context=bool(spec.get("element_context", False)),
+        # 事实一致性判定再带上人工摘要作第二辅助参照（自评时自动忽略）
+        use_reference_context=bool(spec.get("reference_context", False)),
+        # 事实一致性一次性评分：(原文全文, 摘要六要素) → 六个分
+        six_shot_fact=bool(spec.get("six_shot_fact", False)),
+        six_shot_coverage=bool(spec.get("six_shot_coverage", False)),
+    )
+    if judge_api:
+        # 判定也走 API：不用本地裁判模型。抽取没单独配就复用同一个 API runtime。
+        from sfzy.judge.api_runtime import build_api_runtime
+
+        judge_runtime = build_api_runtime(dict(judge_api))
+        if extract_runtime is None:
+            extract_runtime = judge_runtime
+        judge = FactConsistencyJudge(
+            runtime=judge_runtime, extract_runtime=extract_runtime, **common
+        )
+        return SixElementScorer(judge)
+
+    judge = FactConsistencyJudge(
+        model_path=model,
+        device=spec.get("device", "cuda:1"),
+        dtype=spec.get("dtype", "bfloat16"),
+        **common,
         # 裁判侧 4-bit（NF4）：7B 在 24GB 卡上量化后约 5~6GB，位置由
         # device_map 定在 semantic.device 指的卡上，与策略分居两卡。
         load_in_4bit=bool(spec.get("load_in_4bit", False)),

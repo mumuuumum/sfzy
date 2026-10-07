@@ -241,8 +241,56 @@ JUDGE_SYSTEM_CONTEXT = JUDGE_SYSTEM + """
 3. 如果摘要该要素的陈述在【判分依据】里找不到、但在【辅助参考】的任意一项里能找到：
    * 这属于抽取归类差异，**不是编造**，不得因此判 0。
 4. 只有当摘要该要素的陈述在原文六项里**都找不到**支持时，才按上面的"编造/新增"判 0。
+5. 「原告诉讼请求 / 被告辩称 / 法院查明事实」这三项的 0 分门槛要更严（略微放宽）。
+   这三项都是长段落，抽取本身有损，摘要往往只是压缩、概括、换词、省略。只有出现明确、可指认的冲突才判 0。
 
 只输出0、1、2、3或4。"""
+
+
+# ---------------------------------------------------------------------------
+# 事实一致性：一次性给六个分（输入 = 原文全文 + 摘要六要素）
+# ---------------------------------------------------------------------------
+# 原来把六要素拆成 6 次判定，好处是每次只看两小段、不被锚定；代价是 6 倍调用，
+# 而且原文侧抽取一旦有损（日期挪用、"本院认为"丢掉）就会把正确摘要判成 0。
+# 这个版本改成"一次看全文 + 摘要六要素、输出六个分"：不再依赖原文抽取，
+# 六要素仍分别给分（一次调用里给六个），不是点式总分。
+SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + """
+
+【输出格式（本次固定）】
+
+你会看到【裁判文书原文】和【待评价摘要的六要素】。请对**六个要素分别**给出
+0~4 的整数分，判据同上（摘要该项是否受原文支持；省略、压缩、同义改写不扣分；
+编造或与原文矛盾判 0）。
+
+只输出一个 JSON 对象，键必须是下面六个，值是 0~4 的整数，不要输出任何其他内容：
+
+{
+  "case_type": 0,
+  "plaintiff_claims": 0,
+  "defendant_defenses": 0,
+  "court_facts": 0,
+  "legal_basis": 0,
+  "judgment_result": 0
+}"""
+
+
+def build_fact_six_messages(document: str, candidate_elements) -> List[Dict[str, str]]:
+    """一次性六要素判定：输入 (原文全文, 摘要六要素)，输出六要素 0~4 分。"""
+    lines = "\n".join(
+        _element_line(name, _as_values(candidate_elements).get(name))
+        for name in ELEMENTS
+    )
+    user = f"""【裁判文书原文】
+{document}
+
+【待评价摘要的六要素】
+{lines}
+
+请对六个要素分别给出 0~4 的整数分，只输出 JSON。"""
+    return [
+        {"role": "system", "content": SIX_SHOT_JUDGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +351,44 @@ def build_coverage_messages(
     ]
 
 
+# ---------------------------------------------------------------------------
+# 覆盖率：一次性给六个分（输入 = 人工摘要全文 + 候选摘要全文）
+# ---------------------------------------------------------------------------
+SIX_SHOT_COVERAGE_SYSTEM = COVERAGE_SYSTEM + """
+
+【输出格式（本次固定）】
+
+你会看到【参考摘要（人工）】和【候选摘要】。请对**六个要素分别**给出 0~4 的
+覆盖程度（0=未覆盖/与参考矛盾，4=完整覆盖核心信息；措辞不同、压缩、换词不扣分）。
+参考摘要里没有写到的那一项，直接给 4（该项无需覆盖）。
+
+只输出一个 JSON 对象，键必须是下面六个，值是 0~4 的整数，不要输出任何其他内容：
+
+{
+  "case_type": 0,
+  "plaintiff_claims": 0,
+  "defendant_defenses": 0,
+  "court_facts": 0,
+  "legal_basis": 0,
+  "judgment_result": 0
+}"""
+
+
+def build_coverage_six_messages(reference: str, candidate: str) -> List[Dict[str, str]]:
+    """一次性覆盖率判定：输入 (人工摘要全文, 候选摘要全文)，输出六要素 0~4 分。"""
+    user = f"""【参考摘要（人工）】
+{reference}
+
+【候选摘要】
+{candidate}
+
+请对六个要素分别给出覆盖程度 0~4 的整数分，只输出 JSON。"""
+    return [
+        {"role": "system", "content": SIX_SHOT_COVERAGE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
 def build_judge_messages(
     element_name: str, document_element: str, candidate_element: str
 ) -> List[Dict[str, str]]:
@@ -344,6 +430,7 @@ def build_judge_messages_with_context(
     candidate_elements=None,
     document_target: str = None,
     candidate_target: str = None,
+    reference_elements=None,
 ) -> List[Dict[str, str]]:
     """带原文六要素上下文的判定 prompt（本次只判 `element_name` 这一项）。
 
@@ -362,6 +449,10 @@ def build_judge_messages_with_context(
 
     `document_target` / `candidate_target` 是实际送判的对比文本。正常就是对应
     要素本身；原文该要素抽空、改用整篇原文兜底时，`document_target` 放兜底文本。
+
+    `reference_elements` 是**人工摘要**的六要素（可选）。人工摘要是人工核对过的
+    可信参照：候选与它一致/能被它支持，说明是正常概括而非编造；与它矛盾则高度
+    可疑。注意**不要在人工作为候选（自评）时传它**——那就成了自证。
     """
     zh = ELEMENT_ZH.get(element_name, element_name)
     doc_values = _as_values(document_elements)
@@ -375,6 +466,20 @@ def build_judge_messages_with_context(
         candidate_target = _as_values(candidate_elements).get(element_name) or ""
     cand_value = (candidate_target or "").strip() or "（空）"
 
+    ref_block = ""
+    ref_hint = ""
+    if reference_elements is not None:
+        ref_value = _as_values(reference_elements).get(element_name) or ""
+        ref_value = ref_value.strip() or "（空）"
+        ref_block = f"""
+【辅助参考二：人工摘要的{zh}】（人工摘要是人工核对过的可信参照）
+{_element_line(element_name, ref_value)}
+"""
+        ref_hint = """
+（候选该项与人工摘要一致、或能由人工摘要支持 → 视为可靠，按 3 或 4 分；
+与人工摘要矛盾 → 按事实错误判 0；人工摘要该项为空则本条不适用。）
+"""
+
     user = f"""当前评价要素类型：
 {zh}（{element_name}）
 
@@ -383,10 +488,10 @@ def build_judge_messages_with_context(
 
 【辅助参考：原文的其余五项】（**只是辅助**：用来排查抽取时的归类/边界误差，不作为判分依据）
 {other_lines}
-
+{ref_block}
 【待评价摘要的要素】
 {zh}（{element_name}）：{cand_value}
-
+{ref_hint}
 请只评价摘要的【{zh}】与原文的事实一致性。"""
     return [
         {"role": "system", "content": JUDGE_SYSTEM_CONTEXT},

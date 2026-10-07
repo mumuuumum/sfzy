@@ -185,8 +185,12 @@ class APIRuntime:
         return len(text)
 
     def ping(self) -> str:
-        """发一次最小请求，验证 base_url / 模型名 / 鉴权是否可用。"""
-        return self._chat([{"role": "user", "content": "ping"}], 1)
+        """发一次最小请求，验证 base_url / 模型名 / 鉴权是否可用。
+
+        **不带** `response_format=json_object`：DeepSeek 等供应商要求用 JSON 模式
+        时 prompt 里必须出现 "json"，而探活消息没有，会被 400 拒掉（和鉴权无关）。
+        """
+        return self._chat([{"role": "user", "content": "ping"}], 1, json_mode=False)
 
     # ---------------------------------------------------------------- HTTP
     def _headers(self) -> Dict[str, str]:
@@ -196,8 +200,11 @@ class APIRuntime:
         headers.update(self.extra_headers)
         return headers
 
-    def _chat(self, messages: List[Dict[str, str]], max_new_tokens: int = 512) -> str:
-        body = self._post(messages, max_tokens=max_new_tokens)
+    def _chat(
+        self, messages: List[Dict[str, str]], max_new_tokens: int = 512,
+        *, json_mode: bool = True,
+    ) -> str:
+        body = self._post(messages, max_tokens=max_new_tokens, json_mode=json_mode)
         choice = (body.get("choices") or [{}])[0]
         return ((choice.get("message") or {}).get("content") or "").strip()
 
@@ -208,6 +215,7 @@ class APIRuntime:
         max_tokens: int,
         logprobs: bool = False,
         top_logprobs: Optional[int] = None,
+        json_mode: bool = True,
     ) -> Dict[str, Any]:
         """发一次 chat.completions，返回解析后的 JSON（带重试）。"""
         payload: Dict[str, Any] = {
@@ -216,18 +224,19 @@ class APIRuntime:
             "temperature": self.temperature,
             "max_tokens": int(max_tokens),
         }
-        if self.response_format_json and not logprobs:
+        if self.response_format_json and json_mode and not logprobs:
             payload["response_format"] = {"type": "json_object"}
         if logprobs:
             payload["logprobs"] = True
             if top_logprobs:
                 payload["top_logprobs"] = int(top_logprobs)
         payload.update(self.extra_body)
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        json_mode_active = "response_format" in payload
 
         last: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
+                body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                 req = request.Request(
                     self._url, data=body, headers=self._headers(), method="POST"
                 )
@@ -243,9 +252,25 @@ class APIRuntime:
                 return data
             except error.HTTPError as exc:  # noqa: PERF203
                 last = exc
+                detail = exc.read()[:300]
+                # 有的供应商（DeepSeek）要求用 json_object 时 prompt 里必须出现
+                # "json"；我们的抽取 prompt 有，但换个 prompt/供应商就可能没有。
+                # 命中这条就丢掉 response_format 直接重试（普通模式 + 我们的三级
+                # JSON 容错解析），别让一个格式开关把整批打分打崩。
+                if (
+                    exc.code == 400
+                    and json_mode_active
+                    and b"json_object" in detail
+                    and b"response_format" in detail
+                ):
+                    payload.pop("response_format", None)
+                    json_mode_active = False
+                    logger.warning(
+                        "供应商要求 prompt 含 'json' 才允许 json_object，已退回普通模式重试"
+                    )
+                    continue
                 retryable = exc.code in (408, 409, 429, 500, 502, 503, 504)
                 if not retryable or attempt >= self.max_retries:
-                    detail = exc.read()[:300]
                     if exc.code in (401, 403):
                         raise APIError(
                             f"HTTP {exc.code}: {detail!r}\n"

@@ -73,10 +73,54 @@ def test_generate_batch_把prompt当user():
     assert got["a"] == [{"role": "user", "content": "a"}]
 
 
-def test_不做判定():
+def test_用logprobs复刻受限解码():
+    rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test", max_logprobs=20)
+    dist = [
+        {"token": "3", "logprob": -0.1},
+        {"token": "4", "logprob": -1.5},
+        {"token": "2", "logprob": -2.0},
+        {"token": "1", "logprob": -4.0},
+        {"token": "0", "logprob": -6.0},
+    ]
+
+    def fake_post(messages, *, max_tokens, logprobs=False, top_logprobs=None):
+        return {"choices": [{
+            "message": {"content": "3"},
+            "logprobs": {"content": [{"token": "3", "logprob": -0.1,
+                                      "top_logprobs": dist}]},
+        }], "usage": {"prompt_tokens": 10, "completion_tokens": 1}}
+
+    rt._post = fake_post
+    scores, pmaxs, probs = rt.score_digits_batch(["p"])
+    assert scores == [3]
+    assert pmaxs[0] > 0.5
+    assert len(probs[0]) == 5 and probs[0][3] == max(probs[0])
+
+
+def test_没有logprobs时退回解析文本():
     rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test")
-    with pytest.raises(NotImplementedError, match="只做抽取"):
-        rt.score_digits_batch(["p"])
+
+    def fake_post(messages, *, max_tokens, logprobs=False, top_logprobs=None):
+        return {"choices": [{"message": {"content": "4"}}]}
+
+    rt._post = fake_post
+    scores, pmaxs, probs = rt.score_digits_batch(["p"])
+    assert scores == [4] and pmaxs == [None] and probs == [[]]
+
+
+def test_ping不带json模式():
+    """探活消息里没有 'json'，不能带 response_format=json_object（DeepSeek 会 400）。"""
+    rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test")
+    seen = {}
+
+    def fake_post(messages, *, max_tokens, logprobs=False, top_logprobs=None,
+                  json_mode=True):
+        seen["json_mode"] = json_mode
+        return {"choices": [{"message": {"content": "pong"}}]}
+
+    rt._post = fake_post
+    assert rt.ping() == "pong"
+    assert seen["json_mode"] is False
 
 
 def test_build_api_runtime_读配置():

@@ -335,6 +335,11 @@ def test_上下文判定prompt_原文给六项摘要只给目标项():
     # 判分规则放在 system 里，user 只放材料，避免和 rubric 打架
     assert "判分规则" not in user
     assert "辅助参考" in system and "3 分" in system
+    # 法律定性按"能否由原文整体推出"判断（案由/诉请/法条/结果体现同一定性即可）
+    assert "法律定性" in system and "按 3 或 4 分" in system
+    # 对"原告诉请/被告辩称/法院查明"这三项的一般性放宽：0 分门槛更严
+    assert "0 分门槛" in system
+    assert "建筑设备租赁" not in system      # 不是针对某个示例打的补丁
 
 
 def test_开关开启时判定带上其它要素作辅助():
@@ -358,6 +363,69 @@ def test_开关开启时判定带上其它要素作辅助():
     j.judge_elements_batch(j.build_pairs(doc, cand, None))
     # 判 court_facts 时，原文的其它要素（legal_basis）也出现在 prompt 里
     assert any("《中华人民共和国劳动法》第七条" in p for p in rt.rendered)
+
+
+def test_人工摘要作第二辅助_自评时忽略():
+    from sfzy.judge.prompts import build_judge_messages_with_context
+
+    doc = SixElements(court_facts="原文事实")
+    cand = SixElements(court_facts="候选事实")
+    ref = SixElements(court_facts="人工摘要事实")
+
+    user = build_judge_messages_with_context(
+        "court_facts", doc, cand, reference_elements=ref
+    )[1]["content"]
+    assert "辅助参考二" in user and "人工摘要事实" in user
+
+    class _RT:
+        def __init__(self):
+            self.stats = {}
+
+    j = FactConsistencyJudge(
+        runtime=_RT(), use_element_context=True, use_reference_context=True
+    )
+    # 候选就是人工摘要本身（离线工具的 human 臂是自评）→ 不挂人工摘要辅助
+    self_pairs = j.build_pairs(doc, ref, None, reference_elements=ref)
+    assert all(getattr(p, "ref_elements", None) is None for p in self_pairs)
+    # 候选不是人工摘要 → 挂上
+    cand_pairs = j.build_pairs(doc, cand, None, reference_elements=ref)
+    assert all(getattr(p, "ref_elements", None) is ref for p in cand_pairs)
+
+
+def test_一次性六要素判定_prompt与解析():
+    from sfzy.judge.judge import parse_six_scores
+    from sfzy.judge.prompts import SIX_SHOT_JUDGE_SYSTEM, build_fact_six_messages
+
+    cand = SixElements(case_type="劳动纠纷", court_facts="摘要事实")
+    msgs = build_fact_six_messages("这是原文全文……", cand)
+    assert msgs[0]["content"] == SIX_SHOT_JUDGE_SYSTEM
+    user = msgs[1]["content"]
+    assert "【裁判文书原文】" in user and "这是原文全文" in user
+    assert "【待评价摘要的六要素】" in user and "court_facts" in user
+
+    assert parse_six_scores('{"case_type": 3, "court_facts": 0}') == {
+        "case_type": 3, "court_facts": 0,
+    }
+    assert parse_six_scores('```json\n{"court_facts": "4"}\n```') == {"court_facts": 4}
+
+    class _RT:
+        def __init__(self):
+            self.stats = {}
+
+        def render(self, messages):
+            return "prompt"
+
+        def generate_batch(self, prompts, max_new_tokens=512):
+            return [
+                '{"case_type":2,"plaintiff_claims":3,"defendant_defenses":4,'
+                '"court_facts":1,"legal_basis":3,"judgment_result":4}'
+            ] * len(prompts)
+
+    j = FactConsistencyJudge(runtime=_RT())
+    out = j.judge_fact_six_batch([("原文", SixElements(case_type="x", plaintiff_claims="y"))])
+    assert out[0]["case_type"] == 2 and out[0]["court_facts"] == 1
+    # 候选该项为空 → 空字段规则给满分 4（模型即使给了别的分也覆盖）
+    assert out[0]["defendant_defenses"] == 4
 
 
 def test_覆盖率pair走覆盖率prompt而不是事实一致性():
@@ -397,6 +465,20 @@ def test_覆盖率pair走覆盖率prompt而不是事实一致性():
     cov_user = next(u for s, u in rt.calls if s == COVERAGE_SYSTEM)
     assert "参考摘要要素" in cov_user and "参考摘要的事实" in cov_user
     assert "候选摘要要素" in cov_user and "候选摘要的事实" in cov_user
+
+
+def test_一次性覆盖率判定_prompt():
+    from sfzy.judge.prompts import (
+        SIX_SHOT_COVERAGE_SYSTEM,
+        build_coverage_six_messages,
+    )
+
+    msgs = build_coverage_six_messages("人工摘要全文", "候选摘要全文")
+    assert msgs[0]["content"] == SIX_SHOT_COVERAGE_SYSTEM
+    user = msgs[1]["content"]
+    assert "【参考摘要（人工）】" in user and "人工摘要全文" in user
+    assert "【候选摘要】" in user and "候选摘要全文" in user
+    assert "case_type" in user and "judgment_result" in user
 
 
 def test_抽取用独立的extract_runtime():
