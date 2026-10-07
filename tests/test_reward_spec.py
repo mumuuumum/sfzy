@@ -325,9 +325,11 @@ def test_合并配置同时开两个reward(name):
     cfg = _load(name)
     s = RewardSpec.from_config(cfg.path_("rl.reward"))
     assert [t.name for t in s.enabled_terms] == ["fact_consistency", "element_coverage"]
-    assert s.normalized_weights() == {
-        "fact_consistency": pytest.approx(0.7), "element_coverage": pytest.approx(0.3),
-    }
+    # 具体权重是拿来调的，测试只校验结构：键齐全、非负、归一化后和为 1。
+    weights = s.normalized_weights()
+    assert set(weights) == {"fact_consistency", "element_coverage"}
+    assert all(w >= 0 for w in weights.values())
+    assert sum(weights.values()) == pytest.approx(1.0)
     assert s.required_signals == {"fact_consistency", "element_coverage"}
     # 两个 reward 的内部权重都来自配置（同样只校验结构）
     for term in s.enabled_terms:

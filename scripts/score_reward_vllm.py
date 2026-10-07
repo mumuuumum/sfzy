@@ -1161,6 +1161,79 @@ def render_report(title: str, stats: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
+def write_run_config(
+    out_dir: Path,
+    *,
+    args: argparse.Namespace,
+    config_path: Path,
+    spec: RewardSpec,
+    semantic: Dict[str, Any],
+    judge_tasks: Sequence[str],
+    model_name: str,
+    max_input_tokens: int,
+    extract_max_new_tokens: int,
+) -> Path:
+    """在实验目录落一份 run_config.json —— 这次验证到底用了什么，一目了然。
+
+    每次实验一个文件夹，光看产出的数字分不清"换过哪一版 prompt / 哪个裁判 /
+    哪个抽取器"，所以把当次生效的配置固化下来。
+    """
+    import datetime
+
+    prompt_versions: Dict[str, str] = {}
+    try:
+        from sfzy.judge.prompts import (
+            EXTRACT_PROMPT_VERSION,
+            EXTRACT_SUMMARY_PROMPT_VERSION,
+        )
+
+        prompt_versions = {
+            "document": EXTRACT_PROMPT_VERSION,
+            "summary": EXTRACT_SUMMARY_PROMPT_VERSION,
+        }
+    except Exception:  # noqa: BLE001
+        pass
+
+    extract_api = semantic.get("extract_api") or {}
+    payload = {
+        "run": args.run,
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "config": str(config_path),
+        "inputs": [str(resolve(p)) for p in (args.input or [])],
+        "judge_model": model_name,
+        "judge_tasks": list(judge_tasks),
+        "quantization": args.quantization,
+        "load_format": getattr(args, "load_format", "auto"),
+        "dtype": args.dtype,
+        "tensor_parallel_size": args.tensor_parallel_size,
+        "max_input_tokens": max_input_tokens,
+        "extract_max_new_tokens": extract_max_new_tokens,
+        "element_context": bool(semantic.get("element_context", False)),
+        "doc_fallback": bool(semantic.get("doc_fallback", True)),
+        "extract_model": args.extract_model,
+        "extract_api": {
+            "base_url": extract_api.get("base_url"),
+            "model": extract_api.get("model"),
+            "concurrency": extract_api.get("concurrency"),
+        } if extract_api else None,
+        "prompt_versions": prompt_versions,
+        "reward": {
+            "terms": [t.name for t in spec.enabled_terms],
+            "normalized_weights": spec.normalized_weights(),
+            "element_weights": {
+                t.name: dict(t.options.get("element_weights") or {})
+                for t in spec.enabled_terms
+            },
+            "gate": {"enabled": spec.gate.enabled, **spec.gate.cfg},
+            "rouge_mode": spec.rouge_mode,
+        },
+    }
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "run_config.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
 def run_input(
     args: argparse.Namespace,
     path: Path,
@@ -1215,6 +1288,7 @@ def run_input(
     stats = summarize(rows_by_id, [t.name for t in spec.enabled_terms])
     stats["input"] = str(path)
     stats["output"] = str(out_path)
+    stats["run"] = getattr(args, "run", None)
     stats["extract_model"] = getattr(args, "extract_model", None)
     stats["extract_api_model"] = getattr(args, "extract_api_model", None)
     stats["max_input_tokens"] = args.max_input_tokens
@@ -1294,7 +1368,13 @@ def main() -> None:
                     help="合并多份 *.reward.jsonl 出一份总报告（不加载裁判，CPU 即可）")
     ap.add_argument("--merge-name", default="merged",
                     help="--merge 时的输出前缀，默认 merged")
-    ap.add_argument("--out-dir", default="data/judge")
+    ap.add_argument("--out-dir", default=None,
+                    help="显式指定输出目录（优先于 --run）；默认 data/judge")
+    ap.add_argument("--runs-dir", default="data/judge/runs",
+                    help="实验根目录：每次验证的结果放进 <runs-dir>/<--run>/")
+    ap.add_argument("--run", default=None,
+                    help="本次实验名（如 exp2）。给了就写到 <runs-dir>/<run>/，"
+                         "并在目录里落一份 run_config.json 记录当次配置")
     ap.add_argument("--candidate-key", default="output", help="候选摘要字段名")
     ap.add_argument("--reference-key", default="reference", help="人工摘要字段名")
     ap.add_argument("--limit", type=int, default=None)
@@ -1348,6 +1428,15 @@ def main() -> None:
 
     global _DUMP_ELEMENTS
     _DUMP_ELEMENTS = bool(args.dump_elements)
+
+    # 输出目录：--out-dir 优先；否则按实验目录约定 <runs-dir>/<--run>/；
+    # 两者都没给才退回 data/judge。
+    if args.out_dir:
+        args.out_dir = str(resolve(args.out_dir))
+    elif args.run:
+        args.out_dir = str(resolve(args.runs_dir) / args.run)
+    else:
+        args.out_dir = str(resolve("data/judge"))
 
     if args.merge:
         run_merge(args)
@@ -1474,6 +1563,15 @@ def main() -> None:
         doc_fallback=bool(semantic.get("doc_fallback", True)),
         use_element_context=bool(semantic.get("element_context", False)),
     )
+
+    run_config_path = write_run_config(
+        resolve(args.out_dir),
+        args=args, config_path=resolve(args.config), spec=spec, semantic=semantic,
+        judge_tasks=judge_tasks, model_name=model_name,
+        max_input_tokens=args.max_input_tokens,
+        extract_max_new_tokens=extract_max_new_tokens,
+    )
+    logger.info("本次实验配置已存档：%s", run_config_path)
 
     all_stats = []
     for raw_path in args.input:

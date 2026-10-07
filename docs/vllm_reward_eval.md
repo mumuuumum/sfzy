@@ -199,36 +199,42 @@ CUDA_VISIBLE_DEVICES=1 python scripts/score_reward_vllm.py \
 # 卡 0：shard0（例：BNB；换成 --quantization bitsandbytes ）
 # pip install vllm-bnb-plugin
 
-CUDA_VISIBLE_DEVICES=0 python scripts/score_reward_vllm.py \
+CUDA_VISIBLE_DEVICES=0 python scripts/score_reward_vllm.py --run exp2 \
     --config configs/grpo_fact_coverage_t4.yaml \
     --model Qwen/Qwen2.5-7B-Instruct --quantization bitsandbytes --dtype float16 \
     --input data/triples/sft_val_shard0of2.jsonl
 
 # 卡 1：shard1
-CUDA_VISIBLE_DEVICES=1 python scripts/score_reward_vllm.py \
+CUDA_VISIBLE_DEVICES=1 python scripts/score_reward_vllm.py --run exp2 \
     --config configs/grpo_fact_coverage_t4.yaml \
     --model Qwen/Qwen2.5-7B-Instruct --quantization bitsandbytes --dtype float16 \
     --input data/triples/sft_val_shard1of2.jsonl
 ```
 
-等两个进程都结束后，产物在 `data/judge/`：
+**实验目录约定**：`--run <名字>` 把这次验证的全部产物放进
+`<--runs-dir>/<名字>/`（默认 `data/judge/runs/exp2/`），并落一份 `run_config.json`
+记录当次生效的模型 / 量化 / prompt 版本 / 奖励权重 / 抽取器。各次实验互不覆盖，
+`data/judge/runs/README.md` 有完整说明；旧的第一次结果已迁到 `data/judge/runs/exp1/`。
+
+等两个进程都结束后，产物在 `data/judge/runs/exp2/`：
 
 ```
-data/judge/sft_val_shard0of2.reward.jsonl          每行一条记录的一臂奖励 / ROUGE
-data/judge/sft_val_shard0of2.reward.summary.json   两条结论的检验结果 + 分项统计
-data/judge/sft_val_shard0of2.reward.report.md      人读报告（结论 + 支撑数据）
-data/judge/sft_val_shard1of2.reward.jsonl
-data/judge/sft_val_shard1of2.reward.summary.json
-data/judge/sft_val_shard1of2.reward.report.md
+data/judge/runs/exp2/run_config.json                     本次实验的配置快照
+data/judge/runs/exp2/sft_val_shard0of2.reward.jsonl      每行一条记录的一臂奖励 / ROUGE
+data/judge/runs/exp2/sft_val_shard0of2.reward.summary.json
+data/judge/runs/exp2/sft_val_shard0of2.reward.report.md
+data/judge/runs/exp2/sft_val_shard1of2.reward.jsonl
+data/judge/runs/exp2/sft_val_shard1of2.reward.summary.json
+data/judge/runs/exp2/sft_val_shard1of2.reward.report.md
 ```
 
 两个分片跑完后，把逐条结果合成一份**全量**总报告（纯 CPU，几秒，不加载裁判）：
 
 ```bash
-python scripts/score_reward_vllm.py --merge \
-    data/judge/sft_val_shard0of2.reward.jsonl \
-    data/judge/sft_val_shard1of2.reward.jsonl
-# -> data/judge/merged.reward.summary.json / merged.reward.report.md / merged.reward.jsonl
+python scripts/score_reward_vllm.py --run exp2 --merge \
+    data/judge/runs/exp2/sft_val_shard0of2.reward.jsonl \
+    data/judge/runs/exp2/sft_val_shard1of2.reward.jsonl
+# -> data/judge/runs/exp2/merged.reward.summary.json / merged.reward.report.md / merged.reward.jsonl
 ```
 
 最终对外汇报用这份 `merged.reward.report.md`，各分片的报告留作排查。
@@ -238,6 +244,7 @@ python scripts/score_reward_vllm.py --merge \
 | 参数 | 作用 |
 |---|---|
 | `--config` | 读 `rl.reward`（奖励口径）和 `semantic`（裁判抽取预算等），默认 `configs/grpo_fact_coverage_t4.yaml` |
+| `--run` / `--runs-dir` | 实验目录约定：结果写到 `<runs-dir>/<run>/`（默认 `data/judge/runs/exp2/`），并落 `run_config.json`；`--out-dir` 显式指定时优先 |
 | `--model` / `--tokenizer` | 覆盖 `semantic.model`；AWQ 目录缺 tokenizer 文件时单独指 |
 | `--extract-model` | 可选的独立抽取模型（更强/更大）；默认共用裁判模型。两份权重同占显存 |
 | `--quantization` | `none` / `bitsandbytes` / `awq` / `gptq`。T4 必须显式指定一个 4-bit 方案 |
