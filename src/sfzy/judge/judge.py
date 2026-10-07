@@ -440,26 +440,26 @@ class FactConsistencyJudge:
         return self._ref_cache[key]
 
     # ---------------------------------------------------------------- 判定
-    def _render_request(self, request: "JudgeRequest") -> str:
+    def _request_messages(self, request: "JudgeRequest") -> List[Dict[str, str]]:
+        """按任务构造 messages（不渲染）—— 本地/API 两种 runtime 共用。"""
         if request.task == "element_coverage":
-            messages = build_coverage_messages(
+            return build_coverage_messages(
                 request.element, request.left, request.right
             )
-        elif (
+        if (
             self.use_element_context
             and request.doc_elements is not None
             and request.cand_elements is not None
         ):
             # 逐要素给分不变，只是把两边的六要素都摆出来、高亮本次对比项。
-            messages = build_judge_messages_with_context(
+            return build_judge_messages_with_context(
                 request.element, request.doc_elements, request.cand_elements,
                 document_target=request.left, candidate_target=request.right,
             )
-        else:
-            messages = build_judge_messages(
-                request.element, request.left, request.right
-            )
-        return self.runtime.render(messages)
+        return build_judge_messages(request.element, request.left, request.right)
+
+    def _render_request(self, request: "JudgeRequest") -> str:
+        return self.runtime.render(self._request_messages(request))
 
     def _score_requests(
         self, requests: Sequence["JudgeRequest"]
@@ -472,7 +472,8 @@ class FactConsistencyJudge:
         """
         if not requests:
             return [], [], []
-        prompts = [self._render_request(r) for r in requests]
+        conversations = [self._request_messages(r) for r in requests]
+        prompts = [self.runtime.render(c) for c in conversations] if _VERBOSE else []
         if _VERBOSE:
             for i, (r, prompt) in enumerate(zip(requests, prompts)):
                 print(f"\n{'='*20} [Judge:{r.task}] 请求 {i+1} {'='*20}")
@@ -480,7 +481,13 @@ class FactConsistencyJudge:
                 print(f"对照左：{r.left}")
                 print(f"对照右：{r.right}")
                 print(f"构造的完整 Prompt:\n{prompt}\n")
-        scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
+        # API runtime 直接吃 messages（保住 system 里的评分 rubric）；
+        # 本地 runtime 先 render 成字符串再前向。
+        if hasattr(self.runtime, "score_digits_messages"):
+            scores, pmaxs, probs = self.runtime.score_digits_messages(conversations)
+        else:
+            prompts = [self.runtime.render(c) for c in conversations]
+            scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
         if _VERBOSE:
             for i, (s, pm, pr) in enumerate(zip(scores, pmaxs, probs)):
                 print(f"\n{'='*20} [Judge] 请求 {i+1} 输出 {'='*20}")

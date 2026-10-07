@@ -34,8 +34,20 @@ def test_必须给base_url和model():
         api.APIRuntime("http://x/v1", "")
 
 
+def test_缺密钥直接报清楚(monkeypatch):
+    monkeypatch.delenv("SFZY_JUDGE_API_KEY", raising=False)
+    with pytest.raises(ValueError, match="SFZY_JUDGE_API_KEY"):
+        api.APIRuntime("http://x/v1", "m")
+
+
+def test_密钥自动去掉首尾空白(monkeypatch):
+    monkeypatch.setenv("SFZY_JUDGE_API_KEY", "  sk-abc123456789  \n")
+    rt = api.APIRuntime("http://x/v1", "m")
+    assert rt.api_key == "sk-abc123456789"
+
+
 def test_generate_messages_保序并发():
-    rt = api.APIRuntime("http://x/v1", "m", concurrency=4)
+    rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test", concurrency=4)
     seen = []
 
     def fake_chat(messages, n):
@@ -49,7 +61,7 @@ def test_generate_messages_保序并发():
 
 
 def test_generate_batch_把prompt当user():
-    rt = api.APIRuntime("http://x/v1", "m", concurrency=2)
+    rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test", concurrency=2)
     got = {}
 
     def fake_chat(messages, n):
@@ -62,14 +74,14 @@ def test_generate_batch_把prompt当user():
 
 
 def test_不做判定():
-    rt = api.APIRuntime("http://x/v1", "m")
+    rt = api.APIRuntime("http://x/v1", "m", api_key="sk-test")
     with pytest.raises(NotImplementedError, match="只做抽取"):
         rt.score_digits_batch(["p"])
 
 
 def test_build_api_runtime_读配置():
     rt = api.build_api_runtime({
-        "base_url": "http://x/v1/", "model": "m", "concurrency": 6,
+        "base_url": "http://x/v1/", "model": "m", "api_key": "sk-test", "concurrency": 6,
         "max_retries": 1, "timeout_s": 5,
     })
     assert rt.base_url == "http://x/v1"      # 末尾斜杠归一化

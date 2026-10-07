@@ -1415,6 +1415,9 @@ def main() -> None:
     ap.add_argument("--extract-model", default=None,
                     help="可选的独立抽取模型（比裁判更强/更大）。不给就共用裁判模型。"
                          "两份权重同时在显存里，单卡放不下就别用")
+    ap.add_argument("--check-extract-api", action="store_true",
+                    help="只验证 semantic.extract_api 的连通性/鉴权：发一次最小请求就退出"
+                         "（不需要 GPU，用来排查 401）")
     ap.add_argument("--extract-tokenizer", default=None)
     ap.add_argument("--extract-quantization", default=None,
                     help="抽取模型的量化方式，默认跟随 --quantization")
@@ -1473,6 +1476,19 @@ def main() -> None:
     spec_ungated.gate.enabled = False
 
     semantic = cfg.get("semantic") or {}
+
+    if args.check_extract_api:
+        # 只验证抽取 API 的 base_url / 模型 / 鉴权，不发任何 GPU 相关的东西。
+        api_cfg = semantic.get("extract_api")
+        if not api_cfg:
+            raise SystemExit("配置里没有 semantic.extract_api，无法检查")
+        from sfzy.judge.api_runtime import build_api_runtime
+
+        rt = build_api_runtime(dict(api_cfg))
+        reply = rt.ping()
+        print(f"OK  base_url={rt.base_url}  model={rt.model}  reply={reply!r}")
+        return
+
     model_name = args.model or semantic.get("model")
     if not model_name:
         raise SystemExit("要么 --model，要么 config 里写 semantic.model")
