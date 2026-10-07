@@ -186,11 +186,10 @@ JUDGE_SYSTEM = """你是严格的裁判文书摘要事实一致性评价器。�
 核心原则：判断方向始终是“原文 → 摘要”。
 
 1. 【允许省略】原文有、摘要没有的信息，不扣分。
-2. 【允许概括】原文更具体、摘要更抽象时，只要原文能够推出摘要表述，就视为一致。例如“被告偿还10万元”→“被告偿还部分款项”属于一致。
+2. 【允许概括】原文更具体、摘要更抽象时，只要原文能够推出摘要表述，就视为一致。
 3. 【禁止新增】摘要主动陈述而原文无法支持的事实属于编造。
 4. 【禁止改变】主体、行为、金额、日期、数量、法律依据、肯否关系、裁判结果等与原文不一致，属于事实错误。
 5. 严格区分原告诉请、被告辩称和法院认定，不得相互替换。
-6. 其他正确内容不能抵消事实错误或编造。
 
 评分：
 
@@ -218,6 +217,30 @@ JUDGE_SYSTEM = """你是严格的裁判文书摘要事实一致性评价器。�
 “摘要有、原文无”是编造，评0分。
 “原文具体、摘要概括”只要原文能够推出摘要表述，就不是错误，可以评4分。
 不要因为摘要其他内容正确而抵消任何已经确认的事实错误或编造。
+
+只输出0、1、2、3或4。"""
+
+
+# 事实一致性 + 六要素上下文（`semantic.element_context: true`）时用的 system。
+# 判分规则全部留在 system 里，user 只放材料——否则 user 里再写一套规则，会
+# 和这里的 rubric 打架、被模型当成"后出现的规则"覆盖掉。
+JUDGE_SYSTEM_CONTEXT = JUDGE_SYSTEM + """
+
+【本次判定的额外约定：六要素上下文】
+
+本次你会看到三块内容（都在 user 消息里）：
+  * 【判分依据】：原文中与你正要评价的摘要要素相对应的那一项；
+  * 【辅助参考】：原文的其余五项；
+  * 【待评价摘要的要素】：本次要评价的、摘要里的那一个要素。
+
+判断时遵守：
+
+1. 判分的主依据是【判分依据】。
+2. 【辅助参考】只是辅助——它用来排查"抽取时把内容归到了别的要素里"这种边界误差，
+   不能当作与【判分依据】同等强度的证据。
+3. 如果摘要该要素的陈述在【判分依据】里找不到、但在【辅助参考】的任意一项里能找到：
+   * 这属于抽取归类差异，**不是编造**，不得因此判 0。
+4. 只有当摘要该要素的陈述在原文六项里**都找不到**支持时，才按上面的"编造/新增"判 0。
 
 只输出0、1、2、3或4。"""
 
@@ -305,21 +328,14 @@ def build_judge_messages(
     ]
 
 
-def _element_block(elements, highlight: str, highlight_value: str = None) -> str:
-    """把六要素排成清单，标出本次要对比的那一项。
+def _as_values(elements) -> Dict[str, str]:
+    if elements is None:
+        return {}
+    return elements.to_dict() if hasattr(elements, "to_dict") else dict(elements)
 
-    `highlight_value` 是实际送判的对比文本（正常就是对应要素本身；原文抽空、
-    改用整篇原文兜底时是兜底文本）。
-    """
-    values = elements.to_dict() if hasattr(elements, "to_dict") else dict(elements)
-    lines = []
-    for name in ELEMENTS:
-        raw = highlight_value if (name == highlight and highlight_value is not None) \
-            else values.get(name)
-        value = (raw or "").strip() or "（空）"
-        mark = "   ← 本次对比的要素" if name == highlight else ""
-        lines.append(f"- {ELEMENT_ZH[name]}（{name}）：{value}{mark}")
-    return "\n".join(lines)
+
+def _element_line(name: str, value: str) -> str:
+    return f"- {ELEMENT_ZH[name]}（{name}）：{(value or '').strip() or '（空）'}"
 
 
 def build_judge_messages_with_context(
@@ -332,44 +348,47 @@ def build_judge_messages_with_context(
     """带原文六要素上下文的判定 prompt（本次只判 `element_name` 这一项）。
 
     每次判定给：
-      * 原文的**全部六要素**（高亮本次对比项，其余五项作辅助）；
+      * 原文的**判分依据**（本次对比的那一项，单独成块）；
+      * 原文的**其余五项**，单独放在"辅助参考"里，明确只用来兜抽取归类误差；
       * 摘要的**仅本次要判的那一个要素**。
 
     为什么这样不对称：抽取的边界有噪声，同一件事可能被原文抽进 court_facts、
     却被摘要抽进 legal_basis（或反过来）。只给"要对比的两小段"时，这种边界
-    误差会被当成"编造/不一致"。把原文六项都摆出来，只要摘要该项的陈述在原文
-    **任意一项**里出现过，就按一致处理。摘要侧不需要展示其它五项——它们既不
-    参与本次判定，还会引入无关信息。
+    误差会被当成"编造/不一致"。所以把原文六项都摆出来排查；但另外五项只是
+    辅助，摘要侧也只给要判的那一项，不引入无关信息。
+
+    扣分口径：内容只在辅助项里能找到时——放对了位置视同一致；放错了位置
+    算轻微问题给 3 分，**不是 0**（0 只留给六项里都找不到支持的编造）。
 
     `document_target` / `candidate_target` 是实际送判的对比文本。正常就是对应
     要素本身；原文该要素抽空、改用整篇原文兜底时，`document_target` 放兜底文本。
     """
     zh = ELEMENT_ZH.get(element_name, element_name)
-    doc_block = _element_block(document_elements, element_name, document_target)
+    doc_values = _as_values(document_elements)
+    primary = document_target if document_target is not None \
+        else doc_values.get(element_name)
+    other_lines = "\n".join(
+        _element_line(name, doc_values.get(name))
+        for name in ELEMENTS if name != element_name
+    )
     if candidate_target is None and candidate_elements is not None:
-        values = (candidate_elements.to_dict()
-                  if hasattr(candidate_elements, "to_dict") else dict(candidate_elements))
-        candidate_target = values.get(element_name) or ""
+        candidate_target = _as_values(candidate_elements).get(element_name) or ""
     cand_value = (candidate_target or "").strip() or "（空）"
 
     user = f"""当前评价要素类型：
 {zh}（{element_name}）
 
-判断方向：原文 → 摘要。本次**只**评价摘要的【{zh}】。
+【判分依据：原文的{zh}】
+{_element_line(element_name, primary)}
 
-【裁判文书原文的六要素】（高亮的是本次对比的要素；其余五项只作辅助——抽取时可能把本要素的内容归到别的要素里）
-{doc_block}
+【辅助参考：原文的其余五项】（**只是辅助**：用来排查抽取时的归类/边界误差，不作为判分依据）
+{other_lines}
 
 【待评价摘要的要素】
 {zh}（{element_name}）：{cand_value}
 
-辅助规则（原文六要素的边界划分并不严格，用来弥补抽取误差）：
-- 判断摘要的【{zh}】时，只要它的陈述在原文**任意一项**里出现过、能被支持，就按一致处理，不算编造或新增。
-- 摘要省略、概括不扣分。
-- 仍要区分“当事人主张”和“法院认定”，二者互换仍然算不一致。
-
-请判断摘要的【{zh}】是否受原文支持。只输出 0、1、2、3、4 中的一个整数。"""
+请只评价摘要的【{zh}】与原文的事实一致性。"""
     return [
-        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "system", "content": JUDGE_SYSTEM_CONTEXT},
         {"role": "user", "content": user},
     ]

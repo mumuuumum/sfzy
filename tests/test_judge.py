@@ -319,15 +319,22 @@ def test_上下文判定prompt_原文给六项摘要只给目标项():
                       legal_basis="原文法条")
     cand = SixElements(case_type="劳动纠纷", court_facts="摘要概括的事实",
                        legal_basis="摘要法条")
-    user = build_judge_messages_with_context("court_facts", doc, cand)[1]["content"]
+    msgs = build_judge_messages_with_context("court_facts", doc, cand)
+    system, user = msgs[0]["content"], msgs[1]["content"]
+    primary_block = user.split("【辅助参考")[0]
+    assert "判分依据" in primary_block
+    assert ELEMENT_ZH["court_facts"] in primary_block      # 判分依据是本项
+    aux_block = user.split("【辅助参考")[1].split("【待评价摘要的要素】")[0]
     for name in ELEMENTS:
-        assert ELEMENT_ZH[name] in user          # 原文的六要素都在
-    highlighted = [l for l in user.splitlines() if "← 本次对比的要素" in l]
-    assert len(highlighted) == 1                 # 只有原文侧高亮
-    assert "court_facts" in highlighted[0]
+        if name != "court_facts":
+            assert ELEMENT_ZH[name] in aux_block           # 其余五项都在辅助块
+    assert ELEMENT_ZH["court_facts"] not in aux_block
     summary_block = user.split("【待评价摘要的要素】")[1]
     assert "court_facts" in summary_block
     assert "legal_basis" not in summary_block    # 摘要侧只给要判的那一项
+    # 判分规则放在 system 里，user 只放材料，避免和 rubric 打架
+    assert "判分规则" not in user
+    assert "辅助参考" in system and "3 分" in system
 
 
 def test_开关开启时判定带上其它要素作辅助():
