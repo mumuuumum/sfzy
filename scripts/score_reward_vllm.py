@@ -369,6 +369,25 @@ def build_vllm(
     if getattr(args, "load_format", "auto") not in (None, "", "auto"):
         llm_kwargs["load_format"] = args.load_format
 
+    # 跨 vLLM 版本兼容：不同版本的 EngineArgs 字段不一样（例如 V1 引擎删了
+    # swap_space），把当前版本不认识的 kwargs 丢掉，而不是直接 TypeError。
+    from sfzy.utils.vllm_compat import filter_llm_kwargs
+
+    llm_kwargs, dropped = filter_llm_kwargs(llm_kwargs)
+    if dropped:
+        logger.warning(
+            "当前 vLLM 的 EngineArgs 不认识这些参数，已忽略：%s（0.6.x 与 0.3x 的差异）",
+            dropped,
+        )
+    # max_logprobs 被丢说明这个版本不让配置上限；把请求的 logprobs 收敛到默认上限 20，
+    # 否则 SamplingParams(logprobs=50) 会被引擎拒绝。0~4 五个分数 token 一定在 top-20 里。
+    effective_logprobs = args.logprobs
+    if "max_logprobs" in dropped:
+        effective_logprobs = min(args.logprobs, 20)
+        logger.warning(
+            "当前 vLLM 不支持 max_logprobs 参数，判定 logprobs 收敛到 %d", effective_logprobs
+        )
+
     logger.info(
         "加载 vLLM 裁判：%s（dtype=%s, quantization=%s, load_format=%s, tp=%d, max_model_len=%d）",
         model_name, args.dtype, args.quantization,
@@ -380,7 +399,7 @@ def build_vllm(
         llm=llm,
         tokenizer=tokenizer,
         max_input_tokens=args.max_input_tokens,
-        max_logprobs=args.logprobs,
+        max_logprobs=effective_logprobs,
     )
     return runtime, tokenizer
 

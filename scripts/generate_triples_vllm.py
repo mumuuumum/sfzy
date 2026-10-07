@@ -434,6 +434,17 @@ def run_vllm(args: argparse.Namespace) -> None:
     if dtype and dtype != "auto":
         llm_kwargs["dtype"] = dtype
 
+    # 跨 vLLM 版本兼容：不同版本的 EngineArgs 字段不一样（V1 引擎删了 swap_space），
+    # 把当前版本不认识的 kwargs 丢掉，而不是直接 TypeError。
+    from sfzy.utils.vllm_compat import filter_llm_kwargs
+
+    llm_kwargs, dropped = filter_llm_kwargs(llm_kwargs)
+    if dropped:
+        logger.warning(
+            "当前 vLLM 的 EngineArgs 不认识这些参数，已忽略：%s（0.6.x 与 0.3x 的差异）",
+            dropped,
+        )
+
     logger.info("加载 vLLM：%s（dtype=%s, tp=%d, lora=%s）",
                 model_name, dtype, args.tensor_parallel_size,
                 lora_dir or "无")

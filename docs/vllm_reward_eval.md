@@ -27,6 +27,12 @@ ChatGLM3 的那个 SFT 环境。推荐
 pip install "vllm==0.6.6" "transformers==4.46.3"
 ```
 
+**多版本兼容**：脚本按当前安装版本 `EngineArgs` 的字段自动过滤传给 `LLM(...)`
+的参数（见 `sfzy/utils/vllm_compat.py`），所以 0.6.6 和新版（V1 引擎，如 0.3x）
+都能跑。已知差异：新版删掉了 `swap_space`，脚本会忽略它并打一条 warning——
+也就是说在新版上“加 CPU swap 缓解 OOM”这一招不再可用，改用
+`--enforce-eager` / 降 `--gpu-memory-utilization` / 降 `--chunk-size`。
+
 ## 二、T4 的显存与 4-bit（必须看）
 
 Qwen2.5-7B 的 fp16 权重约 15GB，单张 T4（16GB）装不下。**vLLM 是能加载
