@@ -351,9 +351,18 @@ Pearson 和 Spearman：
 
 逐条 `*.reward.jsonl` 里每行是 `arm=candidate|human` 的一条，字段包括
 `reward`（含门控）、`reward_ungated`（不含门控）、`terms`（各分项）、
-`rouge`（rouge-1/2/l 的 p/r/f 与 overall）、`rouge_l`、`fact_raw`（六要素
-0-4 原始分）、`element_coverage`、`gate_reason`。要定位"是哪一篇文书、哪个
-要素判反了"，直接看这一列。
+`rouge`（rouge-1/2/l 的 p/r/f 与 overall）、`rouge_l`、`gate_reason`、
+`error`，以及两个任务各自的**分项**：
+
+| 任务 | 聚合值 | 归一化分项 | 原始分项 | 参与要素 |
+|---|---|---|---|---|
+| 事实一致性 | `fact_consistency` | `fact_scores` | `fact_raw`（0-4） | 固定六项 |
+| 关键要素覆盖率 | `element_coverage` | `coverage_scores` | `coverage_raw`（0-4） | `coverage_present`（参考摘要里真实存在的要素） |
+
+覆盖率的分项口径：`coverage_present` 是参考摘要里存在的要素；参考里没有的要素
+不进 `coverage_raw`/`coverage_scores`（分子分母都不算）；参考有、候选没写的要素
+在 `coverage_raw` 里记 0（未覆盖）。要定位"是哪一篇文书、哪个要素判反了/没覆盖"，
+直接看这几列。
 
 ## 五、和 HF 版的关系
 

@@ -135,6 +135,7 @@ from sfzy.utils.text_fit import truncate_text as _truncate_text  # noqa: E402
 from sfzy.judge.runtime import DIGITS                        # noqa: E402
 from sfzy.judge.schema import (                              # noqa: E402
     ELEMENTS,
+    MAX_SCORE,
     SixElements,
     aggregate,
     aggregate_coverage,
@@ -491,6 +492,8 @@ def score_chunk(
         signals: Dict[str, Optional[float]] = {}
         fact_result = None
         coverage = None
+        cov_raw: Dict[str, int] = {}
+        cov_present: List[str] = []
         error = entry["error"]
         try:
             if "fact_consistency" in tasks and "cons_slice" in entry:
@@ -508,11 +511,14 @@ def score_chunk(
                 )
             if "element_coverage" in tasks and "cov_slice" in entry:
                 a, b = entry["cov_slice"]
-                raw = dict(entry["cov_pre"])
+                cov_present = list(entry["cov_present"])
+                # 分项原始分：参考里没有的要素不参与（不在 dict 里）；参考有、
+                # 候选没写的要素预置 0；其余是模型判出来的 0~4。
+                cov_raw = dict(entry["cov_pre"])
                 for name, value in zip(entry["cov_names"], scores[a:b]):
-                    raw[name] = value
+                    cov_raw[name] = value
                 coverage = aggregate_coverage(
-                    raw, entry["cov_present"], judge.coverage_weights
+                    cov_raw, cov_present, judge.coverage_weights
                 )
                 signals["element_coverage"] = coverage
         except Exception as exc:  # noqa: BLE001 — 单条失败不该毁掉整批
@@ -574,6 +580,14 @@ def score_chunk(
             "fact_scores": (dict(fact_result.scores) if fact_result else {}),
             "fact_raw": (dict(fact_result.raw_scores) if fact_result else {}),
             "element_coverage": coverage,
+            # 覆盖率的分项：原始 0~4 / 归一化 0~1 / 参与计算（参考里真实存在）的要素。
+            # 参考里没有的要素不进这两个 dict（分子分母都不算）。
+            "coverage_raw": dict(cov_raw),
+            "coverage_scores": {
+                name: round(value / float(MAX_SCORE), 6)
+                for name, value in cov_raw.items()
+            },
+            "coverage_present": cov_present,
             "error": error,
         }
         if _DUMP_ELEMENTS:

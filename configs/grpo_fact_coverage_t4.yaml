@@ -78,7 +78,7 @@ rl:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
         enabled: true
-        weight: 0.7
+        weight: 0.5
         element_weights:
           case_type:          0.05
           plaintiff_claims:   0.20
@@ -88,7 +88,7 @@ rl:
           judgment_result:    0.20
       element_coverage:
         enabled: true
-        weight: 0.3
+        weight: 0.5
         element_weights:
           case_type:          0.05
           plaintiff_claims:   0.20
