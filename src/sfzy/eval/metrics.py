@@ -106,67 +106,26 @@ def _build_six_element_scorer(
             "或 semantic.judge_api（API 裁判）"
         )
 
-    # 抽取可以用一个单独的、更强的模型（`semantic.extract_model`）。
-    # 抽取是最容易出错的一步（实测会把日期挪用/改写），换大模型比换裁判更值。
-    # 不给就共用裁判模型。注意这会在显存里多放一份权重。
-    extract_model = spec.get("extract_model")
-    extract_runtime = None
     max_input_tokens = int(spec.get("max_input_tokens", 8192))
-    extract_api = spec.get("extract_api")
-    if extract_api:
-        # 方案 A：抽取走 API（更强/不用本地显存），判定仍用本地裁判。
-        from sfzy.judge.api_runtime import build_api_runtime
-
-        extract_runtime = build_api_runtime(dict(extract_api))
-    elif extract_model and extract_model != model:
-        from sfzy.judge.runtime import build_runtime, resolve_model_path
-
-        extract_runtime = build_runtime(
-            model_path=resolve_model_path(extract_model),
-            device=spec.get("extract_device", spec.get("device", "cuda:1")),
-            dtype=spec.get("extract_dtype", spec.get("dtype", "bfloat16")),
-            max_batch_size=int(spec.get("max_batch_size", 8)),
-            max_input_tokens=max_input_tokens,
-            load_in_4bit=bool(
-                spec.get("extract_load_in_4bit", spec.get("load_in_4bit", False))
-            ),
-            bnb_4bit_compute_dtype=spec.get("extract_bnb_4bit_compute_dtype"),
-            trust_remote_code=bool(
-                spec.get("extract_trust_remote_code", spec.get("trust_remote_code", True))
-            ),
-        )
-
     common = dict(
         max_batch_size=int(spec.get("max_batch_size", 8)),
-        extract_max_new_tokens=int(spec.get("extract_max_new_tokens", 1024)),
-        # 长文书（实测最长约 1.2 万字）在 4096 下会被截断，抽取直接残缺。
+        # 长文书（实测最长约 1.2 万字）在 4096 下会被截断，判定直接残缺。
         max_input_tokens=max_input_tokens,
-        extract_runtime=extract_runtime,
-        # 权重来自 reward 配置；直接调 build_scorer（探针 / 离线打分工具）
+        # 权重来自 reward 配置；直接调 build_scorer（离线打分工具）
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(term_options.get("element_coverage") or {}).get("element_weights"),
         tasks=tasks,
-        min_document_elements=int(spec.get("min_document_elements", 2)),
-        doc_fallback=bool(spec.get("doc_fallback", True)),
-        # 判定时附上两边完整六要素，其余五项作辅助，弥补抽取边界误差
-        use_element_context=bool(spec.get("element_context", False)),
-        # 事实一致性判定再带上人工摘要作第二辅助参照（自评时自动忽略）
-        use_reference_context=bool(spec.get("reference_context", False)),
-        # 事实一致性一次性评分：(原文全文, 摘要六要素) → 六个分
-        six_shot_fact=bool(spec.get("six_shot_fact", False)),
-        six_shot_coverage=bool(spec.get("six_shot_coverage", False)),
+        six_max_new_tokens=int(
+            spec.get("six_max_new_tokens", spec.get("extract_max_new_tokens", 512))
+        ),
     )
     if judge_api:
-        # 判定也走 API：不用本地裁判模型。抽取没单独配就复用同一个 API runtime。
+        # 判定走 API：不用本地裁判模型。
         from sfzy.judge.api_runtime import build_api_runtime
 
         judge_runtime = build_api_runtime(dict(judge_api))
-        if extract_runtime is None:
-            extract_runtime = judge_runtime
-        judge = FactConsistencyJudge(
-            runtime=judge_runtime, extract_runtime=extract_runtime, **common
-        )
+        judge = FactConsistencyJudge(runtime=judge_runtime, **common)
         return SixElementScorer(judge)
 
     judge = FactConsistencyJudge(

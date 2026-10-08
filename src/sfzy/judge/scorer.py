@@ -13,8 +13,7 @@
   2. 校验同组的候选共用同一份 `reference`（人工摘要）
   3. 逐组调用 `judge_candidates`，把每条候选的多路信号摊回原位置
 
-第 1 步不能省。不分组就等于逐条调用，文档六要素会被重复提取 G 次；而候选
-六要素也失去批量 —— "6 要素 × G 候选一次组 batch"直接作废。
+第 1 步不能省：不分组就等于逐条调用，判定 prompt 失去批量。
 
 ============================ 契约在哪 ============================
 契约由 `sfzy.eval.metrics.SignalScorer`（一个 `typing.Protocol`）描述，
@@ -55,8 +54,8 @@ class SixElementScorer:
         fail_soft: bool = True,
     ) -> None:
         """
-        `fail_soft=True`（默认）时，某一篇文书的判定整体失败（比如提取器抛
-        `ExtractionFailure`、显存抖动）只把这一组标成 `None`，交给 trainer 的
+        `fail_soft=True`（默认）时，某一篇文书的判定整体失败（比如 API 报错、
+        显存抖动）只把这一组标成 `None`，交给 trainer 的
         `fill_semantic_gaps` 用组内均值补上，**不中断训练**。理由和
         `eval/metrics.py` 里点式裁判一样：一次失败不该毁掉整轮几小时的 run。
         整批失败时 `None` 会原样透传，调用方按"这条打分失败"处理。

@@ -34,29 +34,24 @@ reward 配置直接从 `--config` 的 `rl.reward` 读，和 train_grpo.py 用的
 ============================ 为什么能复用 Judge ============================
 `FactConsistencyJudge` 把"怎么用模型"抽象成了一个 `runtime`（见
 `sfzy/judge/runtime.py` 的 `TorchRuntime`）。只需要实现一个接口相同的
-`VLLMRuntime`（`render` / `generate_batch` / `score_digits_batch`），
-六要素抽取、重试、空字段规则、覆盖率组装、0-4 受限解码这些逻辑一行都不用改。
+`VLLMRuntime`（`render` / `generate_batch`），判定 prompt 的组装、解析、
+聚合这些逻辑一行都不用改。
 
 关键实现选择（和 `scripts/generate_triples_vllm.py` 一致）：
   * 直接把 token id 喂给 vLLM（`prompt_token_ids`），不喂字符串 ——
     tokenization 收敛到我们的 tokenizer，vLLM 只负责前向；
-  * 受限解码用 `max_tokens=1 + logprobs` 复刻：在 `{'0','1','2','3','4'}`
-    五个 token 的 logprob 上做 softmax，取 argmax 当分数、max 当置信度。
 
 ============================ 分批，别一条一条喂 ============================
 vLLM 的连续批处理是吞吐的来源。脚本按 `--chunk-size` 条记录切成一批：
 
-  1. 把这一批里所有**不重复**的原文 / 人工摘要 / 候选摘要一次性抽取六要素
-     （一次 generate，几十条序列一起批）；
-  2. 两种臂 × 六要素 × 两个任务的判定 prompt 合成**一次批量前向**；
+  1. 这一批里每一臂的三路判定（事实一致性 / 覆盖率 / INP）分别攒成一批；
+  2. 每路判定各走一次批量前向（一次 generate，几十条序列一起批）；
   3. 再按记录切回去聚合。
 
 一条记录分两臂：
 
   候选臂（candidate）：candidate=output，  reference=reference
   人工臂（human）    ：candidate=reference，reference=reference
-
-两臂共用同一份原文要素 / 人工摘要要素，所以原文六要素不会重复抽。
 
 ============================ T4 的显存（重要） ============================
 vLLM **支持加载 4-bit**：AWQ / GPTQ / bitsandbytes 三条路都可以（官方硬件表
@@ -112,6 +107,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import sys
@@ -137,7 +133,6 @@ from sfzy.judge.schema import (                              # noqa: E402
     ELEMENT_ZH,
     ELEMENTS,
     MAX_SCORE,
-    SixElements,
     aggregate,
     aggregate_coverage,
 )
@@ -145,10 +140,6 @@ from sfzy.judge.schema import (                              # noqa: E402
 logger = get_logger("score_reward_vllm")
 
 _ROUGE_WARNED = False
-
-# 诊断开关：--dump-elements 打开后，逐条输出里带上原文/人工/候选三种六要素
-# 的抽取结果。定位"某个要素为什么判 0"时用它（配合 --limit 跑一小批）。
-_DUMP_ELEMENTS = False
 
 
 def _warn_rouge_once(exc: Exception) -> None:
@@ -162,6 +153,23 @@ def _warn_rouge_once(exc: Exception) -> None:
         "最常见的原因是 rouge_mode=jieba 但环境里没装 jieba —— pip install jieba。",
         type(exc).__name__, exc,
     )
+
+
+def _prompt_fingerprint() -> Dict[str, str]:
+    """给三段 prompt 各记一个短 sha1 —— 换过 prompt 的结果才不会混着比。"""
+    from sfzy.judge import prompts as pm
+
+    return {
+        "fact_consistency": hashlib.sha1(
+            pm.JUDGE_SYSTEM.encode("utf-8")
+        ).hexdigest()[:12],
+        "element_coverage": hashlib.sha1(
+            pm.COVERAGE_SYSTEM.encode("utf-8")
+        ).hexdigest()[:12],
+        "information_necessity_precision": hashlib.sha1(
+            pm.INP_JUDGE_PROMPT.encode("utf-8")
+        ).hexdigest()[:12],
+    }
 
 
 def resolve(path: Any) -> Path:
@@ -183,11 +191,12 @@ def is_local_dir(path: Path) -> bool:
 class VLLMRuntime:
     """把 vLLM 的 LLM 包成 Judge 认识的 runtime。
 
-    只实现 Judge 真正调用的三个方法：
+    Judge 现在只调用前两个：
 
       * `render(messages)`             —— 套 chat 模板，返回 prompt 文本；
-      * `generate_batch(prompts)`      —— 六要素抽取，输出 JSON 文本；
-      * `score_digits_batch(prompts)`  —— 受限解码，只吐 0~4 的分数与概率。
+      * `generate_batch(prompts)`      —— 批量生成（六要素 JSON / INP 命题列表）。
+
+    `score_digits_batch` 是受限解码（0~4 分数 + 概率），保留下来供本地裁判对照。
 
     不 import 项目的 loader / lora，能在干净的 vLLM 环境里跑。
     """
@@ -408,65 +417,20 @@ def build_vllm(
 # ---------------------------------------------------------------------------
 # 分块打分
 # ---------------------------------------------------------------------------
-def _collect_unique(
-    records: Sequence[Dict[str, Any]],
-    candidate_key: str,
-    reference_key: str,
-    seen: Dict[str, SixElements],
-) -> Tuple[List[str], List[str]]:
-    """收集这一批里还没抽过要素的文本，分成 (原文, 摘要) 两组。
-
-    判决书原文和摘要用**两套抽取 prompt**，所以必须分开批量。
-    """
-    docs: List[str] = []
-    summaries: List[str] = []
-    for rec in records:
-        doc = rec.get("source") or ""
-        if doc and doc not in seen and doc not in docs:
-            docs.append(doc)
-        for text in (rec.get(reference_key) or "", rec.get(candidate_key) or ""):
-            if text and text not in seen and text not in docs and text not in summaries:
-                summaries.append(text)
-    return docs, summaries
-
-
 def score_chunk(
     judge: Any,
     spec: RewardSpec,
     spec_ungated: RewardSpec,
     records: Sequence[Dict[str, Any]],
-    els_cache: Dict[str, SixElements],
     *,
     candidate_key: str,
     reference_key: str,
-    min_document_elements: int,
 ) -> List[Dict[str, Any]]:
     """给一批记录打分，返回每行含候选臂 / 人工臂的结果。"""
     tasks = set(judge.tasks)
-    six_shot = bool(getattr(judge, "six_shot_fact", False))
-    six_cov = bool(getattr(judge, "six_shot_coverage", False))
 
-    # ---- 1. 一次把这一批需要的文本都抽出来 -------------------------------
-    # 两条都是一次性判定时，裁判直接看全文，谁都不用抽；--dump-elements 是诊断，
-    # 打开它才为了落盘把要素抽出来。
-    need_extract = (
-        ("fact_consistency" in tasks and not six_shot)
-        or ("element_coverage" in tasks and not six_cov)
-    ) or _DUMP_ELEMENTS
-    if need_extract:
-        docs_todo, summaries_todo = _collect_unique(
-            records, candidate_key, reference_key, els_cache
-        )
-        for texts, kind in ((docs_todo, "document"), (summaries_todo, "summary")):
-            if not texts:
-                continue
-            extracted = judge.extract_six_elements_batch(texts, kind=kind)
-            for text, el in zip(texts, extracted):
-                els_cache[text] = el
-
-    # ---- 2. 组装两臂的判定请求（先攒起来，最后合成一次批量前向）---------
-    all_pairs: List[Tuple[str, str, str]] = []
-    six_items: List[Tuple[str, SixElements]] = []      # (原文, 摘要六要素)
+    # ---- 1. 组装两臂的判定请求（先攒起来，最后各走一次批量前向）---------
+    six_items: List[Tuple[str, str]] = []              # (原文, 候选摘要)
     cov_items: List[Tuple[str, str]] = []              # (人工摘要, 候选摘要)
     inp_items: List[Tuple[str, str, str]] = []         # (原文, 人工摘要, 候选摘要)
     entries: List[Dict[str, Any]] = []
@@ -476,76 +440,24 @@ def score_chunk(
         reference = rec.get(reference_key) or ""
         output = rec.get(candidate_key) or ""
 
-        doc_el = els_cache.get(document, SixElements())
-        ref_el = els_cache.get(reference, SixElements())
-        error = ""
-        if not six_shot and doc_el.n_filled() < min_document_elements:
-            error = (
-                f"原文六要素只抽到 {doc_el.n_filled()} 项（要求 ≥{min_document_elements}）"
-            )
-
-        for arm, cand_text, cand_el in (
-            ("candidate", output, els_cache.get(output, SixElements())),
-            ("human", reference, ref_el),
-        ):
+        for arm, cand_text in (("candidate", output), ("human", reference)):
             entry: Dict[str, Any] = {
                 "id": rid,
                 "arm": arm,
                 "candidate": cand_text,
                 "reference": reference,
-                "error": error,
-                # 诊断用（不落盘，除非 --dump-elements）
-                "_cand_el": cand_el,
-                "_doc_el": doc_el,
-                "_ref_el": ref_el,
+                "error": "",
             }
             if "fact_consistency" in tasks:
-                if six_shot:
-                    entry["six_idx"] = len(six_items)
-                    six_items.append((document, cand_text))
-                else:
-                    cons_pairs = judge.build_pairs(
-                        doc_el, cand_el, document,
-                        # 人工摘要作第二辅助参照；build_pairs 会在"候选=人工摘要"
-                        # （离线工具的人工臂是自评）时自动忽略，避免自证。
-                        reference_elements=(
-                            ref_el if getattr(judge, "use_reference_context", False)
-                            else None
-                        ),
-                    )
-                    entry["cons_slice"] = (
-                        len(all_pairs), len(all_pairs) + len(cons_pairs)
-                    )
-                    all_pairs.extend(cons_pairs)
+                entry["six_idx"] = len(six_items)
+                six_items.append((document, cand_text))
             if "element_coverage" in tasks:
                 # 人工臂是"人工摘要自评"（候选=参考）→ 覆盖率必然满分，不用调模型
-                is_self = cand_text == reference
-                if six_cov:
-                    # 不抽参考六要素 → 六个要素都参与（参考没写的那项要求模型给 4）
-                    present = list(ELEMENTS)
-                    if is_self:
-                        precomputed: Dict[str, int] = {n: MAX_SCORE for n in present}
-                    else:
-                        precomputed = {}
-                        entry["cov_idx"] = len(cov_items)
-                        cov_items.append((reference, cand_text))
-                    entry["cov_present"] = present
-                    entry["cov_pre"] = precomputed
+                if cand_text == reference:
+                    entry["cov_self"] = True
                 else:
-                    if is_self:
-                        entry["cov_present"] = list(ELEMENTS)
-                        entry["cov_pre"] = {n: MAX_SCORE for n in ELEMENTS}
-                    else:
-                        cov_pairs, present, precomputed = judge.build_coverage_pairs(
-                            ref_el, cand_el
-                        )
-                        entry["cov_slice"] = (
-                            len(all_pairs), len(all_pairs) + len(cov_pairs)
-                        )
-                        entry["cov_names"] = [p[0] for p in cov_pairs]
-                        entry["cov_present"] = list(present)
-                        entry["cov_pre"] = dict(precomputed)
-                        all_pairs.extend(cov_pairs)
+                    entry["cov_idx"] = len(cov_items)
+                    cov_items.append((reference, cand_text))
             if "information_necessity_precision" in tasks:
                 if cand_text == reference:
                     # 人工摘要自评：候选就是人工摘要 → INP 视为 1.0，不发请求
@@ -555,19 +467,15 @@ def score_chunk(
                     inp_items.append((document, reference, cand_text))
             entries.append(entry)
 
-    # ---- 3. 一次批量前向（空字段规则在 judge_elements_with_confidence 里处理）
-    if all_pairs:
-        scores, sources, _pmaxs = judge.judge_elements_with_confidence(all_pairs)
-    else:
-        scores, sources = [], []
-    # 一次性六要素判定：每个 (原文, 摘要六要素) 一次调用
+    # ---- 2. 三路判定各一次批量前向 ----
+    # 事实一致性：每个 (原文, 候选摘要) 一次调用
     six_raws = judge.judge_fact_six_batch(six_items) if six_items else []
-    # 一次性覆盖率判定：每个 (人工摘要, 候选摘要) 一次调用
+    # 覆盖率：每个 (人工摘要, 候选摘要) 一次调用
     cov_raws = judge.judge_coverage_six_batch(cov_items) if cov_items else []
     # INP：每个 (原文, 人工摘要, 候选摘要) 一次调用
     inp_details = judge.judge_inp_batch(inp_items) if inp_items else []
 
-    # ---- 4. 切回每条记录的两臂，聚合 + 算奖励 ---------------------------
+    # ---- 3. 切回每条记录的两臂，聚合 + 算奖励 ---------------------------
     rows: List[Dict[str, Any]] = []
     for entry in entries:
         signals: Dict[str, Optional[float]] = {}
@@ -579,57 +487,24 @@ def score_chunk(
         inp_detail: Dict[str, Any] = {}
         error = entry["error"]
         try:
-            if "fact_consistency" in tasks and six_shot and "six_idx" in entry:
+            if "fact_consistency" in tasks and "six_idx" in entry:
                 fact_result = aggregate(
                     dict(six_raws[entry["six_idx"]]),
                     weights=judge.weights,
-                    sources={name: "six_shot" for name in ELEMENTS},
+                    sources={name: "judge" for name in ELEMENTS},
                     candidate_id=f"{entry['id']}:{entry['arm']}",
                 )
                 signals["fact_consistency"] = fact_result.weighted_reward
                 signals["fact_consistency_min_raw"] = float(
                     min(fact_result.raw_scores.values())
                 )
-            elif "fact_consistency" in tasks and "cons_slice" in entry:
-                a, b = entry["cons_slice"]
-                raw = {name: v for name, v in zip(ELEMENTS, scores[a:b])}
-                src = {name: v for name, v in zip(ELEMENTS, sources[a:b])}
-                fact_result = aggregate(
-                    raw, weights=judge.weights, sources=src,
-                    candidate_id=f"{entry['id']}:{entry['arm']}",
-                )
-                signals["fact_consistency"] = fact_result.weighted_reward
-                # 事实硬门控要读的六要素最小原始分（与 reward_spec 的信号同名）
-                signals["fact_consistency_min_raw"] = float(
-                    min(fact_result.raw_scores.values())
-                )
-            if "element_coverage" in tasks and six_cov and "cov_idx" in entry:
-                present = list(entry["cov_present"])
-                cov_present = present
-                cov_raw = {
-                    name: entry["cov_pre"].get(
-                        name, cov_raws[entry["cov_idx"]].get(name, 2)
-                    )
-                    for name in present
-                }
-                coverage = aggregate_coverage(cov_raw, present, judge.coverage_weights)
-                signals["element_coverage"] = coverage
-            elif "element_coverage" in tasks and "cov_slice" in entry:
-                a, b = entry["cov_slice"]
-                cov_present = list(entry["cov_present"])
-                # 分项原始分：参考里没有的要素不参与（不在 dict 里）；参考有、
-                # 候选没写的要素预置 0；其余是模型判出来的 0~4。
-                cov_raw = dict(entry["cov_pre"])
-                for name, value in zip(entry["cov_names"], scores[a:b]):
-                    cov_raw[name] = value
-                coverage = aggregate_coverage(
-                    cov_raw, cov_present, judge.coverage_weights
-                )
-                signals["element_coverage"] = coverage
-            elif "element_coverage" in tasks and "cov_pre" in entry:
-                # 自评短路：候选就是人工摘要，覆盖率直接按预置的满分聚合（=1.0）
-                cov_present = list(entry["cov_present"])
-                cov_raw = dict(entry["cov_pre"])
+            if "element_coverage" in tasks:
+                cov_present = list(ELEMENTS)
+                if entry.get("cov_self"):
+                    # 自评短路：候选就是人工摘要 → 覆盖率满分
+                    cov_raw = {name: MAX_SCORE for name in ELEMENTS}
+                else:
+                    cov_raw = dict(cov_raws[entry["cov_idx"]])
                 coverage = aggregate_coverage(
                     cov_raw, cov_present, judge.coverage_weights
                 )
@@ -706,8 +581,8 @@ def score_chunk(
             "inp": inp_value,
             "inp_propositions": inp_detail.get("propositions", []),
             "inp_groups": inp_detail.get("groups", []),
-            # 覆盖率的分项：原始 0~4 / 归一化 0~1 / 参与计算（参考里真实存在）的要素。
-            # 参考里没有的要素不进这两个 dict（分子分母都不算）。
+            # 覆盖率的分项：原始 0~4 / 归一化 0~1。一次判定里六个要素都参与
+            # （参考摘要没写到的那一项，prompt 要求模型给 4）。
             "coverage_raw": dict(cov_raw),
             "coverage_scores": {
                 name: round(value / float(MAX_SCORE), 6)
@@ -716,12 +591,6 @@ def score_chunk(
             "coverage_present": cov_present,
             "error": error,
         }
-        if _DUMP_ELEMENTS:
-            row["elements"] = {
-                "document": entry["_doc_el"].to_dict(),
-                "reference": entry["_ref_el"].to_dict(),
-                "candidate": entry["_cand_el"].to_dict(),
-            }
         rows.append(row)
     return rows
 
@@ -731,18 +600,15 @@ def score_with_fallback(
     spec: RewardSpec,
     spec_ungated: RewardSpec,
     records: Sequence[Dict[str, Any]],
-    els_cache: Dict[str, SixElements],
     *,
     candidate_key: str,
     reference_key: str,
-    min_document_elements: int,
 ) -> List[Dict[str, Any]]:
     """整批失败就二分回退，一直到单条；保证不会因为一条坏记录丢掉一整批。"""
     try:
         return score_chunk(
-            judge, spec, spec_ungated, records, els_cache,
+            judge, spec, spec_ungated, records,
             candidate_key=candidate_key, reference_key=reference_key,
-            min_document_elements=min_document_elements,
         )
     except Exception as exc:  # noqa: BLE001
         if len(records) <= 1:
@@ -759,13 +625,11 @@ def score_with_fallback(
         mid = len(records) // 2
         logger.warning("整批 %d 条打分失败（%s），二分回退", len(records), exc)
         return score_with_fallback(
-            judge, spec, spec_ungated, records[:mid], els_cache,
+            judge, spec, spec_ungated, records[:mid],
             candidate_key=candidate_key, reference_key=reference_key,
-            min_document_elements=min_document_elements,
         ) + score_with_fallback(
-            judge, spec, spec_ungated, records[mid:], els_cache,
+            judge, spec, spec_ungated, records[mid:],
             candidate_key=candidate_key, reference_key=reference_key,
-            min_document_elements=min_document_elements,
         )
 
 
@@ -1361,30 +1225,14 @@ def write_run_config(
     judge_tasks: Sequence[str],
     model_name: str,
     max_input_tokens: int,
-    extract_max_new_tokens: int,
 ) -> Path:
     """在实验目录落一份 run_config.json —— 这次验证到底用了什么，一目了然。
 
-    每次实验一个文件夹，光看产出的数字分不清"换过哪一版 prompt / 哪个裁判 /
-    哪个抽取器"，所以把当次生效的配置固化下来。
+    每次实验一个文件夹，光看产出的数字分不清"换过哪一版 prompt / 哪个裁判"，
+    所以把当次生效的配置固化下来。
     """
     import datetime
 
-    prompt_versions: Dict[str, str] = {}
-    try:
-        from sfzy.judge.prompts import (
-            EXTRACT_PROMPT_VERSION,
-            EXTRACT_SUMMARY_PROMPT_VERSION,
-        )
-
-        prompt_versions = {
-            "document": EXTRACT_PROMPT_VERSION,
-            "summary": EXTRACT_SUMMARY_PROMPT_VERSION,
-        }
-    except Exception:  # noqa: BLE001
-        pass
-
-    extract_api = semantic.get("extract_api") or {}
     payload = {
         "run": args.run,
         "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
@@ -1397,24 +1245,12 @@ def write_run_config(
         "dtype": args.dtype,
         "tensor_parallel_size": args.tensor_parallel_size,
         "max_input_tokens": max_input_tokens,
-        "extract_max_new_tokens": extract_max_new_tokens,
-        "element_context": bool(semantic.get("element_context", False)),
-        "reference_context": bool(semantic.get("reference_context", False)),
-        "six_shot_fact": bool(semantic.get("six_shot_fact", False)),
-        "six_shot_coverage": bool(semantic.get("six_shot_coverage", False)),
-        "doc_fallback": bool(semantic.get("doc_fallback", True)),
-        "extract_model": args.extract_model,
-        "extract_api": {
-            "base_url": extract_api.get("base_url"),
-            "model": extract_api.get("model"),
-            "concurrency": extract_api.get("concurrency"),
-        } if extract_api else None,
         "judge_api": {
             "base_url": (semantic.get("judge_api") or {}).get("base_url"),
             "model": (semantic.get("judge_api") or {}).get("model"),
             "concurrency": (semantic.get("judge_api") or {}).get("concurrency"),
         } if semantic.get("judge_api") else None,
-        "prompt_versions": prompt_versions,
+        "prompt_versions": _prompt_fingerprint(),
         "reward": {
             "terms": [t.name for t in spec.enabled_terms],
             "normalized_weights": spec.normalized_weights(),
@@ -1438,7 +1274,6 @@ def run_input(
     judge: Any,
     spec: RewardSpec,
     spec_ungated: RewardSpec,
-    min_document_elements: int,
 ) -> Dict[str, Any]:
     out_path = resolve(args.out_dir) / f"{path.stem}.reward.jsonl"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1469,17 +1304,15 @@ def run_input(
         path.name, len(records), len(done), len(todo),
     )
 
-    els_cache: Dict[str, SixElements] = {}
     started = time.time()
     count = 0
     with open(out_path, "a", encoding="utf-8") as f:
         for start in range(0, len(todo), args.chunk_size):
             chunk = todo[start:start + args.chunk_size]
             rows = score_with_fallback(
-                judge, spec, spec_ungated, chunk, els_cache,
+                judge, spec, spec_ungated, chunk,
                 candidate_key=args.candidate_key,
                 reference_key=args.reference_key,
-                min_document_elements=min_document_elements,
             )
             for row in rows:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -1498,20 +1331,9 @@ def run_input(
     stats["input"] = str(path)
     stats["output"] = str(out_path)
     stats["run"] = getattr(args, "run", None)
-    stats["extract_model"] = getattr(args, "extract_model", None)
-    stats["extract_api_model"] = getattr(args, "extract_api_model", None)
     stats["judge_api_model"] = getattr(args, "judge_api_model", None)
     stats["max_input_tokens"] = args.max_input_tokens
-    try:  # 记录抽取 prompt 版本，换过 prompt 的结果才不会混在一起比
-        from sfzy.judge.prompts import (
-            EXTRACT_PROMPT_VERSION,
-            EXTRACT_SUMMARY_PROMPT_VERSION,
-        )
-
-        stats["extract_prompt_version"] = EXTRACT_PROMPT_VERSION
-        stats["extract_summary_prompt_version"] = EXTRACT_SUMMARY_PROMPT_VERSION
-    except Exception:  # noqa: BLE001
-        pass
+    stats["prompt_versions"] = _prompt_fingerprint()
     summary_path = Path(str(out_path.with_suffix("")) + ".summary.json")
     summary_path.write_text(
         json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -1589,7 +1411,7 @@ def main() -> None:
     ap.add_argument("--reference-key", default="reference", help="人工摘要字段名")
     ap.add_argument("--limit", type=int, default=None)
     ap.add_argument("--ids", nargs="+", default=None,
-                    help="只跑这些 id（调试单条用，配合 --dump-elements）")
+                    help="只跑这些 id（调试单条用，会自动打印 prompt）")
     ap.add_argument("--index", nargs="+", type=int, default=None,
                     help="只跑输入文件里的这些行号（从 1 开始；不知道 id 时用）")
     ap.add_argument("--print-prompts", action="store_true",
@@ -1599,26 +1421,16 @@ def main() -> None:
                     help="默认跳过输出里已有的 id（可断点续跑）")
     ap.add_argument("--chunk-size", type=int, default=16,
                     help="一批几条记录。显存紧就调小，吞吐优先就调大")
-    ap.add_argument("--dump-elements", action="store_true",
-                    help="逐条结果里带上抽取出的六要素（原文/人工/候选），"
-                         "用来定位某个要素为什么判 0；配合 --limit 跑一小批")
 
     # ---- 裁判模型 / vLLM ----
     ap.add_argument("--model", default=None,
                     help="裁判模型目录或 HF 名，默认取 semantic.model")
     ap.add_argument("--tokenizer", default=None,
                     help="单独指定 tokenizer（AWQ 目录缺文件时用）")
-    ap.add_argument("--extract-model", default=None,
-                    help="可选的独立抽取模型（比裁判更强/更大）。不给就共用裁判模型。"
-                         "两份权重同时在显存里，单卡放不下就别用")
-    ap.add_argument("--check-extract-api", action="store_true",
-                    help="只验证 semantic.extract_api 的连通性/鉴权：发一次最小请求就退出"
+    ap.add_argument("--check-api", "--check-extract-api", dest="check_api",
+                    action="store_true",
+                    help="只验证 semantic.judge_api 的连通性/鉴权：发一次最小请求就退出"
                          "（不需要 GPU，用来排查 401）")
-    ap.add_argument("--extract-tokenizer", default=None)
-    ap.add_argument("--extract-quantization", default=None,
-                    help="抽取模型的量化方式，默认跟随 --quantization")
-    ap.add_argument("--extract-dtype", default=None,
-                    help="抽取模型的精度，默认跟随 --dtype")
     ap.add_argument("--quantization", default="none",
                     help="none | bitsandbytes | awq | gptq。T4 上 7B 装不下 fp16，"
                          "必须显式指定一个 4-bit 方案（bitsandbytes 可对现有 fp16 "
@@ -1632,20 +1444,18 @@ def main() -> None:
     ap.add_argument("--gpu-memory-utilization", type=float, default=0.90)
     ap.add_argument("--swap-space", type=int, default=4)
     ap.add_argument("--max-input-tokens", type=int, default=None,
-                    help="抽取/判定 prompt 的输入预算，默认取 semantic.max_input_tokens"
+                    help="判定 prompt 的输入预算，默认取 semantic.max_input_tokens"
                          "（再默认 8192）。长判决书（val 最长约 1.2 万字）要调大；"
                          "超预算的输入按头+尾截断，system 不丢")
-    ap.add_argument("--extract-max-new-tokens", type=int, default=None,
-                    help="六要素抽取的生成预算，默认取 semantic.extract_max_new_tokens")
+    ap.add_argument("--six-max-new-tokens", type=int, default=None,
+                    help="一次判定的生成预算（六要素 JSON / INP 命题列表），"
+                         "默认 512")
     ap.add_argument("--max-model-len", type=int, default=None)
     ap.add_argument("--logprobs", type=int, default=50,
                     help="受限解码时取多少个 logprob，够覆盖 0~4 即可")
     ap.add_argument("--enforce-eager", action="store_true")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
-
-    global _DUMP_ELEMENTS
-    _DUMP_ELEMENTS = bool(args.dump_elements)
 
     # 输出目录：--out-dir 优先；否则按实验目录约定 <runs-dir>/<--run>/；
     # 两者都没给才退回 data/judge。
@@ -1661,29 +1471,22 @@ def main() -> None:
     if args.debug_prompts:
         logger.info("已开启 prompt 打印：每次判定的 system+user 都会打到控制台")
 
-    if args.check_extract_api:
+    if args.check_api:
         # 只验证 API 的 base_url / 模型 / 鉴权，不发任何 GPU 相关的东西。
         # 放在最前面：它既不需要 --input 也不需要 --merge。
         cfg = load_config(resolve(args.config))
         semantic = cfg.get("semantic") or {}
         from sfzy.judge.api_runtime import build_api_runtime
 
-        blocks = {
-            "extract_api": semantic.get("extract_api"),
-            "judge_api": semantic.get("judge_api"),
-        }
-        blocks = {name: block for name, block in blocks.items() if block}
-        if not blocks:
-            raise SystemExit(
-                "配置里既没有 semantic.extract_api 也没有 semantic.judge_api，无法检查"
-            )
-        for name, block in blocks.items():
-            rt = build_api_runtime(dict(block))
-            reply = rt.ping()
-            print(
-                f"[{name}] OK  base_url={rt.base_url}  model={rt.model}  "
-                f"reply={reply!r}"
-            )
+        judge_api = semantic.get("judge_api")
+        if not judge_api:
+            raise SystemExit("配置里没有 semantic.judge_api，无法检查")
+        rt = build_api_runtime(dict(judge_api))
+        reply = rt.ping()
+        print(
+            f"[judge_api] OK  base_url={rt.base_url}  model={rt.model}  "
+            f"reply={reply!r}"
+        )
         return
 
     if args.merge:
@@ -1716,17 +1519,18 @@ def main() -> None:
             model_name = str(local)
     trust_remote_code = bool(semantic.get("trust_remote_code", False))
 
-    extract_max_new_tokens = int(
-        args.extract_max_new_tokens or semantic.get("extract_max_new_tokens", 1024)
+    six_max_new_tokens = int(
+        args.six_max_new_tokens
+        or semantic.get("six_max_new_tokens")
+        or semantic.get("extract_max_new_tokens", 512)
     )
     # 输入预算：命令行优先，否则读配置（默认 8192）。长判决书（val 最长约
     # 1.2 万字）需要更大预算，否则头+尾截断会砍掉中间的事实。
     if args.max_input_tokens is None:
         args.max_input_tokens = int(semantic.get("max_input_tokens", 8192))
     max_model_len = int(
-        args.max_model_len or (args.max_input_tokens + 2 * extract_max_new_tokens)
+        args.max_model_len or (args.max_input_tokens + 2 * six_max_new_tokens)
     )
-    min_document_elements = int(semantic.get("min_document_elements", 2))
 
     # vLLM 支持 4-bit（AWQ / GPTQ / bitsandbytes），但**不读** transformers 风格
     # 的 semantic.load_in_4bit —— 量化方案必须在加载时用 --quantization 指定。
@@ -1764,53 +1568,13 @@ def main() -> None:
             spec.fact_element_min_raw,
         )
 
-    # 可选的独立抽取器：抽取是最容易出错的一步（日期挪用/改写），换更强的模型
-    # 通常比换裁判更值。代价是显存里要多放一份权重 —— 单张 T4 上两个 7B 装不下，
-    # 只有显存够（例如 A100/4090 或小抽取器）才用得上。
-    extract_runtime = None
-    extract_model_name = args.extract_model
-    if extract_model_name:
-        local = resolve(extract_model_name)
-        if is_local_dir(local):
-            extract_model_name = str(local)
-        eargs = copy.copy(args)
-        eargs.tokenizer = args.extract_tokenizer
-        if args.extract_quantization:
-            eargs.quantization = args.extract_quantization
-        if args.extract_dtype:
-            eargs.dtype = args.extract_dtype
-        logger.warning(
-            "额外加载抽取模型 %s：两份权重会同时占用显存。单张 T4 放不下两个 7B，"
-            "请确认显存预算；不够就只用 v2 抽取 prompt、不传 --extract-model。",
-            extract_model_name,
-        )
-        extract_runtime, _ = build_vllm(
-            eargs, extract_model_name,
-            bool(semantic.get("extract_trust_remote_code", trust_remote_code)),
-            max_model_len,
-        )
-    elif semantic.get("extract_api"):
-        # 方案 A：抽取走 API，判定仍用本地 vLLM。
-        from sfzy.judge.api_runtime import build_api_runtime
-
-        extract_api = dict(semantic["extract_api"])
-        extract_runtime = build_api_runtime(extract_api)
-        args.extract_api_model = extract_api.get("model")
-        logger.info(
-            "抽取走 API：base_url=%s model=%s concurrency=%s",
-            extract_api.get("base_url"), extract_api.get("model"),
-            extract_api.get("concurrency", 16),
-        )
-
     # 判定 runtime：配了 judge_api 就走 API（不加载本地裁判，也就不吃显存）；
-    # 否则本地 vLLM。抽取没单独配就复用判定这个 runtime。
+    # 否则本地 vLLM。
     if judge_api:
         from sfzy.judge.api_runtime import build_api_runtime
 
         judge_api_cfg = dict(judge_api)
         runtime = build_api_runtime(judge_api_cfg)
-        if extract_runtime is None:
-            extract_runtime = runtime
         args.judge_api_model = judge_api_cfg.get("model")
         logger.info(
             "判定走 API：base_url=%s model=%s concurrency=%s（不加载本地裁判）",
@@ -1825,18 +1589,11 @@ def main() -> None:
     options = spec.judge_term_options()
     judge = FactConsistencyJudge(
         runtime=runtime,
-        extract_runtime=extract_runtime,
         weights=(options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(options.get("element_coverage") or {}).get("element_weights"),
         tasks=judge_tasks,
         max_input_tokens=args.max_input_tokens,
-        extract_max_new_tokens=extract_max_new_tokens,
-        min_document_elements=min_document_elements,
-        doc_fallback=bool(semantic.get("doc_fallback", True)),
-        use_element_context=bool(semantic.get("element_context", False)),
-        use_reference_context=bool(semantic.get("reference_context", False)),
-        six_shot_fact=bool(semantic.get("six_shot_fact", False)),
-        six_shot_coverage=bool(semantic.get("six_shot_coverage", False)),
+        six_max_new_tokens=six_max_new_tokens,
         debug_prompts=bool(getattr(args, "debug_prompts", False)),
     )
 
@@ -1845,7 +1602,6 @@ def main() -> None:
         args=args, config_path=resolve(args.config), spec=spec, semantic=semantic,
         judge_tasks=judge_tasks, model_name=model_name,
         max_input_tokens=args.max_input_tokens,
-        extract_max_new_tokens=extract_max_new_tokens,
     )
     logger.info("本次实验配置已存档：%s", run_config_path)
 
@@ -1855,7 +1611,7 @@ def main() -> None:
         if not path.exists():
             raise SystemExit(f"输入文件不存在：{path}")
         all_stats.append(
-            run_input(args, path, judge, spec, spec_ungated, min_document_elements)
+            run_input(args, path, judge, spec, spec_ungated)
         )
 
     if len(all_stats) > 1:

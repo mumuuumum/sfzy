@@ -52,7 +52,6 @@ from sfzy.judge import (                                   # noqa: E402
     ELEMENTS,
     ELEMENT_ZH,
     FactConsistencyJudge,
-    SixElements,
 )
 from sfzy.judge.runtime import TorchRuntime                # noqa: E402
 
@@ -170,55 +169,28 @@ def load_documents() -> dict:
             for l in open(path, encoding="utf-8") if l.strip()}
 
 
-def print_elements(title: str, els: SixElements) -> None:
-    print(f"\n{title}")
-    for name in ELEMENTS:
-        value = els.get(name).strip()
-        value = value if value else "（空）"
-        print(f"  {ELEMENT_ZH[name]:<8}{value[:120]}{'…' if len(value) > 120 else ''}")
-
-
 def run_single(judge: FactConsistencyJudge, document: str, candidate: str) -> None:
-    """需求第十三节要打印的五项，一次看全。"""
-    doc_el = judge.document_elements(document)
-    cand_el = judge.extract_six_elements(candidate)
-    print_elements("【1】document 六要素", doc_el)
-    print_elements("【2】candidate 六要素", cand_el)
+    """需求第十三节要打印的五项，一次看全。
 
-    # 必须和 judge_summary 走同一套组 pair 规则（含"要素抽空时用整篇原文兜底"），
-    # 否则演示看到的和生产跑的不是一个东西
-    pairs = judge.build_pairs(doc_el, cand_el, document)
-    scores, sources, pmaxs = judge.judge_elements_with_confidence(pairs)
+    现在是一次性判定：把 (原文全文, 摘要全文) 一次喂给裁判，直接拿六个分。
+    """
     from sfzy.judge.schema import aggregate
+
+    raw = judge.judge_fact_six_batch([(document, candidate)])[0]
     result = aggregate(
-        {n: s for n, s in zip(ELEMENTS, scores)},
+        dict(raw),
         weights=judge.weights,
-        sources={n: s for n, s in zip(ELEMENTS, sources)},
+        sources={name: "judge" for name in ELEMENTS},
     )
 
-    # 逐要素对照：这一步才是"对比二者获得分数"的正文。
-    # 只打印分数看不出模型到底在比什么，所以原文要素、摘要要素、判定分并排给。
-    print("\n【3】逐要素对照与判定")
-    for name, s, pm, (_, doc_sent, cand_sent) in zip(ELEMENTS, scores, pmaxs, pairs):
-        doc_v = doc_el.get(name).strip() or "（空）"
-        cand_v = cand_el.get(name).strip() or "（空）"
-        src = sources[ELEMENTS.index(name)]
-        # 兜底是在 build_pairs 里做的，库层的 sources 只区分"调没调模型"，
-        # 所以这里按"抽出来的要素是空、但实际送进去的是整篇文书"来识别
-        fallback = (not doc_el.get(name).strip()) and doc_sent == document and bool(document)
-        tag = "  ← 空字段规则，未调用模型" if src == "empty_rule" else (
-            "  ← 要素抽空，用整篇原文兜底判定" if fallback else "")
-        conf = f"  pmax={pm:.2f}" if pm is not None else ""
-        print(f"\n  ▸ {ELEMENT_ZH[name]}（{name}）  判定 {s}/4{conf}{tag}")
-        print(f"      原文要素：{doc_v[:150]}{'…' if len(doc_v) > 150 else ''}")
-        print(f"      摘要要素：{cand_v[:150]}{'…' if len(cand_v) > 150 else ''}")
-        if fallback:
-            print(f"      实际送判：原文要素位置放了整篇文书（{len(doc_sent)} 字）")
+    print("\n【1】六要素判定（一次判定 (原文, 摘要) → 六个分）")
+    for name in ELEMENTS:
+        print(f"  {ELEMENT_ZH[name]:<8}判定 {raw[name]}/4")
 
-    print("\n【4】六个归一化评分（/4）")
+    print("\n【2】六个归一化评分（/4）")
     for name in ELEMENTS:
         print(f"  {ELEMENT_ZH[name]:<8}{result.scores[name]:.2f}")
-    print(f"\n【5】weighted fact_reward = {result.weighted_reward:.4f}")
+    print(f"\n【3】weighted fact_reward = {result.weighted_reward:.4f}")
     print(f"     min_element_score     = {result.min_element_score:.4f}"
           "   （不含案由）")
     print(f"     judgment_result_score = {result.judgment_result_score:.4f}")
@@ -232,15 +204,17 @@ def run_cases(judge: FactConsistencyJudge, cases: list, docs: dict, verbose: boo
     rows = []
     for doc_id, group in by_doc.items():
         document = docs[doc_id]
-        judge.clear_cache()                       # 每个文档单独提取一次
-        doc_el = judge.document_elements(document)
+        judge.clear_cache()
         results = judge.judge_candidates(
             document, [c["candidate"] for c in group],
             candidate_ids=[c["id"] for c in group],
         )
-        if verbose:
-            print_elements(f"\n【{doc_id[:8]}】document 六要素", doc_el)
         for c, r in zip(group, results):
+            if verbose:
+                scores = " ".join(
+                    f"{ELEMENT_ZH[n]}={r.raw_scores.get(n)}" for n in ELEMENTS
+                )
+                print(f"  【{c['id']}】{scores}")
             rows.append((doc_id, c, r))
 
     print("\n" + "=" * 92)
@@ -266,10 +240,6 @@ def run_cases(judge: FactConsistencyJudge, cases: list, docs: dict, verbose: boo
     core = per_case["E"]
     c1 = st.mean(good) > st.mean(bad)
     c2 = st.mean(bad) > st.mean(core)
-    c3 = all(
-        st.mean(per_case[a] or [0]) > st.mean(per_case[e] or [0])
-        for a in ("A",) for e in ("E",)
-    )
     print(f"\n  判据 1  mean(A,B) > mean(C,D,F,G)：{st.mean(good):.4f} vs {st.mean(bad):.4f}"
           f"   {'✓' if c1 else '✗'}")
     print(f"  判据 2  mean(C,D,F,G) > mean(E)：{st.mean(bad):.4f} vs {st.mean(core):.4f}"
@@ -311,7 +281,8 @@ def main() -> None:
     ap.add_argument("--filter", default=None,
                     help="只跑案例 id 或文档 id 含该子串的案例。"
                          "本地用小模型验接线时，跑一个文档的 7 条就够")
-    ap.add_argument("--verbose", action="store_true", help="打印每个文档的六要素")
+    ap.add_argument("--verbose", action="store_true",
+                    help="打印每条候选的六要素分")
     ap.add_argument("--stats", action="store_true", help="打印 0-4 各档比例")
     args = ap.parse_args()
 

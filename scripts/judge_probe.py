@@ -12,8 +12,8 @@
 常量输出 = 没有判别力 = 奖励里加进去只会是噪声。这种事必须**在写进奖励之前**
 用几分钟测出来，而不是跑完 13 小时 GRPO 之后。
 
-探针是**要素级**的（直接给"原文要素 / 摘要要素"），绕开六要素提取器 ——
-这样测的纯粹是"判定能力"，不受提取质量干扰。提取质量由 judge_test.py 测。
+探针是**要素级**的（给出"原文要素 / 摘要要素"，只读该要素的判定分），
+测的纯粹是"判定能力"；案例级排序由 judge_test.py 测。
 
 ============================ 判据 ============================
   * 好的四条（完全相同 / 只省略 / 合理概括 / 换词改写）**都要 ≥ 3**
@@ -155,8 +155,11 @@ def main() -> None:
     judge = FactConsistencyJudge(runtime=runtime)
 
     probes = [json.loads(l) for l in open(resolve(args.probes), encoding="utf-8") if l.strip()]
-    pairs = [(p["element"], p["doc"], p["cand"]) for p in probes]
-    scores, sources, pmaxs = judge.judge_elements_with_confidence(pairs)
+    # 一次性判定：每个探针把 (原文, 摘要) 喂给裁判拿六个分，只读它要测的那个要素。
+    six = judge.judge_fact_six_batch([(p["doc"], p["cand"]) for p in probes])
+    scores = [row.get(p["element"], 2) for row, p in zip(six, probes)]
+    sources = [json.dumps(row, ensure_ascii=False) for row in six]
+    pmaxs = [None] * len(probes)
 
     # ================= 1. 汇总表格打印 =================
     print(f"\n{'探针':<14}{'期望':<8}{'得分':>5}{'pmax':>8}   说明")
@@ -202,7 +205,7 @@ def main() -> None:
     print(f"\n结论：{'✓ 可以当裁判' if verdict else '✗ 不能当裁判，判别力不足'}")
     if not verdict:
         print("  表现是常量输出的话，问题在模型容量，不在提示词 —— 换更大的模型。")
-    print("\n推理统计：", runtime.stats, " 提取统计：", judge.stats)
+    print("\n推理统计：", runtime.stats)
 
 
 if __name__ == "__main__":

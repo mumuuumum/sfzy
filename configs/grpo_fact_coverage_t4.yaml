@@ -1,9 +1,9 @@
 # ============================================================================
 # 事实一致性 + 关键要素覆盖率 —— 2× T4 15GB
 #
-# 和 grpo_fact_only_t4 只差奖励那一段（多开 element_coverage）。算力上只多花
-# 判定那一段：原文 / 人工摘要 / 候选三种六要素各只抽一次（人工摘要按 sha1
-# 缓存），两套判定 prompt 合成一次批量前向。
+# 和 grpo_fact_only_t4 只差奖励那一段（多开 element_coverage）。判定不再抽取
+# 六要素：事实一致性喂（原文, 摘要）、覆盖率喂（人工摘要, 候选摘要）、
+# 信息必要性喂（原文, 人工摘要, 候选摘要），各路各走一次批量前向。
 #
 # 这份配置**自包含**，不继承任何其它 yaml。
 #
@@ -97,7 +97,7 @@ rl:
           legal_basis:        0.15
           judgment_result:    0.20
       # ---- INP（信息必要性精确率）----
-      # prompt 常量 INP_JUDGE_PROMPT 目前是**空串**，由使用者填写后再打开。
+      # prompt 常量 INP_JUDGE_PROMPT 已由使用者填写，打开即生效。
       information_necessity_precision:
         enabled: false
         weight: 1            # 与 quality_fbeta 同时开启时，这个权重会失效
@@ -120,40 +120,15 @@ semantic:
   dtype: float16
   bnb_4bit_compute_dtype: float16
   load_in_4bit: true
-  # 两个 judge 项的判定会合并成一次批量前向，batch 上限仍然按"6 要素 × G 候选"估
+  # 一次判定喂的是整篇原文 + 摘要（不再抽取六要素），batch 上限按 G 候选估
   max_batch_size: 4
-  # 抽取/判定 prompt 的输入预算。val 原文最长约 1.2 万字，8192 token 仍会把
-  # 长文书的抽取 prompt 截断（头+尾保住了，中间的事实没了）→ 抽取残缺、判 0。
-  # 提到 16384 覆盖 val 全部；超预算的输入仍按头+尾截断，system 不丢。
-  # 注意 vLLM 的 max_model_len = max_input_tokens + 2*extract_max_new_tokens，
-  # 16384+3072=19456 < Qwen2.5-7B 的 32768。T4 上 KV 每序列约 1GB，够用。
+  # 判定 prompt 的输入预算。val 原文最长约 1.2 万字，超预算的原文按头+尾截断，
+  # system 不丢。vLLM 的 max_model_len = max_input_tokens + 2*six_max_new_tokens。
   max_input_tokens: 11288
-  # v3 抽取 prompt 要求逐字保留、分条列举，输出更长；1024 容易把 JSON 截断
-  extract_max_new_tokens: 512
-  min_document_elements: 2
-  doc_fallback: true
-  # 逐要素判定时附上原文/摘要各自的完整六要素，高亮本次对比项，其余五项作
-  # 辅助。用来弥补抽取的边界误差（同一件事可能一边抽进 court_facts、另一边
-  # 抽进 legal_basis），避免把"分类不同"误判成"编造"。
-  element_context: true
-  # 事实一致性判定时再附上"人工摘要"作第二辅助参照：候选与人工一致/能被人工支持
-  # → 视为可靠；与人工矛盾 → 按事实错误判 0。人工摘要里没有该项时本条不适用。
-  # 注意：离线工具的 human 臂是"人工摘要自评"，build_pairs 会自动忽略这条辅助。
-  reference_context: true
-  # 事实一致性改成"一次性评分"：输入 (原文全文, 摘要六要素) → 输出六要素 0~4 分。
-  # 一次调用/候选（原来逐要素 6 次），而且不再依赖原文抽取 → 少一大类假 0。
-  six_shot_fact: true
-  # 覆盖率也改成一次性：(人工摘要, 候选摘要) → 六要素覆盖分，一次调用/候选。
-  six_shot_coverage: true
-  # 方案 A：抽取走 API（换更强模型、不占本地显存），判定仍用本地裁判。
-  # 取消注释并填好 base_url / model；密钥只从环境变量读，不写进配置。
-  extract_api:
-    base_url: https://api.deepseek.com/v1   # 或自建 vLLM 的 OpenAI 端口
-    api_key_env: SFZY_JUDGE_API_KEY
-    model: deepseek-chat
-    concurrency: 16
-    max_retries: 3
-    timeout_s: 60
+  # 一次判定的生成预算（六要素 JSON / INP 命题列表）
+  six_max_new_tokens: 512
+  # 判定走 API（不加载本地裁判，也就不吃显存）。
+  # 密钥只从环境变量读，不写进配置。
   judge_api:
     base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
     api_key_env: SFZY_JUDGE_API_KEY

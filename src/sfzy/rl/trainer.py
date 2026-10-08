@@ -581,8 +581,7 @@ class GRPOTrainer:
             )
 
         # 裁判整组失败时光看比例没法排查 —— 把最后一条异常打出来。
-        # 实测最常见的两种：某篇文书六要素抽不到 2 项（ExtractionFailure），
-        # 或者裁判侧那一批前向 OOM。
+        # 实测最常见的两种：裁判 API 超时/报错，或者裁判侧那一批前向 OOM。
         errors = getattr(self.scorer, "last_errors", None)
         if m.get("judge_missing", 0.0) > 0 and errors:
             logger.warning(

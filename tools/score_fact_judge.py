@@ -8,12 +8,9 @@
 这个脚本补上那一列：拿同一批 val 记录、同一套 Judge、同一条
 `judge_candidates` 路径，分别给两个模型的输出打分。
 
-============================ 一次传两个文件有意想不到的好处 ============================
-同一篇文书在两条臂里是**同一份 source**，而文档六要素的缓存是按
-source 的 sha1 命中的。两个文件一起传：
-
-  * 文档要素只提取一次，Judge 的生成开销直接省掉一半；
-  * 两条臂是在**同一份要素**上判的，比较更干净。
+============================ 一次传两个文件的好处 ============================
+同一篇文书在两个文件里是**同一份 source**，一起传可以保证两条臂用同一份
+（判定仍然逐条走 `judge_candidates`，只是把两次实验放在同一趟里跑）。
 
 ============================ 用法 ============================
     python tools/score_fact_judge.py \
@@ -27,7 +24,7 @@ source 的 sha1 命中的。两个文件一起传：
     {"id": "...", "fact_reward": 0.9375, "min_element_score": 0.75,
      "judgment_result_score": 1.0, "scores": {...}, "raw_scores": {...}}
 
-失败的行（比如那篇文书六要素抽不出来）记 `"error"` 字段，**不写假分数** ——
+失败的行（比如裁判 API 报错）记 `"error"` 字段，**不写假分数** ——
 把失败当 0 分会让统计系统性偏低。
 """
 
@@ -62,8 +59,8 @@ def score_records(
 ) -> List[Tuple[str, Optional[JudgeResult], Optional[str]]]:
     """逐条打分，返回 [(id, JudgeResult|None, error|None)]。
 
-    一条失败**不中断整批**：val 集里总有几篇文书让六要素提取器抛
-    `ExtractionFailure`（要素少于 2 项），为此丢掉前面几小时的打分不值。
+    一条失败**不中断整批**：val 集里总有几篇文书让裁判调用失败（API 超时等），
+    为此丢掉前面几小时的打分不值。
     """
     out: List[Tuple[str, Optional[JudgeResult], Optional[str]]] = []
     for rec in records:
@@ -190,9 +187,6 @@ def build_judge(args: argparse.Namespace) -> FactConsistencyJudge:
         load_in_4bit=args.load_in_4bit,
         trust_remote_code=args.trust_remote_code,
         max_batch_size=args.max_batch_size,
-        extract_max_new_tokens=args.extract_max_new_tokens,
-        min_document_elements=args.min_document_elements,
-        doc_fallback=not args.no_doc_fallback,
     )
 
 
@@ -217,10 +211,6 @@ def main() -> None:
     ap.add_argument("--load-in-4bit", action="store_true", help="T4 / 小显存时用")
     ap.add_argument("--trust-remote-code", action="store_true", default=True)
     ap.add_argument("--max-batch-size", type=int, default=8)
-    ap.add_argument("--extract-max-new-tokens", type=int, default=1024)
-    ap.add_argument("--min-document-elements", type=int, default=2)
-    ap.add_argument("--no-doc-fallback", action="store_true",
-                    help="关掉『要素抽空时拿整篇原文兜底』（默认开）")
     args = ap.parse_args()
 
     inputs = [resolve(p) for p in args.input]

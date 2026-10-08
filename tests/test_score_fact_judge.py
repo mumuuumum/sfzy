@@ -84,7 +84,7 @@ def test_单条失败只记_error_不写假分数():
 def test_失败条目不参与均值():
     """把失败当 0 分会让"模型变差了"这种假结论直接冒出来。"""
     good = TOOL.result_to_record("a", aggregate({e: MAX_SCORE for e in ELEMENTS}), None)
-    bad = TOOL.result_to_record("b", None, "ExtractionFailure: 只抽到 1 项")
+    bad = TOOL.result_to_record("b", None, "APIError: 裁判调用失败")
     stats = TOOL.summarize([good, bad])
     assert stats["n"] == 1.0 and stats["n_failed"] == 1.0
     assert stats["mean_fact_reward"] == pytest.approx(1.0)      # 不是 0.5
