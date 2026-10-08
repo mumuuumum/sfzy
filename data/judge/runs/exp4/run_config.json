@@ -1,0 +1,85 @@
+{
+  "run": "exp4",
+  "created_at": "2026-10-07T20:33:21",
+  "config": "/home/yukino/projects/sfzy/configs/grpo_fact_coverage_t4.yaml",
+  "inputs": [
+    "/home/yukino/projects/sfzy/data/triples/sft_val_shard1of2.jsonl"
+  ],
+  "judge_model": "Qwen/Qwen2.5-7B-Instruct",
+  "judge_tasks": [
+    "element_coverage",
+    "fact_consistency"
+  ],
+  "quantization": "none",
+  "load_format": "auto",
+  "dtype": "float16",
+  "tensor_parallel_size": 1,
+  "max_input_tokens": 11288,
+  "extract_max_new_tokens": 512,
+  "element_context": true,
+  "reference_context": true,
+  "six_shot_fact": true,
+  "six_shot_coverage": true,
+  "doc_fallback": true,
+  "extract_model": null,
+  "extract_api": {
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "concurrency": 16
+  },
+  "judge_api": {
+    "base_url": "https://api.deepseek.com/v1",
+    "model": "deepseek-chat",
+    "concurrency": 16
+  },
+  "prompt_versions": {
+    "document": "v4-verbatim-procedure-reasoning",
+    "summary": "s1-summary"
+  },
+  "reward": {
+    "terms": [
+      "fact_consistency",
+      "element_coverage"
+    ],
+    "normalized_weights": {
+      "fact_consistency": 0.5,
+      "element_coverage": 0.5
+    },
+    "element_weights": {
+      "fact_consistency": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.2,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.25,
+        "legal_basis": 0.15,
+        "judgment_result": 0.2
+      },
+      "element_coverage": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.2,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.25,
+        "legal_basis": 0.15,
+        "judgment_result": 0.2
+      }
+    },
+    "gate": {
+      "enabled": true,
+      "min_chars": 60,
+      "length_ratio_range": [
+        0.5,
+        1.5
+      ],
+      "forbidden_prefixes": [
+        "以下是",
+        "摘要：",
+        "摘要:",
+        "本摘要",
+        "这是"
+      ],
+      "require_result_marker": true,
+      "fact_consistency_min_raw": 1
+    },
+    "rouge_mode": "jieba"
+  }
+}

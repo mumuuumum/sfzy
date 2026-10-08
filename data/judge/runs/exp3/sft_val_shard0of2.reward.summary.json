@@ -1,0 +1,281 @@
+{
+  "n_records": 670,
+  "n_paired": 670,
+  "candidate": {
+    "n": 670,
+    "n_ok": 670,
+    "mean_reward": 0.7990485074626865,
+    "mean_reward_ungated": 0.9033022388059702,
+    "gate_rate": 0.12238805970149254,
+    "gate_reasons": {
+      "length_too_long": 51,
+      "fact_element_raw<1": 30,
+      "no_result_marker": 1
+    },
+    "mean_fact_consistency": 0.9521828358208955,
+    "mean_element_coverage": 0.8544216417910447,
+    "mean_rouge_l": 0.5900663671641792,
+    "mean_rouge_overall": 0.5633444268656717,
+    "fact_raw_zero": {
+      "n": 670,
+      "per_element_zero": {
+        "case_type": {
+          "count": 5,
+          "rate": 0.007462686567164179
+        },
+        "plaintiff_claims": {
+          "count": 6,
+          "rate": 0.008955223880597015
+        },
+        "defendant_defenses": {
+          "count": 9,
+          "rate": 0.013432835820895522
+        },
+        "court_facts": {
+          "count": 16,
+          "rate": 0.023880597014925373
+        },
+        "legal_basis": {
+          "count": 0,
+          "rate": 0.0
+        },
+        "judgment_result": {
+          "count": 6,
+          "rate": 0.008955223880597015
+        }
+      },
+      "any_zero": {
+        "count": 34,
+        "rate": 0.050746268656716415
+      },
+      "zero_count_distribution": {
+        "0": 636,
+        "1": 28,
+        "2": 4,
+        "3": 2
+      }
+    }
+  },
+  "human": {
+    "n": 670,
+    "n_ok": 670,
+    "mean_reward": 0.9376772388059701,
+    "mean_reward_ungated": 0.9746361940298508,
+    "gate_rate": 0.04477611940298507,
+    "gate_reasons": {
+      "fact_element_raw<1": 29,
+      "no_result_marker": 1
+    },
+    "mean_fact_consistency": 0.9492723880597016,
+    "mean_element_coverage": 1.0,
+    "mean_rouge_l": 1.0,
+    "mean_rouge_overall": 1.0,
+    "fact_raw_zero": {
+      "n": 670,
+      "per_element_zero": {
+        "case_type": {
+          "count": 3,
+          "rate": 0.004477611940298508
+        },
+        "plaintiff_claims": {
+          "count": 4,
+          "rate": 0.005970149253731343
+        },
+        "defendant_defenses": {
+          "count": 10,
+          "rate": 0.014925373134328358
+        },
+        "court_facts": {
+          "count": 16,
+          "rate": 0.023880597014925373
+        },
+        "legal_basis": {
+          "count": 1,
+          "rate": 0.0014925373134328358
+        },
+        "judgment_result": {
+          "count": 9,
+          "rate": 0.013432835820895522
+        }
+      },
+      "any_zero": {
+        "count": 29,
+        "rate": 0.04328358208955224
+      },
+      "zero_count_distribution": {
+        "0": 641,
+        "1": 20,
+        "2": 6,
+        "3": 1,
+        "4": 2
+      }
+    }
+  },
+  "delta_reward(human-candidate)": 0.13862873134328357,
+  "human_win": 544,
+  "tie": 56,
+  "human_lose": 70,
+  "human_win_rate": 0.8119402985074626,
+  "verdict": "✓ 两条结论都成立",
+  "conclusions": {
+    "candidate_reward_lt_human_reward": {
+      "n": 670,
+      "mean_delta": 0.13862873134328357,
+      "median_delta": 0.06874999999999998,
+      "sd_delta": 0.3537422015480852,
+      "win": 544,
+      "tie": 56,
+      "lose": 70,
+      "win_rate": 0.8119402985074626,
+      "t_stat": 10.143872358838932,
+      "p_value": 3.52829594412451e-24,
+      "sign_test_p": 6.99844467844009e-92,
+      "pass": true,
+      "verdict": "✓ 成立：候选摘要奖励显著低于人工摘要"
+    },
+    "reward_rouge_positive_correlation": {
+      "primary": "reward(含门控) vs rouge-l-f",
+      "gated": {
+        "n": 670,
+        "pearson": 0.290516719675899,
+        "pearson_p": 1.1146106713395458e-14,
+        "spearman": 0.507674149188237,
+        "spearman_p": 2.428133155267941e-47
+      },
+      "ungated": {
+        "n": 670,
+        "pearson": 0.46873208010371575,
+        "pearson_p": 2.1801774386793234e-39,
+        "spearman": 0.5033871907771917,
+        "spearman_p": 2.081594622333081e-46
+      },
+      "pass": true,
+      "verdict": "✓ 成立：候选 reward 与 ROUGE-L 显著正相关"
+    }
+  },
+  "per_term": {
+    "fact_consistency": {
+      "gated": {
+        "conclusion1": {
+          "n": 670,
+          "mean_delta": 0.07425373134328359,
+          "median_delta": 0.0,
+          "sd_delta": 0.37062205690807687,
+          "win": 213,
+          "tie": 289,
+          "lose": 168,
+          "win_rate": 0.31791044776119404,
+          "t_stat": 5.185903388033556,
+          "p_value": 2.149702357385357e-07,
+          "sign_test_p": 0.024057531858961846,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的事实一致性显著低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 670,
+          "pearson": 0.21627549759475057,
+          "pearson_p": 1.3850794991480568e-08,
+          "spearman": 0.16644216957949542,
+          "spearman_p": 1.4315834228138339e-05,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的事实一致性 与 ROUGE-L 显著正相关"
+        }
+      },
+      "ungated": {
+        "conclusion1": {
+          "n": 670,
+          "mean_delta": -0.0029104477611940293,
+          "median_delta": 0.0,
+          "sd_delta": 0.12595828269261394,
+          "win": 181,
+          "tie": 297,
+          "lose": 192,
+          "win_rate": 0.2701492537313433,
+          "t_stat": -0.5980954233018254,
+          "p_value": 0.5497762638821306,
+          "sign_test_p": 0.6046709101768525,
+          "pass": false,
+          "verdict": "✗ 不成立：候选摘要的事实一致性没有低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 670,
+          "pearson": 0.16003643654367739,
+          "pearson_p": 3.0594711713390905e-05,
+          "spearman": 0.11114971475465885,
+          "spearman_p": 0.0039453260923554365,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的事实一致性 与 ROUGE-L 显著正相关"
+        }
+      },
+      "candidate_mean": 0.9521828358208955,
+      "human_mean": 0.9492723880597016,
+      "human_constant_one": false
+    },
+    "element_coverage": {
+      "gated": {
+        "conclusion1": {
+          "n": 670,
+          "mean_delta": 0.20300373134328356,
+          "median_delta": 0.13749999999999996,
+          "sd_delta": 0.34704211101413535,
+          "win": 575,
+          "tie": 71,
+          "lose": 24,
+          "win_rate": 0.8582089552238806,
+          "t_stat": 15.141163373292521,
+          "p_value": 8.66668932801636e-52,
+          "sign_test_p": 4.626688056338456e-138,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率显著低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 670,
+          "pearson": 0.3623865048993037,
+          "pearson_p": 1.0771450205735975e-22,
+          "spearman": 0.5530671098703007,
+          "spearman_p": 3.283757843929547e-58,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率 与 ROUGE-L 显著正相关"
+        }
+      },
+      "ungated": {
+        "conclusion1": {
+          "n": 670,
+          "mean_delta": 0.1455783582089552,
+          "median_delta": 0.13124999999999998,
+          "sd_delta": 0.10692043782273959,
+          "win": 596,
+          "tie": 74,
+          "lose": 0,
+          "win_rate": 0.8895522388059701,
+          "t_stat": 35.24305033159428,
+          "p_value": 4.3840973544151263e-272,
+          "sign_test_p": 7.71174356832923e-180,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率显著低于人工摘要"
+        },
+        "conclusion2": {
+          "n": 670,
+          "pearson": 0.5630295107659173,
+          "pearson_p": 7.344269872416976e-61,
+          "spearman": 0.5614950773066159,
+          "spearman_p": 1.90957199015088e-60,
+          "pass": true,
+          "verdict": "✓ 成立：候选摘要的要素覆盖率 与 ROUGE-L 显著正相关"
+        }
+      },
+      "candidate_mean": 0.8544216417910447,
+      "human_mean": 1.0,
+      "human_constant_one": true
+    }
+  },
+  "input": "/home/yukino/projects/sfzy/data/triples/sft_val_shard0of2.jsonl",
+  "output": "/home/yukino/projects/sfzy/data/judge/runs/exp3/sft_val_shard0of2.reward.jsonl",
+  "run": "exp3",
+  "extract_model": null,
+  "extract_api_model": "deepseek-chat",
+  "judge_api_model": "deepseek-chat",
+  "max_input_tokens": 11288,
+  "extract_prompt_version": "v4-verbatim-procedure-reasoning",
+  "extract_summary_prompt_version": "s1-summary"
+}

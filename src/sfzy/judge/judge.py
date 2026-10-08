@@ -272,6 +272,7 @@ class FactConsistencyJudge:
         six_shot_fact: bool = False,
         six_max_new_tokens: int = 512,
         six_shot_coverage: bool = False,
+        debug_prompts: bool = False,
         load_in_4bit: bool = False,
         bnb_4bit_compute_dtype: Optional[str] = None,
         trust_remote_code: bool = True,
@@ -320,6 +321,8 @@ class FactConsistencyJudge:
         self.six_max_new_tokens = int(six_max_new_tokens)
         # 覆盖率也改成"一次给(人工摘要, 候选摘要) → 输出六要素分"
         self.six_shot_coverage = bool(six_shot_coverage)
+        # 是否把每次构造的 prompt（system+user）打到控制台（调试单条用）
+        self.debug_prompts = bool(debug_prompts)
         self.extract_max_new_tokens = extract_max_new_tokens
         self.max_input_tokens = max_input_tokens
         # 截断后的文档缓存（doc_fallback 每条要素都要用同一段截断文本，
@@ -386,7 +389,7 @@ class FactConsistencyJudge:
         texts = [self._fit_for_extract(t, kind) for t in texts]
         conversations = [build_extract_messages(t, kind) for t in texts]
         # === 调试：打印提取阶段的输入 Prompt ===
-        if _VERBOSE:
+        if _VERBOSE or self.debug_prompts:
             for i, (t, conv) in enumerate(zip(texts, conversations)):
                 print(f"\n{'='*20} [Extract] 样本 {i+1} 输入 {'='*20}")
                 print(f"原始文本（前300字）: {t[:300]}...")
@@ -407,7 +410,7 @@ class FactConsistencyJudge:
         parsed = [parse_six_json_debug(r) for r in raws]
 
         # === 调试：打印提取阶段的模型输出与解析结果 ===
-        if _VERBOSE:
+        if _VERBOSE or self.debug_prompts:
             for i, (raw, (el, mode)) in enumerate(zip(raws, parsed)):
                 print(f"\n{'='*20} [Extract] 样本 {i+1} 输出 {'='*20}")
                 print(f"模型原始输出:\n{raw}\n")
@@ -539,8 +542,9 @@ class FactConsistencyJudge:
         if not requests:
             return [], [], []
         conversations = [self._request_messages(r) for r in requests]
-        prompts = [self.runtime.render(c) for c in conversations] if _VERBOSE else []
-        if _VERBOSE:
+        verbose = _VERBOSE or self.debug_prompts
+        prompts = [self.runtime.render(c) for c in conversations] if verbose else []
+        if verbose:
             for i, (r, prompt) in enumerate(zip(requests, prompts)):
                 print(f"\n{'='*20} [Judge:{r.task}] 请求 {i+1} {'='*20}")
                 print(f"要素名称: {r.element}")
@@ -554,7 +558,7 @@ class FactConsistencyJudge:
         else:
             prompts = [self.runtime.render(c) for c in conversations]
             scores, pmaxs, probs = self.runtime.score_digits_batch(prompts)
-        if _VERBOSE:
+        if verbose:
             for i, (s, pm, pr) in enumerate(zip(scores, pmaxs, probs)):
                 print(f"\n{'='*20} [Judge] 请求 {i+1} 输出 {'='*20}")
                 print(f"解析得分: {s}")
@@ -562,20 +566,30 @@ class FactConsistencyJudge:
                 print(f"各数字概率分布: {pr}\n")
         return scores, pmaxs, probs
 
-    def judge_fact_six_batch(
-        self, items: Sequence[Tuple[str, SixElements]]
-    ) -> List[Dict[str, int]]:
-        """一次性六要素判定：`[(原文, 摘要六要素)]` → `[{要素: 0-4}]`（顺序一致）。
+    def _dump_conversations(self, label: str, conversations: Sequence[List[Dict[str, str]]]) -> None:
+        """把构造好的 prompt（system+user）打到控制台，调试单条用。"""
+        if not (_VERBOSE or self.debug_prompts):
+            return
+        for i, conv in enumerate(conversations):
+            print(f"\n{'=' * 20} {label} {i + 1} {'=' * 20}")
+            for message in conv:
+                print(f"[{message['role']}]\n{message['content']}\n")
 
-        输入是**整篇原文 + 摘要的六要素**，一次调用给出六个分。比原来"逐要素判 6 次"
-        少了 5/6 的调用，而且不再依赖原文抽取（原文抽取有损是之前假 0 的主因）。
+    def judge_fact_six_batch(
+        self, items: Sequence[Tuple[str, str]]
+    ) -> List[Dict[str, int]]:
+        """一次性六要素判定：`[(原文全文, 摘要全文)]` → `[{要素: 0-4}]`（顺序一致）。
+
+        输入是**整篇原文 + 摘要原文**，一次调用给出六个分；**不预抽任何六要素**
+        （prompt 里说明按六个要素打分即可）。既不依赖原文抽取，也不依赖摘要抽取。
         """
         if not items:
             return []
         conversations = [
-            build_fact_six_messages(self._fit_document_for_judge(doc), els)
-            for doc, els in items
+            build_fact_six_messages(self._fit_document_for_judge(doc), cand)
+            for doc, cand in items
         ]
+        self._dump_conversations("[Judge:fact_consistency 一次性六要素]", conversations)
         if hasattr(self.runtime, "generate_messages"):
             raws = self.runtime.generate_messages(
                 conversations, max_new_tokens=self.six_max_new_tokens
@@ -586,15 +600,9 @@ class FactConsistencyJudge:
                 max_new_tokens=self.six_max_new_tokens,
             )
         results: List[Dict[str, int]] = []
-        for (_doc, els), raw in zip(items, raws):
+        for _item, raw in zip(items, raws):
             parsed = parse_six_scores(raw)
-            full: Dict[str, int] = {}
-            for name in ELEMENTS:
-                if not els.get(name).strip():
-                    full[name] = MAX_SCORE            # 空字段规则：候选省略 → 4
-                else:
-                    full[name] = parsed.get(name, 2)  # 解析缺失按"疑点"2，不判 0
-            results.append(full)
+            results.append({name: parsed.get(name, 2) for name in ELEMENTS})
         return results
 
     def judge_coverage_six_batch(
@@ -606,6 +614,7 @@ class FactConsistencyJudge:
         conversations = [
             build_coverage_six_messages(ref, cand) for ref, cand in items
         ]
+        self._dump_conversations("[Judge:element_coverage 一次性六要素]", conversations)
         if hasattr(self.runtime, "generate_messages"):
             raws = self.runtime.generate_messages(
                 conversations, max_new_tokens=self.six_max_new_tokens
@@ -821,7 +830,15 @@ class FactConsistencyJudge:
         空字段的那些 pair 根本不发请求。
         """
         candidates = list(candidates)
-        cand_els = self.extract_six_elements_batch(candidates)
+        # 只有"逐要素"路径才需要候选六要素；两条都一次性时完全不抽。
+        need_cand_els = (
+            ("fact_consistency" in self.tasks and not self.six_shot_fact)
+            or ("element_coverage" in self.tasks and not self.six_shot_coverage)
+        )
+        cand_els = (
+            self.extract_six_elements_batch(candidates) if need_cand_els
+            else [SixElements() for _ in candidates]
+        )
         ids = (
             list(candidate_ids)
             if candidate_ids is not None
@@ -835,8 +852,10 @@ class FactConsistencyJudge:
         fallback_slots: set = set()
         six_raw: List[Dict[str, int]] = []
         if "fact_consistency" in self.tasks and self.six_shot_fact:
-            # 一次性判定：整篇原文 + 摘要六要素 → 六要素分（一次调用/候选）
-            six_raw = self.judge_fact_six_batch([(document, ce) for ce in cand_els])
+            # 一次性判定：整篇原文 + 摘要全文 → 六要素分（一次调用/候选，不抽要素）
+            six_raw = self.judge_fact_six_batch(
+                [(document, text) for text in candidates]
+            )
         elif "fact_consistency" in self.tasks:
             doc_el = self.document_elements(document)
             # 人工摘要作第二辅助参照（自评时逐条忽略，见下面的 ce 比较）
@@ -894,21 +913,33 @@ class FactConsistencyJudge:
                 raise ValueError(
                     "element_coverage 需要人工摘要（reference），但调用时没有传。"
                 )
-            ref_el = self.reference_elements(reference)
             if self.six_shot_coverage:
                 # 一次性判定：(人工摘要全文, 候选摘要全文) → 六要素覆盖分
+                # 不抽参考六要素 → 六个要素都参与（参考没写的那项要求模型给 4）
+                # 候选就是人工摘要本身（自评）→ 覆盖率必然满分，不用调模型
+                self_idx = [ci for ci, text in enumerate(candidates) if text == reference]
+                call_items = [
+                    (ci, text) for ci, text in enumerate(candidates) if text != reference
+                ]
                 cov_six_raw = self.judge_coverage_six_batch(
-                    [(reference, text) for text in candidates]
+                    [(reference, text) for _ci, text in call_items]
                 )
-                for ci, ce in enumerate(cand_els):
-                    present = [name for name in ELEMENTS if ref_el.get(name).strip()]
-                    cov_present[ci] = present
-                    for name in present:
-                        if not ce.get(name).strip():
-                            cov_precomputed[(ci, name)] = 0
+                six_pos = {ci: k for k, (ci, _t) in enumerate(call_items)}
+                for ci in range(len(candidates)):
+                    cov_present[ci] = list(ELEMENTS)
+                for ci in self_idx:
+                    for name in ELEMENTS:
+                        cov_precomputed[(ci, name)] = MAX_SCORE
             else:
+                ref_el = self.reference_elements(reference)
                 for ci, ce in enumerate(cand_els):
-                    pairs, present, precomputed = self.build_coverage_pairs(ref_el, ce)
+                    if candidates[ci] == reference:
+                        present = [n for n in ELEMENTS if ref_el.get(n).strip()]
+                        pairs, precomputed = [], {n: MAX_SCORE for n in present}
+                    else:
+                        pairs, present, precomputed = self.build_coverage_pairs(
+                            ref_el, ce
+                        )
                     cov_present[ci] = present
                     for name, score in precomputed.items():
                         cov_precomputed[(ci, name)] = score
@@ -977,12 +1008,13 @@ class FactConsistencyJudge:
             if "element_coverage" in self.tasks:
                 present = cov_present[ci]
                 if self.six_shot_coverage:
-                    raw_scores = {
-                        name: cov_precomputed.get(
-                            (ci, name), cov_six_raw[ci].get(name, 2)
-                        )
-                        for name in present
-                    }
+                    raw_scores = {}
+                    for name in present:
+                        key = (ci, name)
+                        if key in cov_precomputed:
+                            raw_scores[name] = cov_precomputed[key]
+                        else:
+                            raw_scores[name] = cov_six_raw[six_pos[ci]].get(name, 2)
                 else:
                     raw_scores = {
                         name: cov_precomputed.get((ci, name), cov_got.get((ci, name)))

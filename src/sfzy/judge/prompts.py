@@ -258,9 +258,10 @@ SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + """
 
 【输出格式（本次固定）】
 
-你会看到【裁判文书原文】和【待评价摘要的六要素】。请对**六个要素分别**给出
-0~4 的整数分，判据同上（摘要该项是否受原文支持；省略、压缩、同义改写不扣分；
-编造或与原文矛盾判 0）。
+你会看到【裁判文书原文】和【待评价摘要】（摘要原文，没有预先抽取要素）。
+请你自己按下面六个要素逐项对照，对**六个要素分别**给出 0~4 的整数分，
+判据同上（摘要该项是否受原文支持；摘要没写到的要素视为省略、给 4；省略、压缩、
+同义改写不扣分；编造或与原文矛盾判 0）。
 
 只输出一个 JSON 对象，键必须是下面六个，值是 0~4 的整数，不要输出任何其他内容：
 
@@ -274,19 +275,19 @@ SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + """
 }"""
 
 
-def build_fact_six_messages(document: str, candidate_elements) -> List[Dict[str, str]]:
-    """一次性六要素判定：输入 (原文全文, 摘要六要素)，输出六要素 0~4 分。"""
-    lines = "\n".join(
-        _element_line(name, _as_values(candidate_elements).get(name))
-        for name in ELEMENTS
-    )
+def build_fact_six_messages(document: str, candidate: str) -> List[Dict[str, str]]:
+    """一次性六要素判定：输入 (原文全文, 摘要全文)，输出六要素 0~4 分。
+
+    不再预抽摘要六要素——prompt 里说明"按这六个要素打分"即可。
+    """
     user = f"""【裁判文书原文】
 {document}
 
-【待评价摘要的六要素】
-{lines}
+【待评价摘要】
+{candidate}
 
-请对六个要素分别给出 0~4 的整数分，只输出 JSON。"""
+请按 case_type / plaintiff_claims / defendant_defenses / court_facts /
+legal_basis / judgment_result 六个要素分别给出 0~4 的整数分，只输出 JSON。"""
     return [
         {"role": "system", "content": SIX_SHOT_JUDGE_SYSTEM},
         {"role": "user", "content": user},

@@ -396,12 +396,12 @@ def test_一次性六要素判定_prompt与解析():
     from sfzy.judge.judge import parse_six_scores
     from sfzy.judge.prompts import SIX_SHOT_JUDGE_SYSTEM, build_fact_six_messages
 
-    cand = SixElements(case_type="劳动纠纷", court_facts="摘要事实")
-    msgs = build_fact_six_messages("这是原文全文……", cand)
+    msgs = build_fact_six_messages("这是原文全文……", "这是摘要全文……")
     assert msgs[0]["content"] == SIX_SHOT_JUDGE_SYSTEM
     user = msgs[1]["content"]
     assert "【裁判文书原文】" in user and "这是原文全文" in user
-    assert "【待评价摘要的六要素】" in user and "court_facts" in user
+    assert "【待评价摘要】" in user and "这是摘要全文" in user
+    assert "court_facts" in user and "judgment_result" in user
 
     assert parse_six_scores('{"case_type": 3, "court_facts": 0}') == {
         "case_type": 3, "court_facts": 0,
@@ -422,10 +422,9 @@ def test_一次性六要素判定_prompt与解析():
             ] * len(prompts)
 
     j = FactConsistencyJudge(runtime=_RT())
-    out = j.judge_fact_six_batch([("原文", SixElements(case_type="x", plaintiff_claims="y"))])
+    out = j.judge_fact_six_batch([("原文", "摘要")])
     assert out[0]["case_type"] == 2 and out[0]["court_facts"] == 1
-    # 候选该项为空 → 空字段规则给满分 4（模型即使给了别的分也覆盖）
-    assert out[0]["defendant_defenses"] == 4
+    assert out[0]["judgment_result"] == 4
 
 
 def test_覆盖率pair走覆盖率prompt而不是事实一致性():
@@ -479,6 +478,39 @@ def test_一次性覆盖率判定_prompt():
     assert "【参考摘要（人工）】" in user and "人工摘要全文" in user
     assert "【候选摘要】" in user and "候选摘要全文" in user
     assert "case_type" in user and "judgment_result" in user
+
+
+def test_人工摘要自评覆盖率满分且不调模型():
+    class _RT:
+        def __init__(self):
+            self.stats = {}
+            self.cov_calls = 0
+
+        def render(self, messages):
+            return "prompt"
+
+        def generate_batch(self, prompts, max_new_tokens=512):
+            out = []
+            for prompt in prompts:
+                if "【参考摘要（人工）】" in prompt:
+                    self.cov_calls += 1
+                    out.append(json.dumps({n: 2 for n in ELEMENTS}, ensure_ascii=False))
+                else:
+                    out.append(json.dumps({n: 3 for n in ELEMENTS}, ensure_ascii=False))
+            return out
+
+    rt = _RT()
+    j = FactConsistencyJudge(
+        runtime=rt, tasks=("fact_consistency", "element_coverage"),
+        six_shot_fact=True, six_shot_coverage=True,
+    )
+    results = j.judge_candidates(
+        "原文", ["候选摘要", "人工摘要"], reference="人工摘要",
+    )
+    assert results[0].signals["element_coverage"] == pytest.approx(0.5)
+    # 候选就是人工摘要（自评）→ 覆盖率满分，且没有为它发覆盖率请求
+    assert results[1].signals["element_coverage"] == pytest.approx(1.0)
+    assert rt.cov_calls == 1
 
 
 def test_抽取用独立的extract_runtime():

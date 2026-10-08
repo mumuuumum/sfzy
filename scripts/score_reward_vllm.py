@@ -447,20 +447,22 @@ def score_chunk(
     six_cov = bool(getattr(judge, "six_shot_coverage", False))
 
     # ---- 1. 一次把这一批需要的文本都抽出来 -------------------------------
-    docs_todo, summaries_todo = _collect_unique(
-        records, candidate_key, reference_key, els_cache
-    )
-    if six_shot:
-        # 一次性判定直接把整篇原文喂给裁判，不需要原文六要素（也就少了抽取损失）；
-        # 但 --dump-elements 是诊断用的，仍把原文要素抽出来放进结果里。
-        if not _DUMP_ELEMENTS:
-            docs_todo = []
-    for texts, kind in ((docs_todo, "document"), (summaries_todo, "summary")):
-        if not texts:
-            continue
-        extracted = judge.extract_six_elements_batch(texts, kind=kind)
-        for text, el in zip(texts, extracted):
-            els_cache[text] = el
+    # 两条都是一次性判定时，裁判直接看全文，谁都不用抽；--dump-elements 是诊断，
+    # 打开它才为了落盘把要素抽出来。
+    need_extract = (
+        ("fact_consistency" in tasks and not six_shot)
+        or ("element_coverage" in tasks and not six_cov)
+    ) or _DUMP_ELEMENTS
+    if need_extract:
+        docs_todo, summaries_todo = _collect_unique(
+            records, candidate_key, reference_key, els_cache
+        )
+        for texts, kind in ((docs_todo, "document"), (summaries_todo, "summary")):
+            if not texts:
+                continue
+            extracted = judge.extract_six_elements_batch(texts, kind=kind)
+            for text, el in zip(texts, extracted):
+                els_cache[text] = el
 
     # ---- 2. 组装两臂的判定请求（先攒起来，最后合成一次批量前向）---------
     all_pairs: List[Tuple[str, str, str]] = []
@@ -499,7 +501,7 @@ def score_chunk(
             if "fact_consistency" in tasks:
                 if six_shot:
                     entry["six_idx"] = len(six_items)
-                    six_items.append((document, cand_el))
+                    six_items.append((document, cand_text))
                 else:
                     cons_pairs = judge.build_pairs(
                         doc_el, cand_el, document,
@@ -515,26 +517,34 @@ def score_chunk(
                     )
                     all_pairs.extend(cons_pairs)
             if "element_coverage" in tasks:
+                # 人工臂是"人工摘要自评"（候选=参考）→ 覆盖率必然满分，不用调模型
+                is_self = cand_text == reference
                 if six_cov:
-                    present = [n for n in ELEMENTS if ref_el.get(n).strip()]
-                    precomputed = {
-                        n: 0 for n in present if not cand_el.get(n).strip()
-                    }
-                    entry["cov_idx"] = len(cov_items)
-                    cov_items.append((reference, cand_text))
+                    # 不抽参考六要素 → 六个要素都参与（参考没写的那项要求模型给 4）
+                    present = list(ELEMENTS)
+                    if is_self:
+                        precomputed: Dict[str, int] = {n: MAX_SCORE for n in present}
+                    else:
+                        precomputed = {}
+                        entry["cov_idx"] = len(cov_items)
+                        cov_items.append((reference, cand_text))
                     entry["cov_present"] = present
                     entry["cov_pre"] = precomputed
                 else:
-                    cov_pairs, present, precomputed = judge.build_coverage_pairs(
-                        ref_el, cand_el
-                    )
-                    entry["cov_slice"] = (
-                        len(all_pairs), len(all_pairs) + len(cov_pairs)
-                    )
-                    entry["cov_names"] = [p[0] for p in cov_pairs]
-                    entry["cov_present"] = list(present)
-                    entry["cov_pre"] = dict(precomputed)
-                    all_pairs.extend(cov_pairs)
+                    if is_self:
+                        entry["cov_present"] = list(ELEMENTS)
+                        entry["cov_pre"] = {n: MAX_SCORE for n in ELEMENTS}
+                    else:
+                        cov_pairs, present, precomputed = judge.build_coverage_pairs(
+                            ref_el, cand_el
+                        )
+                        entry["cov_slice"] = (
+                            len(all_pairs), len(all_pairs) + len(cov_pairs)
+                        )
+                        entry["cov_names"] = [p[0] for p in cov_pairs]
+                        entry["cov_present"] = list(present)
+                        entry["cov_pre"] = dict(precomputed)
+                        all_pairs.extend(cov_pairs)
             entries.append(entry)
 
     # ---- 3. 一次批量前向（空字段规则在 judge_elements_with_confidence 里处理）
@@ -600,6 +610,14 @@ def score_chunk(
                 cov_raw = dict(entry["cov_pre"])
                 for name, value in zip(entry["cov_names"], scores[a:b]):
                     cov_raw[name] = value
+                coverage = aggregate_coverage(
+                    cov_raw, cov_present, judge.coverage_weights
+                )
+                signals["element_coverage"] = coverage
+            elif "element_coverage" in tasks and "cov_pre" in entry:
+                # 自评短路：候选就是人工摘要，覆盖率直接按预置的满分聚合（=1.0）
+                cov_present = list(entry["cov_present"])
+                cov_raw = dict(entry["cov_pre"])
                 coverage = aggregate_coverage(
                     cov_raw, cov_present, judge.coverage_weights
                 )
@@ -1549,6 +1567,9 @@ def main() -> None:
                     help="只跑这些 id（调试单条用，配合 --dump-elements）")
     ap.add_argument("--index", nargs="+", type=int, default=None,
                     help="只跑输入文件里的这些行号（从 1 开始；不知道 id 时用）")
+    ap.add_argument("--print-prompts", action="store_true",
+                    help="把每次判定的 system+user prompt 打到控制台（单条调试用）；"
+                         "给了 --ids/--index 会自动开启")
     ap.add_argument("--no-resume", action="store_true",
                     help="默认跳过输出里已有的 id（可断点续跑）")
     ap.add_argument("--chunk-size", type=int, default=16,
@@ -1609,6 +1630,11 @@ def main() -> None:
         args.out_dir = str(resolve(args.runs_dir) / args.run)
     else:
         args.out_dir = str(resolve("data/judge"))
+
+    # 单条调试（--ids / --index）默认就把构造的 prompt 打出来；也可 --print-prompts 显式开。
+    args.debug_prompts = bool(args.print_prompts or args.ids or args.index)
+    if args.debug_prompts:
+        logger.info("已开启 prompt 打印：每次判定的 system+user 都会打到控制台")
 
     if args.check_extract_api:
         # 只验证 API 的 base_url / 模型 / 鉴权，不发任何 GPU 相关的东西。
@@ -1786,6 +1812,7 @@ def main() -> None:
         use_reference_context=bool(semantic.get("reference_context", False)),
         six_shot_fact=bool(semantic.get("six_shot_fact", False)),
         six_shot_coverage=bool(semantic.get("six_shot_coverage", False)),
+        debug_prompts=bool(getattr(args, "debug_prompts", False)),
     )
 
     run_config_path = write_run_config(
