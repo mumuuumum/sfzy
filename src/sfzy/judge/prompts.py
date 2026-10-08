@@ -28,6 +28,21 @@ from typing import Dict, List
 
 from sfzy.judge.schema import ELEMENT_ZH, ELEMENTS
 
+# 六要素之一的 court_facts 定义（事实一致性 / 覆盖率 / 抽取共用一处，避免漂移）。
+# 注意：这里把"裁判理由 / 法院说理"也算进 court_facts —— 之前只保留纯事实，
+# 会把摘要里正确的"本院认为"内容误判成编造。
+COURT_FACTS_DEF = "法院审理查明、认定的案件事实、裁判理由和法院说理"
+
+# 六要素的中文定义（一次性判定 prompt 里要摆出来，模型才知道每个键指什么）
+ELEMENT_DEFS_ZH = (
+    "1. case_type：案件类型或案由\n"
+    "2. plaintiff_claims：原告的诉讼请求\n"
+    "3. defendant_defenses：被告的辩称、抗辩意见\n"
+    f"4. court_facts：{COURT_FACTS_DEF}\n"
+    "5. legal_basis：法院裁判所依据的法律、司法解释、法律条文及主要裁判理由\n"
+    "6. judgment_result：法院最终裁判结果"
+)
+
 # ---------------------------------------------------------------------------
 # 六要素提取（需求第二节）
 # ---------------------------------------------------------------------------
@@ -43,7 +58,7 @@ EXTRACT_SUMMARY_PROMPT_VERSION = "s1-summary"
 # 1. case_type：案件类型或案由
 # 2. plaintiff_claims：当前裁判中原告的诉讼请求
 # 3. defendant_defenses：当前裁判中被告的辩称、抗辩意见
-# 4. court_facts：当前裁判中法院审理查明、认定的案件事实（选择对最终判决真正有帮助的进行表述）
+# 4. court_facts：法院审理查明、认定的案件事实、裁判理由和法院说理
 # 5. legal_basis：当前裁判中法院裁判所依据的法律、司法解释、法律条文
 # 6. judgment_result：当前裁判中法院最终裁判结果
 
@@ -82,7 +97,7 @@ EXTRACT_SYSTEM = """你是一个裁判文书信息抽取模型。
 1. case_type：案件类型或案由
 2. plaintiff_claims：当前裁判中原告的诉讼请求
 3. defendant_defenses：当前裁判中被告的辩称、抗辩意见
-4. court_facts：当前裁判中法院审理查明、认定的、直接支撑最终裁判结果的核心事实以及法院由这些事实得出的结论。仅保留决定裁判结果所必需的事实，不提取背景性、过程性、证据列举性事实，以及删除后仍不影响理解裁判结论的事实。保留法院由事实得出的结论。
+4. court_facts：法院审理查明、认定的案件事实、裁判理由和法院说理。只保留与最终裁判结果相关的核心内容，不提取背景性、过程性、证据列举性事实。
 5. legal_basis：当前裁判中法院裁判所依据的法律、司法解释、法律条文
 6. judgment_result：当前裁判中法院最终裁判结果
 
@@ -134,7 +149,7 @@ EXTRACT_SUMMARY_SYSTEM = """你是一个裁判文书摘要的信息抽取模型�
 1. case_type：案件类型或案由
 2. plaintiff_claims：原告的诉讼请求
 3. defendant_defenses：被告的辩称、抗辩意见
-4. court_facts：法院审理查明、认定的案件事实
+4. court_facts：法院审理查明、认定的案件事实、裁判理由和法院说理
 5. legal_basis：法院裁判所依据的法律、司法解释、法律条文及主要裁判理由
 6. judgment_result：法院最终裁判结果
 
@@ -241,7 +256,7 @@ JUDGE_SYSTEM_CONTEXT = JUDGE_SYSTEM + """
 3. 如果摘要该要素的陈述在【判分依据】里找不到、但在【辅助参考】的任意一项里能找到：
    * 这属于抽取归类差异，**不是编造**，不得因此判 0。
 4. 只有当摘要该要素的陈述在原文六项里**都找不到**支持时，才按上面的"编造/新增"判 0。
-5. 「原告诉讼请求 / 被告辩称 / 法院查明事实」这三项的 0 分门槛要更严（略微放宽）。
+5. 「原告诉讼请求 / 被告辩称 / 法院查明事实与说理」这三项的 0 分门槛要更严（略微放宽）。
    这三项都是长段落，抽取本身有损，摘要往往只是压缩、概括、换词、省略。只有出现明确、可指认的冲突才判 0。
 
 只输出0、1、2、3或4。"""
@@ -254,7 +269,7 @@ JUDGE_SYSTEM_CONTEXT = JUDGE_SYSTEM + """
 # 而且原文侧抽取一旦有损（日期挪用、"本院认为"丢掉）就会把正确摘要判成 0。
 # 这个版本改成"一次看全文 + 摘要六要素、输出六个分"：不再依赖原文抽取，
 # 六要素仍分别给分（一次调用里给六个），不是点式总分。
-SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + """
+SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + f"""
 
 【输出格式（本次固定）】
 
@@ -263,16 +278,19 @@ SIX_SHOT_JUDGE_SYSTEM = JUDGE_SYSTEM + """
 判据同上（摘要该项是否受原文支持；摘要没写到的要素视为省略、给 4；省略、压缩、
 同义改写不扣分；编造或与原文矛盾判 0）。
 
+六个要素的定义：
+{ELEMENT_DEFS_ZH}
+
 只输出一个 JSON 对象，键必须是下面六个，值是 0~4 的整数，不要输出任何其他内容：
 
-{
+{{
   "case_type": 0,
   "plaintiff_claims": 0,
   "defendant_defenses": 0,
   "court_facts": 0,
   "legal_basis": 0,
   "judgment_result": 0
-}"""
+}}"""
 
 
 def build_fact_six_messages(document: str, candidate: str) -> List[Dict[str, str]]:
@@ -355,7 +373,7 @@ def build_coverage_messages(
 # ---------------------------------------------------------------------------
 # 覆盖率：一次性给六个分（输入 = 人工摘要全文 + 候选摘要全文）
 # ---------------------------------------------------------------------------
-SIX_SHOT_COVERAGE_SYSTEM = COVERAGE_SYSTEM + """
+SIX_SHOT_COVERAGE_SYSTEM = COVERAGE_SYSTEM + f"""
 
 【输出格式（本次固定）】
 
@@ -363,16 +381,19 @@ SIX_SHOT_COVERAGE_SYSTEM = COVERAGE_SYSTEM + """
 覆盖程度（0=未覆盖/与参考矛盾，4=完整覆盖核心信息；措辞不同、压缩、换词不扣分）。
 参考摘要里没有写到的那一项，直接给 4（该项无需覆盖）。
 
+六个要素的定义：
+{ELEMENT_DEFS_ZH}
+
 只输出一个 JSON 对象，键必须是下面六个，值是 0~4 的整数，不要输出任何其他内容：
 
-{
+{{
   "case_type": 0,
   "plaintiff_claims": 0,
   "defendant_defenses": 0,
   "court_facts": 0,
   "legal_basis": 0,
   "judgment_result": 0
-}"""
+}}"""
 
 
 def build_coverage_six_messages(reference: str, candidate: str) -> List[Dict[str, str]]:

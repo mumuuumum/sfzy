@@ -45,7 +45,7 @@ ELEMENT_ZH: Dict[str, str] = {
     "case_type": "案件类型",
     "plaintiff_claims": "原告诉讼请求",
     "defendant_defenses": "被告辩称",
-    "court_facts": "法院查明事实",
+    "court_facts": "法院查明事实与说理",
     "legal_basis": "法律依据",
     "judgment_result": "裁判结果",
 }

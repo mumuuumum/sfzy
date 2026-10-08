@@ -42,7 +42,7 @@ def test_六要素动态键被改名成中文():
     """`mean_court_facts_score` 这种键是 summarize_scores 动态产出的，
     登记表里没有它，必须靠模式匹配接住 —— 否则六要素的逐项曲线全丢。"""
     out = group_metrics({"mean_court_facts_score": 0.9, "mean_judgment_result_score": 1.0})
-    assert out == {"judge/element/法院查明事实": 0.9, "judge/element/裁判结果": 1.0}
+    assert out == {"judge/element/法院查明事实与说理": 0.9, "judge/element/裁判结果": 1.0}
 
 
 def test_档位比例被改名():
