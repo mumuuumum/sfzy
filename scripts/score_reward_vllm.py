@@ -468,6 +468,7 @@ def score_chunk(
     all_pairs: List[Tuple[str, str, str]] = []
     six_items: List[Tuple[str, SixElements]] = []      # (原文, 摘要六要素)
     cov_items: List[Tuple[str, str]] = []              # (人工摘要, 候选摘要)
+    inp_items: List[Tuple[str, str, str]] = []         # (原文, 人工摘要, 候选摘要)
     entries: List[Dict[str, Any]] = []
     for rec in records:
         rid = str(rec.get("id", ""))
@@ -545,6 +546,13 @@ def score_chunk(
                         entry["cov_present"] = list(present)
                         entry["cov_pre"] = dict(precomputed)
                         all_pairs.extend(cov_pairs)
+            if "information_necessity_precision" in tasks:
+                if cand_text == reference:
+                    # 人工摘要自评：候选就是人工摘要 → INP 视为 1.0，不发请求
+                    entry["inp_self"] = True
+                else:
+                    entry["inp_idx"] = len(inp_items)
+                    inp_items.append((document, reference, cand_text))
             entries.append(entry)
 
     # ---- 3. 一次批量前向（空字段规则在 judge_elements_with_confidence 里处理）
@@ -556,6 +564,8 @@ def score_chunk(
     six_raws = judge.judge_fact_six_batch(six_items) if six_items else []
     # 一次性覆盖率判定：每个 (人工摘要, 候选摘要) 一次调用
     cov_raws = judge.judge_coverage_six_batch(cov_items) if cov_items else []
+    # INP：每个 (原文, 人工摘要, 候选摘要) 一次调用
+    inp_details = judge.judge_inp_batch(inp_items) if inp_items else []
 
     # ---- 4. 切回每条记录的两臂，聚合 + 算奖励 ---------------------------
     rows: List[Dict[str, Any]] = []
@@ -565,6 +575,8 @@ def score_chunk(
         coverage = None
         cov_raw: Dict[str, int] = {}
         cov_present: List[str] = []
+        inp_value: Optional[float] = None
+        inp_detail: Dict[str, Any] = {}
         error = entry["error"]
         try:
             if "fact_consistency" in tasks and six_shot and "six_idx" in entry:
@@ -622,6 +634,15 @@ def score_chunk(
                     cov_raw, cov_present, judge.coverage_weights
                 )
                 signals["element_coverage"] = coverage
+            if "information_necessity_precision" in tasks:
+                if entry.get("inp_self"):
+                    inp_detail = {
+                        "propositions": [], "groups": [], "inp": 1.0, "parse": "self",
+                    }
+                elif "inp_idx" in entry:
+                    inp_detail = inp_details[entry["inp_idx"]]
+                inp_value = float(inp_detail.get("inp", 0.0))
+                signals["information_necessity_precision"] = inp_value
         except Exception as exc:  # noqa: BLE001 — 单条失败不该毁掉整批
             error = error or f"{type(exc).__name__}: {exc}"
 
@@ -681,6 +702,10 @@ def score_chunk(
             "fact_scores": (dict(fact_result.scores) if fact_result else {}),
             "fact_raw": (dict(fact_result.raw_scores) if fact_result else {}),
             "element_coverage": coverage,
+            # INP：逐命题评分 / 重复分组 / 最终分
+            "inp": inp_value,
+            "inp_propositions": inp_detail.get("propositions", []),
+            "inp_groups": inp_detail.get("groups", []),
             # 覆盖率的分项：原始 0~4 / 归一化 0~1 / 参与计算（参考里真实存在）的要素。
             # 参考里没有的要素不进这两个 dict（分子分母都不算）。
             "coverage_raw": dict(cov_raw),

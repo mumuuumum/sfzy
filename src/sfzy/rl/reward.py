@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from sfzy.rl.reward_spec import FACT_GATE_SIGNAL, RewardSpec
-from sfzy.rl.reward_terms import compute_rule_term
+from sfzy.rl.reward_terms import compute_composite_term, compute_rule_term
 
 # --------------------------------------------------------------------------
 # 事实提取（只用于 prompt 池筛选，不参与奖励）
@@ -218,12 +218,15 @@ def _compute_one(
     # ---- 第二层：逐项求值 + 归一化加权求和 ----
     weights = spec.normalized_weights()
     total = 0.0
-    for term in spec.enabled_terms:
+    # 被组合项（quality_fbeta）吞并的项不再参与独立加权和
+    for term in spec.active_terms:
         ts = term.spec
         if ts.source == "rule":
             value = compute_rule_term(
                 ts.name, candidate, reference, source, rouge_mode=spec.rouge_mode
             )
+        elif ts.source == "composite":
+            value = compute_composite_term(ts.name, judge_signals, term.options)
         else:
             value = judge_signals.get(ts.signal)
             if value is None:

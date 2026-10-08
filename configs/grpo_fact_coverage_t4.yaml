@@ -73,11 +73,11 @@ rl:
     # 设 1 = "任一要素得 0 分即出局"；设 0 关闭这条规则（其余门控项沿默认）。
     # 注意：这是全局硬门控，离线验证时人工摘要也会被同一条规则拦下。
     gate:
-      fact_consistency_min_raw: 1
+      fact_consistency_min_raw: 0
     terms:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
-        enabled: true
+        enabled: false
         weight: 0.5
         element_weights:
           case_type:          0.05
@@ -88,7 +88,7 @@ rl:
           judgment_result:    0.20
       element_coverage:
         enabled: true
-        weight: 0.5
+        weight: 1
         element_weights:
           case_type:          0.05
           plaintiff_claims:   0.20
@@ -96,6 +96,17 @@ rl:
           court_facts:        0.25
           legal_basis:        0.15
           judgment_result:    0.20
+      # ---- INP（信息必要性精确率）----
+      # prompt 常量 INP_JUDGE_PROMPT 目前是**空串**，由使用者填写后再打开。
+      information_necessity_precision:
+        enabled: false
+        weight: 1            # 与 quality_fbeta 同时开启时，这个权重会失效
+      # ---- Coverage × INP 的 Fβ 组合 ----
+      # 启用后 coverage / inp 不再参与独立加权和，改由 Fβ 一项参与。
+      # quality_fbeta:
+      #   enabled: true
+      #   weight: 0.3
+      #   beta: 1.0              # β>1 偏重 Coverage；β<1 偏重 INP；β=1 即 F1
 
   anchor:
     enabled: false

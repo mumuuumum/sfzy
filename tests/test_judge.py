@@ -480,6 +480,22 @@ def test_一次性覆盖率判定_prompt():
     assert "case_type" in user and "judgment_result" in user
 
 
+def test_INP解析与重复分组():
+    from sfzy.judge.judge import parse_inp
+
+    raw = json.dumps({"propositions": [
+        {"text": "甲向乙借款10万元", "necessity": 4, "group": 1},
+        {"text": "甲向乙借款10万元", "necessity": 3, "group": 1},   # 重复
+        {"text": "案涉房屋位于某地", "necessity": 2, "group": 2},
+    ]}, ensure_ascii=False)
+    out = parse_inp(raw)
+    # 去重后每个命题组取成员最大值：4 + 2；分母是原子命题总数 3
+    assert out["inp"] == pytest.approx((4 + 2) / (4 * 3))
+    assert out["groups"] == [0, 0, 1]
+    assert len(out["propositions"]) == 3
+    assert out["propositions"][0]["necessity"] == 4
+
+
 def test_人工摘要自评覆盖率满分且不调模型():
     class _RT:
         def __init__(self):

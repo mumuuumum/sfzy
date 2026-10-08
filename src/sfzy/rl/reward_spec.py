@@ -176,7 +176,11 @@ class RewardSpec:
             term_spec = TERM_REGISTRY[name]
             enabled = bool(entry.get("enabled", True))
 
-            allowed = set(_RESERVED_FIELDS) | set(term_spec.internal_weight_fields)
+            allowed = (
+                set(_RESERVED_FIELDS)
+                | set(term_spec.internal_weight_fields)
+                | set(term_spec.scalar_options)
+            )
             unknown = sorted(set(entry) - allowed)
             if unknown:
                 raise RewardConfigError(
@@ -211,6 +215,12 @@ class RewardSpec:
                         f"terms.{name}.{field_name} 下，\n"
                         f"  键必须且只能是 {list(required_keys)}，权重之和必须为 1。"
                     )
+            # 组合项/规则项的标量参数（如 quality_fbeta 的 beta / eps），可选
+            for field_name in term_spec.scalar_options:
+                if field_name in entry:
+                    options[field_name] = _as_float(
+                        entry[field_name], f"terms.{name}.{field_name}"
+                    )
             terms[name] = TermConfig(
                 name=name, enabled=enabled, weight=weight, options=options
             )
@@ -238,9 +248,24 @@ class RewardSpec:
     def enabled_terms(self) -> List[TermConfig]:
         return [t for t in self.terms.values() if t.enabled]
 
+    @property
+    def consumed_terms(self) -> Set[str]:
+        """被组合项（如 quality_fbeta）吞并的项名 —— 它们不再参与独立加权和。"""
+        out: Set[str] = set()
+        for term in self.enabled_terms:
+            if term.source == "composite":
+                out.update(term.spec.consumes)
+        return out
+
+    @property
+    def active_terms(self) -> List[TermConfig]:
+        """真正参与加权和的项 = 启用项 - 被组合项吞并的项。"""
+        consumed = self.consumed_terms
+        return [t for t in self.enabled_terms if t.name not in consumed]
+
     def normalized_weights(self) -> Dict[str, float]:
-        """启用项的权重。`normalize_weights=True` 时归一到和为 1。"""
-        enabled = self.enabled_terms
+        """参与加权和的项的权重。`normalize_weights=True` 时归一到和为 1。"""
+        enabled = self.active_terms
         total = sum(t.weight for t in enabled)
         if not self.normalize_weights or total <= 0:
             return {t.name: t.weight for t in enabled}
@@ -253,6 +278,9 @@ class RewardSpec:
         for term in self.enabled_terms:
             if term.source == "judge" and term.spec.signal:
                 out.add(term.spec.signal)
+            # 组合项依赖的信号（如 quality_fbeta 需要 coverage 与 INP）也要取回来
+            if term.source == "composite":
+                out.update(term.spec.depends_on)
         return out
 
     @property
@@ -295,6 +323,8 @@ class RewardSpec:
         """{裁判信号名: 该 reward 的内部权重}，交给裁判后端构造时使用。"""
         out: Dict[str, Dict[str, Any]] = {}
         for term in self.enabled_terms:
-            if term.source == "judge" and term.spec.signal and term.options:
+            if term.source == "judge" and term.spec.signal:
+                # 即使没有内部权重（如 INP）也要带上，调用方靠这些键决定
+                # 要跑哪些 judge task。
                 out[term.spec.signal] = dict(term.options)
         return out

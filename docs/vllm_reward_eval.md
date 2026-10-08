@@ -184,6 +184,46 @@ semantic:
 成 1.0、不发请求；只有事实一致性对人工臂仍需判定（原文 vs 人工摘要）。覆盖率只对
 候选臂发一次调用。
 
+## Information Necessity Precision（INP）与 Fβ 组合
+
+INP 用来惩罚候选摘要里**不必要的事实 / 背景细节 / 重复信息**，防止靠堆砌事实
+刷关键要素覆盖率。
+
+- Judge 输入：`(原文, 人工摘要, 候选摘要)`；把候选拆成**原子命题**逐一评"必要性"，
+  分档 0~4。
+- 程序计算：`INP = Σ(每个不重复命题组取其成员必要性得分的最大值) / (4 × 原子命题总数)`，
+  取值 `[0,1]`。重复命题在分子里只算一次、分母仍按原始条数 → 重复会被稀释。
+- ⚠️ prompt 常量 `INP_JUDGE_PROMPT` 目前是**空串**，留给使用者填写。约定的模型输出：
+
+  ```json
+  {"propositions": [{"text": "原子命题文本", "necessity": 0, "group": 1}, ...]}
+  ```
+
+  `group` 相同即视为重复；没有 `group` 时按文本相同归组。逐条结果里会写
+  `inp`、`inp_propositions`(逐命题评分)、`inp_groups`(重复分组)。
+
+配置（`rl.reward.terms` 里，和 fact/coverage 一样可插拔）：
+
+```yaml
+      information_necessity_precision:
+        enabled: true
+        weight: 0.5            # 与 quality_fbeta 同时开启时，这个权重会失效
+      quality_fbeta:
+        enabled: true
+        weight: 0.3
+        beta: 1.0
+```
+
+**Fβ 组合**：`Fβ = (1+β²)·C·INP / (β²·INP + C + ε)`，`β>1` 偏重 Coverage，
+`β<1` 偏重 INP，`β=1` 退化为标准 F1；`C=INP=0` 直接返回 0。
+
+当 `quality_fbeta` 启用时，`element_coverage` 与 `information_necessity_precision`
+被它**吞并**：二者不再参与独立加权和（它们配置里的 `weight` 失效），只有 `quality_fbeta`
+按自己的权重参与，归一化只在剩余项上做。不开 `quality_fbeta` 时，两者仍各自独立加权。
+
+人工臂自评（候选=人工摘要）时 INP 直接记 1.0、不发请求。所以一条样本的判定调用是
+**4 次**（事实 2 + 覆盖率 1 + INP 1）。
+
 **事实一致性和覆盖率是两个独立任务,各有各的 prompt。** 事实一致性问"摘要该项
 是否受原文支持"(左=原文、右=摘要);覆盖率问"候选覆盖了参考多少"(左=参考摘要、
 右=候选摘要),用的是 `COVERAGE_SYSTEM`。离线工具会把两者的 pair 合成一批送判,

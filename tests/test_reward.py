@@ -284,6 +284,58 @@ def test_事实门控信号名在judge与scorer里一致():
     assert f'"{FACT_GATE_SIGNAL}"' in scorer_src
 
 
+# ---------------------------------------------------------------- INP / Fβ
+
+def test_fbeta分数的边界与偏向():
+    from sfzy.rl.reward_terms import fbeta_score
+
+    assert fbeta_score(0.0, 0.0) == 0.0
+    assert fbeta_score(0.5, 0.5, beta=1.0) == pytest.approx(0.5)
+    # β>1 更重视 Coverage；β<1 更重视 INP
+    assert fbeta_score(0.9, 0.1, beta=2.0) > fbeta_score(0.9, 0.1, beta=0.5)
+    assert fbeta_score(0.1, 0.9, beta=0.5) > fbeta_score(0.1, 0.9, beta=2.0)
+    for beta in (0.25, 1.0, 4.0):
+        value = fbeta_score(0.7, 0.3, beta=beta)
+        assert 0.0 <= value <= 1.0
+
+
+def test_fbeta组合项替代coverage与inp的独立加权():
+    from sfzy.rl.reward_terms import fbeta_score
+
+    spec = {"terms": {
+        "element_coverage": {
+            "enabled": True, "weight": 0.5,
+            "element_weights": dict(ELEMENT_WEIGHTS),
+        },
+        "information_necessity_precision": {"enabled": True, "weight": 0.5},
+        "quality_fbeta": {"enabled": True, "weight": 1.0, "beta": 1.0},
+    }}
+    score, bd = compute_reward(
+        REF, REF, spec=spec,
+        judge_signals={"element_coverage": 0.8, "information_necessity_precision": 0.5},
+    )
+    # coverage / inp 被 quality_fbeta 吞并，不再出现在加权和里
+    assert "element_coverage" not in bd.values
+    assert "information_necessity_precision" not in bd.values
+    assert bd.values["quality_fbeta"] == pytest.approx(fbeta_score(0.8, 0.5))
+    assert score == pytest.approx(fbeta_score(0.8, 0.5))
+
+
+def test_不开fbeta时coverage与inp各自独立加权():
+    spec = {"terms": {
+        "element_coverage": {
+            "enabled": True, "weight": 0.5,
+            "element_weights": dict(ELEMENT_WEIGHTS),
+        },
+        "information_necessity_precision": {"enabled": True, "weight": 0.5},
+    }}
+    score, bd = compute_reward(
+        REF, REF, spec=spec,
+        judge_signals={"element_coverage": 0.8, "information_necessity_precision": 0.4},
+    )
+    assert score == pytest.approx(0.5 * 0.8 + 0.5 * 0.4)
+
+
 # ---------------------------------------------------------------- 批量与统计
 
 def test_批量打分_带多信号():

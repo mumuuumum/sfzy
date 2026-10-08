@@ -321,18 +321,17 @@ def test_a100配置用bf16全精度裁判():
 
 
 @pytest.mark.parametrize("name", ["grpo_fact_coverage_t4.yaml", "grpo_fact_coverage_a100.yaml"])
-def test_合并配置同时开两个reward(name):
+def test_合并配置能解析_结构正确(name):
     cfg = _load(name)
     s = RewardSpec.from_config(cfg.path_("rl.reward"))
-    assert [t.name for t in s.enabled_terms] == ["fact_consistency", "element_coverage"]
-    # 具体权重是拿来调的，测试只校验结构：键齐全、非负、归一化后和为 1。
+    # 开哪些 reward、权重多少都是拿来调的（现在 INP 也在试），测试只校验结构。
+    assert s.enabled_terms
     weights = s.normalized_weights()
-    assert set(weights) == {"fact_consistency", "element_coverage"}
+    assert set(weights) == {t.name for t in s.active_terms}
     assert all(w >= 0 for w in weights.values())
     assert sum(weights.values()) == pytest.approx(1.0)
-    assert s.required_signals == {"fact_consistency", "element_coverage"}
-    # 两个 reward 的内部权重都来自配置（同样只校验结构）
     for term in s.enabled_terms:
-        weights = term.options["element_weights"]
-        assert set(weights) == set(ELEMENT_WEIGHTS)
-        assert sum(weights.values()) == pytest.approx(1.0)
+        element_weights = term.options.get("element_weights")
+        if element_weights is not None:
+            assert set(element_weights) == set(ELEMENT_WEIGHTS)
+            assert sum(element_weights.values()) == pytest.approx(1.0)

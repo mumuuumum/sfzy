@@ -27,7 +27,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Tuple
 
 from sfzy.eval.rouge import score_pair
 
@@ -63,10 +63,15 @@ class TermSpec:
     """
 
     name: str
-    source: str                     # "rule" | "judge"
+    source: str                     # "rule" | "judge" | "composite"
     signal: Optional[str] = None    # judge 项消费的信号名；rule 项为 None
     description: str = ""
     internal_weight_fields: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # 组合项（composite）：依赖哪些信号、把哪些项"吞并"（被吞并的项不再参与独立加权和），
+    # 以及除权重外的标量参数（如 beta / eps）。
+    depends_on: Tuple[str, ...] = ()
+    consumes: Tuple[str, ...] = ()
+    scalar_options: Tuple[str, ...] = ()
 
 
 TERM_REGISTRY: Dict[str, TermSpec] = {
@@ -91,6 +96,21 @@ TERM_REGISTRY: Dict[str, TermSpec] = {
         # 同样六个要素，但权重可以单独设（两者共用一个 judge 后端，
         # 抽取共用，判定各一套 prompt）。
         internal_weight_fields={"element_weights": FACT_ELEMENTS},
+    ),
+    "information_necessity_precision": TermSpec(
+        name="information_necessity_precision",
+        source="judge",
+        signal="information_necessity_precision",
+        description="信息必要性精确率 INP：候选原子命题的必要性得分均值 ∈ [0,1]",
+        # 按原子命题算，没有六要素内部权重。
+    ),
+    "quality_fbeta": TermSpec(
+        name="quality_fbeta",
+        source="composite",
+        description="Coverage 与 INP 的 Fβ 组合 ∈ [0,1]（启用后 coverage/INP 不再独立加权）",
+        depends_on=("element_coverage", "information_necessity_precision"),
+        consumes=("element_coverage", "information_necessity_precision"),
+        scalar_options=("beta", "eps"),
     ),
 }
 
@@ -131,3 +151,50 @@ def compute_rule_term(name: str, candidate: str, reference: str, source: Optiona
     if fn is None:
         raise KeyError(f"{name!r} 不是规则项（没有注册对应的 RULE_FUNCS 实现）")
     return float(fn(candidate, reference, source=source, **opts))
+
+
+# --------------------------------------------------------------------------
+# 组合项：Coverage × INP 的 Fβ
+# --------------------------------------------------------------------------
+def fbeta_score(
+    coverage: Optional[float],
+    inp: Optional[float],
+    beta: float = 1.0,
+    eps: float = 1e-9,
+) -> float:
+    """`Fβ = (1+β²)·C·INP / (β²·INP + C + ε)`，∈[0,1]。
+
+    `β>1` 偏重 Coverage，`β<1` 偏重 INP，`β=1` 是标准 F1。
+    C=INP=0 直接返回 0；任一信号缺失按 0 处理。
+    """
+    c = float(coverage) if coverage is not None else 0.0
+    i = float(inp) if inp is not None else 0.0
+    c = min(1.0, max(0.0, c))
+    i = min(1.0, max(0.0, i))
+    if c <= 0.0 and i <= 0.0:
+        return 0.0
+    b2 = float(beta) ** 2
+    denom = b2 * i + c + float(eps)
+    if denom <= 0.0:
+        return 0.0
+    return min(1.0, max(0.0, (1.0 + b2) * c * i / denom))
+
+
+COMPOSITE_FUNCS = {
+    "quality_fbeta": lambda signals, opts: fbeta_score(
+        signals.get("element_coverage"),
+        signals.get("information_necessity_precision"),
+        beta=float(opts.get("beta", 1.0)),
+        eps=float(opts.get("eps", 1e-9)),
+    ),
+}
+
+
+def compute_composite_term(
+    name: str, signals: Mapping[str, Optional[float]], options: Mapping[str, Any]
+) -> float:
+    """组合项：从多个裁判信号算出综合分。"""
+    fn = COMPOSITE_FUNCS.get(name)
+    if fn is None:
+        raise KeyError(f"{name!r} 不是组合项（没有注册对应的 COMPOSITE_FUNCS 实现）")
+    return float(fn(signals, options))

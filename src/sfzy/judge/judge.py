@@ -31,6 +31,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from sfzy.judge.prompts import (
     build_coverage_messages,
     build_coverage_six_messages,
+    build_inp_messages,
     build_extract_messages,
     build_fact_six_messages,
     build_judge_messages,
@@ -64,7 +65,11 @@ _VERBOSE = os.environ.get("JUDGE_VERBOSE", "0") == "1"
 # 这个 Judge 支持的任务（= 它产出的信号名）。
 # 加一个新 reward：在 prompts.py 里写判定 prompt、在这里加一个分支、
 # 在 `term_options` 里声明要它，不需要动抽取和批处理的代码。
-SUPPORTED_TASKS: tuple = ("fact_consistency", "element_coverage")
+SUPPORTED_TASKS: tuple = (
+    "fact_consistency",
+    "element_coverage",
+    "information_necessity_precision",
+)
 
 
 @dataclass(frozen=True)
@@ -247,6 +252,105 @@ def parse_six_scores(text: str) -> Dict[str, int]:
         if match.group(1) in ELEMENTS:
             out[match.group(1)] = int(match.group(2))
     return out
+
+
+def _clamp_score(value: Any) -> Optional[int]:
+    try:
+        return max(0, min(MAX_SCORE, int(value)))
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_inp(text: str) -> Dict[str, Any]:
+    """解析 INP 判定输出 → `{"propositions": [...], "groups": [...], "inp": float}`。
+
+    约定模型输出：
+        {"propositions": [{"text": "原子命题", "necessity": 0~4, "group": 1}, ...]}
+    容错：没有 `group` 时按文本相同归组；必要性缺失按 2（中性）处理。
+
+    INP = Σ(每个不重复命题组取其成员必要性得分的最大值) / (4 × 原子命题总数)。
+    """
+    raw = (text or "").strip()
+    fence = _FENCE_RE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+    data: Any = None
+    candidates = [raw]
+    if "{" in raw and "}" in raw:
+        candidates.append(raw[raw.find("{"): raw.rfind("}") + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(data, dict):
+            break
+        data = None
+
+    if not isinstance(data, dict):
+        return {"propositions": [], "groups": [], "inp": 0.0, "parse": "failed"}
+
+    raw_props = data.get("propositions") or data.get("items") or []
+    texts = data.get("texts") or []
+    scores = data.get("scores") or []
+    groups_raw = data.get("groups") or []
+    propositions: List[Dict[str, Any]] = []
+    for i, item in enumerate(raw_props):
+        if isinstance(item, dict):
+            propositions.append({
+                "text": str(item.get("text") or item.get("proposition") or ""),
+                "necessity": _clamp_score(
+                    item.get("necessity", item.get("score"))
+                ),
+                "group": item.get("group", item.get("group_id")),
+            })
+        elif isinstance(item, str):
+            propositions.append({"text": item, "necessity": None, "group": None})
+    if not propositions and texts:
+        for i, text_i in enumerate(texts):
+            propositions.append({
+                "text": str(text_i),
+                "necessity": _clamp_score(scores[i] if i < len(scores) else None),
+                "group": groups_raw[i] if i < len(groups_raw) else None,
+            })
+    if not propositions:
+        return {"propositions": [], "groups": [], "inp": 0.0, "parse": "empty"}
+
+    # ---- 归组：显式 group 优先；否则按规范化文本相同归组 ----
+    group_key: Dict[Any, int] = {}
+    txt_key: Dict[str, int] = {}
+    groups: List[int] = []
+    for prop in propositions:
+        gid = prop.get("group")
+        if gid is None:
+            text_key = re.sub(r"\s+", "", str(prop.get("text") or ""))
+            gid = txt_key.setdefault(text_key, len(txt_key))
+        if gid not in group_key:
+            group_key[gid] = len(group_key)
+        prop["group"] = group_key[gid]
+        prop["necessity"] = (
+            prop["necessity"] if prop["necessity"] is not None else 2
+        )
+        groups.append(prop["group"])
+
+    total = len(propositions)
+    group_scores: Dict[int, int] = {}
+    for prop in propositions:
+        g = prop["group"]
+        group_scores[g] = max(group_scores.get(g, 0), prop["necessity"])
+    distinct_positions = [i for i, p in enumerate(propositions)
+                          if p["group"] not in {q["group"] for q in propositions[:i]}]
+    inp = sum(group_scores.values()) / (float(MAX_SCORE) * total) if total else 0.0
+    return {
+        "propositions": propositions,
+        "groups": groups,
+        "distinct_index": distinct_positions,
+        "group_scores": group_scores,
+        "inp": round(min(1.0, max(0.0, inp)), 6),
+        "parse": "ok",
+    }
 
 
 class FactConsistencyJudge:
@@ -575,6 +679,14 @@ class FactConsistencyJudge:
             for message in conv:
                 print(f"[{message['role']}]\n{message['content']}\n")
 
+    def _dump_outputs(self, label: str, raws: Sequence[str]) -> None:
+        """把模型的原始返回打到控制台（API 输出观察用）。"""
+        if not (_VERBOSE or self.debug_prompts):
+            return
+        for i, raw in enumerate(raws):
+            print(f"\n{'-' * 20} {label} {i + 1} 模型输出 {'-' * 20}")
+            print(raw)
+
     def judge_fact_six_batch(
         self, items: Sequence[Tuple[str, str]]
     ) -> List[Dict[str, int]]:
@@ -599,6 +711,7 @@ class FactConsistencyJudge:
                 [self.runtime.render(c) for c in conversations],
                 max_new_tokens=self.six_max_new_tokens,
             )
+        self._dump_outputs("[Judge:fact_consistency 一次性六要素]", raws)
         results: List[Dict[str, int]] = []
         for _item, raw in zip(items, raws):
             parsed = parse_six_scores(raw)
@@ -624,11 +737,40 @@ class FactConsistencyJudge:
                 [self.runtime.render(c) for c in conversations],
                 max_new_tokens=self.six_max_new_tokens,
             )
+        self._dump_outputs("[Judge:element_coverage 一次性六要素]", raws)
         results: List[Dict[str, int]] = []
         for _item, raw in zip(items, raws):
             parsed = parse_six_scores(raw)
             results.append({name: parsed.get(name, 2) for name in ELEMENTS})
         return results
+
+    def judge_inp_batch(
+        self, items: Sequence[Tuple[str, str, str]]
+    ) -> List[Dict[str, Any]]:
+        """INP 判定：`[(原文, 人工摘要, 候选摘要)]` → 每条的
+        `{propositions, groups, inp}`（order 一致）。
+
+        prompt 用 `INP_JUDGE_PROMPT`（当前为空串，由使用者填写）。
+        """
+        if not items:
+            return []
+        conversations = [
+            build_inp_messages(doc, ref, cand) for doc, ref, cand in items
+        ]
+        self._dump_conversations(
+            "[Judge:information_necessity_precision]", conversations
+        )
+        if hasattr(self.runtime, "generate_messages"):
+            raws = self.runtime.generate_messages(
+                conversations, max_new_tokens=self.six_max_new_tokens
+            )
+        else:
+            raws = self.runtime.generate_batch(
+                [self.runtime.render(c) for c in conversations],
+                max_new_tokens=self.six_max_new_tokens,
+            )
+        self._dump_outputs("[Judge:information_necessity_precision]", raws)
+        return [parse_inp(raw) for raw in raws]
 
     def _judge_pairs_raw(
         self, pairs: Sequence[Tuple[str, str, str]]
@@ -950,6 +1092,28 @@ class FactConsistencyJudge:
                         cov_slots.append((ci, name))
 
         # ---- 两个任务合成一次批量前向 ----
+        inp_details: List[Dict[str, Any]] = []
+        if "information_necessity_precision" in self.tasks:
+            if reference is None:
+                raise ValueError(
+                    "information_necessity_precision 需要人工摘要（reference），"
+                    "但调用时没有传。"
+                )
+            call_items = [
+                (document, reference, text) for text in candidates if text != reference
+            ]
+            details = self.judge_inp_batch(call_items)
+            pos = 0
+            for text in candidates:
+                if text == reference:
+                    # 人工摘要自评：候选就是人工摘要 → INP 视为 1.0，不发请求
+                    inp_details.append({
+                        "propositions": [], "groups": [], "inp": 1.0, "parse": "self",
+                    })
+                else:
+                    inp_details.append(details[pos])
+                    pos += 1
+
         scores, pmaxs, probs = self._score_requests(cons_requests + cov_requests)
         n_cons = len(cons_requests)
         cons_scores, cons_pmaxs, cons_probs = (
@@ -1022,6 +1186,11 @@ class FactConsistencyJudge:
                     }
                 signals["element_coverage"] = aggregate_coverage(
                     raw_scores, present, self.coverage_weights
+                )
+
+            if "information_necessity_precision" in self.tasks:
+                signals["information_necessity_precision"] = float(
+                    inp_details[ci]["inp"]
                 )
 
             result.signals = signals
