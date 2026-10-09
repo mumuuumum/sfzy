@@ -956,7 +956,7 @@ def summarize(
         variants["human_mean"] = _mean(human_values)
         # 人工臂在该分项上恒为 1.0 → 它的结论 1 是结构性成立，不代表判别力
         variants["human_constant_one"] = bool(human_values) and all(
-            abs(v - 1.0) < 1e-9 for v in human_values
+            v is not None and abs(v - 1.0) < 1e-9 for v in human_values
         )
         per_term[name] = variants
 
