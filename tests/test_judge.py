@@ -196,11 +196,11 @@ def test_INP_prompt_与材料():
         assert block in user
 
 
-def test_EE_prompt_留空与材料():
-    """EE prompt 由使用者自行填写 —— 这里只钉住"留空 + 三段材料"。"""
+def test_EE_prompt与材料():
+    """EE 输入 (原文, 人工参考摘要, 候选摘要) —— 三段材料都要有。"""
     from sfzy.judge.prompts import EE_JUDGE_PROMPT, build_ee_messages
 
-    assert EE_JUDGE_PROMPT == ""          # 不要代写评价规则
+    assert EE_JUDGE_PROMPT.strip()        # 用户手写的 prompt，非空
     msgs = build_ee_messages("原文", "人工摘要", "候选摘要")
     assert msgs[0]["content"] == EE_JUDGE_PROMPT
     user = msgs[1]["content"]
@@ -296,7 +296,7 @@ class _FakeRT:
             elif "信息必要性评价器" in prompt:
                 out.append(json.dumps(self.inp, ensure_ascii=False))
             elif "【人工参考摘要】" in prompt:
-                # EE 的 system 是空串，只能靠 user 里的材料块认出来
+                # EE 的 user 里含【人工参考摘要】块，据此认出来
                 out.append(json.dumps(self.ee, ensure_ascii=False))
             else:
                 out.append(json.dumps(self.fact, ensure_ascii=False))

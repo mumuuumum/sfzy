@@ -1,0 +1,153 @@
+# ============================================================================
+# 事实一致性 + 关键要素覆盖率 —— 2× T4 15GB
+#
+# 和 grpo_fact_only_t4 只差奖励那一段（多开 element_coverage）。判定不再抽取
+# 六要素：事实一致性喂（原文, 摘要）、覆盖率喂（人工摘要, 候选摘要）、
+# 信息必要性喂（原文, 人工摘要, 候选摘要），各路各走一次批量前向。
+#
+# 这份配置**自包含**，不继承任何其它 yaml。
+#
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_coverage_t4.yaml
+# ============================================================================
+
+seed: 42
+device: auto
+
+data_config: configs/data_splits.yaml
+
+model:
+  model_name_or_path: THUDM/chatglm3-6b   # 离线机器改成本地目录
+  trust_remote_code: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: float16
+  torch_dtype: float16
+  device_map: {"": 0}
+  max_length: 2048
+  config_patches: {}
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+
+rl:
+  output_dir: outputs/grpo_fact_cov_ee_t4
+  prompt_style: structured
+  prompt_file: data/splits/rl_prompts.jsonl
+  sft_adapter: /kaggle/input/models/mumuuumum/sft-chatglm3-6b/transformers/default/1/step_000336.pt
+  limit_prompts: 8            # 先跑最小闭环；确认接线后再改成 null
+
+  quantize: true
+
+  group_size: 4
+  prompts_per_step: 1
+  max_length: 2048
+  max_new_tokens: 320
+  temperature: 0.9
+  top_p: 0.95
+
+  gradient_checkpointing: true
+  logprob_micro_batch: 1
+
+  clip_ratio: 0.2
+  kl_coef: 0.0
+  length_norm: sqrt
+  learning_rate: 1.0e-5
+  max_grad_norm: 1.0
+  grad_accum_steps: 1
+
+  save_every_n_steps: 10
+  keep_last_n_checkpoints: 2
+  log_every_n_steps: 1
+  resume_from: null
+
+  # ---- 奖励：两个 judge 项，各有各的内部权重 ----
+  reward:
+    normalize_weights: true
+    # 事实一致性硬门控：六个要素原始分（0-4）里只要有一个 < 这个值，
+    # 整条 reward 直接 0，fact_consistency / element_coverage 都不再参与。
+    # 设 1 = "任一要素得 0 分即出局"；设 0 关闭这条规则（其余门控项沿默认）。
+    # 注意：这是全局硬门控，离线验证时人工摘要也会被同一条规则拦下。
+    gate:
+      fact_consistency_min_raw: 0
+    terms:
+      rouge_l: {enabled: false, weight: 0.0}
+      fact_consistency:
+        enabled: false
+        weight: 0.5
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.20
+          defendant_defenses: 0.15
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.20
+      element_coverage:
+        enabled: false
+        weight: 1
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.20
+          defendant_defenses: 0.15
+          court_facts:        0.25
+          legal_basis:        0.15
+          judgment_result:    0.20
+      # ---- INP（信息必要性精确率）----
+      # prompt 常量 INP_JUDGE_PROMPT 已由使用者填写，打开即生效。
+      information_necessity_precision:
+        enabled: false
+        weight: 1            # 与 quality_fbeta 同时开启时，这个权重会失效
+      # ---- Expression Efficiency（表达效率）----
+      # prompt 常量 EE_JUDGE_PROMPT 目前是空串，由使用者填写后再打开。
+      # 三维权重可整段省略（默认 0.4 / 0.2 / 0.4）；写了就必须写全，
+      # 只要求非负、和 > 0（R_EE 自带按权重和归一）。
+      expression_efficiency:
+        enabled: true
+        weight: 1
+        dimension_weights:
+          semantic_redundancy: 0.3
+          verbal_redundancy: 0.3
+          abstraction_adequacy: 0.4
+      # ---- Coverage × INP 的 Fβ 组合 ----
+      # 启用后 coverage / inp 不再参与独立加权和，改由 Fβ 一项参与。
+      # quality_fbeta:
+      #   enabled: true
+      #   weight: 0.3
+      #   beta: 1.0              # β>1 偏重 Coverage；β<1 偏重 INP；β=1 即 F1
+
+  anchor:
+    enabled: false
+    slack: 0.05
+
+semantic:
+  backend: fact
+  model: Qwen/Qwen2.5-7B-Instruct   # 离线机器改成本地目录
+  trust_remote_code: false
+  device: cuda:1
+  dtype: float16
+  bnb_4bit_compute_dtype: float16
+  load_in_4bit: true
+  # 一次判定喂的是整篇原文 + 摘要（不再抽取六要素），batch 上限按 G 候选估
+  max_batch_size: 4
+  # 判定 prompt 的输入预算。val 原文最长约 1.2 万字，超预算的原文按头+尾截断，
+  # system 不丢。vLLM 的 max_model_len = max_input_tokens + 2*six_max_new_tokens。
+  max_input_tokens: 11288
+  # 一次判定的生成预算（六要素 JSON / INP 命题列表）
+  six_max_new_tokens: 512
+  # 判定走 API（不加载本地裁判，也就不吃显存）。
+  # 密钥只从环境变量读，不写进配置。
+  judge_api:
+    base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
+    api_key_env: SFZY_JUDGE_API_KEY
+    model: deepseek-chat                       # 想换更强裁判改这里
+    concurrency: 16                            # 线程池并发（API 是 I/O 密集）
+    max_retries: 3
+    timeout_s: 60
+    max_logprobs: 20         
+tracking:
+  backend: none
+  project: sfzy
