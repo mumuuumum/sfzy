@@ -320,7 +320,7 @@ def test_a100配置用bf16全精度裁判():
     assert cfg.path_("semantic.load_in_4bit") is False
 
 
-@pytest.mark.parametrize("name", ["grpo_fact_coverage_t4.yaml", "grpo_fact_coverage_a100.yaml"])
+@pytest.mark.parametrize("name", ["grpo_fact_coverage_inp_t4.yaml", "grpo_fact_coverage_a100.yaml"])
 def test_合并配置能解析_结构正确(name):
     cfg = _load(name)
     s = RewardSpec.from_config(cfg.path_("rl.reward"))

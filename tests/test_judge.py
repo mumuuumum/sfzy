@@ -179,7 +179,10 @@ def test_一次性覆盖率判定_prompt():
     user = msgs[1]["content"]
     assert "【参考摘要（人工）】" in user and "人工摘要全文" in user
     assert "【候选摘要】" in user and "候选摘要全文" in user
-    assert "case_type" in user and "judgment_result" in user
+    # 六个要素的键名和定义在 system 里（ELEMENT_DEFS_ZH + 输出格式模板），不在 user 里
+    assert "case_type" in msgs[0]["content"] and "judgment_result" in msgs[0]["content"]
+    # 覆盖率只吃"人工摘要 vs 候选摘要"，**不带裁判文书原文**
+    assert "【裁判文书原文】" not in user
 
 
 def test_INP_prompt_与材料():

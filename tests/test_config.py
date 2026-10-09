@@ -153,7 +153,7 @@ GRPO_CONFIGS = (
     "grpo_fact_judge.yaml",
     "grpo_fact_only_t4.yaml",
     "grpo_fact_only_a100.yaml",
-    "grpo_fact_coverage_t4.yaml",
+    "grpo_fact_coverage_inp_t4.yaml",
     "grpo_fact_coverage_a100.yaml",
     "grpo_smoke_fact_judge.yaml",
     "grpo_cloud_qwen.yaml",

@@ -1035,11 +1035,11 @@ def print_summary(title: str, stats: Dict[str, Any]) -> None:
             key=lambda kv: kv[1]["rate"] or 0.0, reverse=True,
         )[:3]
         print("  fact_raw=0 最多的要素（候选）：" + "，".join(
-            f"{ELEMENT_ZH.get(n, n)} {v['rate']:.0%}" for n, v in top
+            f"{ELEMENT_ZH.get(n, n)} {_pct(v['rate'])}" for n, v in top
         ))
         print(
-            f"  任一要素为 0（会触发事实硬门控）：候选 {cz['any_zero']['rate']:.1%} / "
-            f"人工 {hz['any_zero']['rate']:.1%}"
+            f"  任一要素为 0（会触发事实硬门控）：候选 {_pct(cz['any_zero']['rate'], 1)} / "
+            f"人工 {_pct(hz['any_zero']['rate'], 1)}"
         )
     if stats["human_win_rate"] is not None:
         print(
@@ -1088,6 +1088,11 @@ def _print_conclusions(stats: Dict[str, Any]) -> None:
 
 def _fmt(value: Optional[float], digits: int = 4) -> str:
     return f"{value:.{digits}f}" if isinstance(value, float) else "-"
+
+
+def _pct(value: Optional[float], digits: int = 0) -> str:
+    """百分比格式化；`rate` 缺失（没有可统计的样本）时显示 `-`。"""
+    return f"{value:.{digits}%}" if isinstance(value, float) else "-"
 
 
 def render_report(title: str, stats: Dict[str, Any]) -> str:
