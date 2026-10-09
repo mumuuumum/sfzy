@@ -12,9 +12,16 @@
 prompt 在 `prompts.py`，权重与聚合在 `schema.py`，判定流程在 `judge.py`。
 """
 
-from sfzy.judge.judge import FactConsistencyJudge, parse_inp, parse_six_scores
+from sfzy.judge.judge import (
+    FactConsistencyJudge,
+    parse_ee,
+    parse_inp,
+    parse_six_scores,
+)
 from sfzy.judge.schema import (
     DEFAULT_WEIGHTS,
+    EE_DEFAULT_WEIGHTS,
+    EE_DIMENSIONS,
     ELEMENTS,
     ELEMENT_ZH,
     MAX_SCORE,
@@ -32,6 +39,9 @@ __all__ = [
     "SixElementScorer",
     "parse_six_scores",
     "parse_inp",
+    "parse_ee",
+    "EE_DIMENSIONS",
+    "EE_DEFAULT_WEIGHTS",
     "SixElements",
     "JudgeResult",
     "ELEMENTS",

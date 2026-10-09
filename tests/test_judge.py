@@ -196,6 +196,59 @@ def test_INP_prompt_与材料():
         assert block in user
 
 
+def test_EE_prompt_留空与材料():
+    """EE prompt 由使用者自行填写 —— 这里只钉住"留空 + 三段材料"。"""
+    from sfzy.judge.prompts import EE_JUDGE_PROMPT, build_ee_messages
+
+    assert EE_JUDGE_PROMPT == ""          # 不要代写评价规则
+    msgs = build_ee_messages("原文", "人工摘要", "候选摘要")
+    assert msgs[0]["content"] == EE_JUDGE_PROMPT
+    user = msgs[1]["content"]
+    for block in ("【裁判文书原文】", "【人工参考摘要】", "【候选摘要】"):
+        assert block in user
+
+
+def test_EE解析与量程():
+    from sfzy.judge.judge import parse_ee
+
+    assert parse_ee(
+        '{"semantic_redundancy":4,"verbal_redundancy":3,"abstraction_adequacy":2}'
+    ) == {"semantic_redundancy": 4, "verbal_redundancy": 3, "abstraction_adequacy": 2}
+    assert parse_ee('```json\n{"semantic_redundancy": "0"}\n```') == {
+        "semantic_redundancy": 0,
+    }
+    # 前后有解释、键引号不规整时也要能救回来
+    assert parse_ee("好的：\n{abstraction_adequacy: 3}\n以上") == {
+        "abstraction_adequacy": 3,
+    }
+    assert parse_ee("我无法完成") == {}
+
+
+def test_EE加权分公式():
+    from sfzy.judge.schema import expression_efficiency_score
+
+    dims = {"semantic_redundancy": 4, "verbal_redundancy": 0, "abstraction_adequacy": 4}
+    assert expression_efficiency_score(dims) == pytest.approx(0.8)
+    # 权重整体缩放不改变结果（R_EE 自带按权重和归一）
+    assert expression_efficiency_score(
+        dims, {"semantic_redundancy": 4, "verbal_redundancy": 2, "abstraction_adequacy": 4}
+    ) == pytest.approx(0.8)
+    # 权重和 <= 0 时返回 0
+    assert expression_efficiency_score(
+        dims, {"semantic_redundancy": 0, "verbal_redundancy": 0, "abstraction_adequacy": 0}
+    ) == 0.0
+
+
+def test_EE_维度常量与reward侧一致():
+    """judge/schema 与 rl/reward_terms 各抄了一份 EE 维度，必须完全一致。"""
+    from sfzy.judge.schema import EE_DEFAULT_WEIGHTS, EE_DIMENSIONS
+    from sfzy.rl.reward_terms import EE_DEFAULT_WEIGHTS as R_DEFAULTS
+    from sfzy.rl.reward_terms import EE_DIMENSIONS as R_DIMS
+
+    assert tuple(R_DIMS) == tuple(EE_DIMENSIONS)
+    assert dict(R_DEFAULTS) == dict(EE_DEFAULT_WEIGHTS)
+
+
 def test_prompts模块只保留当前方案的三段():
     """不再有六要素抽取 / 逐要素判定的 prompt。"""
     from sfzy.judge import prompts as pm
@@ -217,11 +270,16 @@ def test_prompts模块只保留当前方案的三段():
 class _FakeRT:
     """不加载模型：按 prompt 里的评价器身份选择要返回的 JSON。"""
 
-    def __init__(self, fact=None, coverage=None, inp=None):
+    def __init__(self, fact=None, coverage=None, inp=None, ee=None):
         self.fact = fact if fact is not None else {n: 4 for n in ELEMENTS}
         self.coverage = coverage if coverage is not None else {n: 3 for n in ELEMENTS}
         self.inp = inp if inp is not None else {
             "propositions": [{"text": "甲向乙借款", "necessity": 4, "group": 1}]
+        }
+        self.ee = ee if ee is not None else {
+            "semantic_redundancy": 4,
+            "verbal_redundancy": 2,
+            "abstraction_adequacy": 4,
         }
         self.calls: list = []          # 每次真正发出去的 prompt
         self.stats: dict = {}
@@ -237,6 +295,9 @@ class _FakeRT:
                 out.append(json.dumps(self.coverage, ensure_ascii=False))
             elif "信息必要性评价器" in prompt:
                 out.append(json.dumps(self.inp, ensure_ascii=False))
+            elif "【人工参考摘要】" in prompt:
+                # EE 的 system 是空串，只能靠 user 里的材料块认出来
+                out.append(json.dumps(self.ee, ensure_ascii=False))
             else:
                 out.append(json.dumps(self.fact, ensure_ascii=False))
         return out
@@ -275,6 +336,31 @@ def test_覆盖率与INP_人工摘要自评短路():
     assert results[1].signals["information_necessity_precision"] == pytest.approx(1.0)
     assert len([p for p in rt.calls if "覆盖率评价器" in p]) == 1
     assert len([p for p in rt.calls if "信息必要性评价器" in p]) == 1
+
+
+def test_EE_人工摘要自评短路():
+    """候选=人工摘要时短路为 1.0，不再发一条两段摘要完全相同的请求。"""
+    rt = _FakeRT(ee={
+        "semantic_redundancy": 4, "verbal_redundancy": 0, "abstraction_adequacy": 4,
+    })
+    j = FactConsistencyJudge(
+        runtime=rt, tasks=("expression_efficiency",),
+        ee_weights={"semantic_redundancy": 0.4, "verbal_redundancy": 0.2,
+                    "abstraction_adequacy": 0.4},
+    )
+    results = j.judge_candidates(
+        "原文", ["候选摘要", "人工摘要"], reference="人工摘要",
+    )
+    assert results[0].signals["expression_efficiency"] == pytest.approx(0.8)
+    # 人工臂（候选=人工摘要）短路为满分，且没有为它发请求
+    assert results[1].signals["expression_efficiency"] == pytest.approx(1.0)
+    assert len([p for p in rt.calls if "【人工参考摘要】" in p]) == 1
+
+
+def test_EE_没传参考摘要直接报错():
+    j = FactConsistencyJudge(runtime=_FakeRT(), tasks=("expression_efficiency",))
+    with pytest.raises(ValueError, match="reference"):
+        j.judge_candidates("DOC", ["CAND"])
 
 
 def test_只开覆盖率时不需要事实一致性():

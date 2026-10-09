@@ -30,7 +30,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 # 顺序即打印顺序，也是 Judge 的调用顺序
 ELEMENTS: tuple = (
@@ -64,6 +64,63 @@ DEFAULT_WEIGHTS: Dict[str, float] = {
 MIN_SCORE_ELEMENTS: tuple = tuple(e for e in ELEMENTS if e != "case_type")
 
 MAX_SCORE = 4          # Judge 的量程 0-4
+
+# ---------------------------------------------------------------------------
+# Expression Efficiency（EE，表达效率）
+# ---------------------------------------------------------------------------
+# 三个维度由**同一次** Judge 调用给出，都是 0~4 分、分数越高越好：
+#   * semantic_redundancy    语义冗余（是否重复陈述相同/高度重叠的信息）
+#   * verbal_redundancy      表达冗余（套话、重复修饰、低效措辞）
+#   * abstraction_adequacy   抽象适当性（该概括的地方是否还留着不必要的细节）
+EE_DIMENSIONS: tuple = (
+    "semantic_redundancy",
+    "verbal_redundancy",
+    "abstraction_adequacy",
+)
+
+EE_DIMENSION_ZH: Dict[str, str] = {
+    "semantic_redundancy": "语义冗余",
+    "verbal_redundancy": "表达冗余",
+    "abstraction_adequacy": "抽象适当性",
+}
+
+# 三个维度的内部权重默认值。权重可以写在配置里覆盖，只要求**非负且和 > 0**
+# （公式按权重和归一，不像六要素那样强制和为 1）。
+EE_DEFAULT_WEIGHTS: Dict[str, float] = {
+    "semantic_redundancy": 0.4,
+    "verbal_redundancy": 0.2,
+    "abstraction_adequacy": 0.4,
+}
+
+
+def expression_efficiency_score(
+    dimensions: Dict[str, Any], weights: Optional[Dict[str, float]] = None
+) -> float:
+    """R_EE = Σ(w_i · s_i/4) / Σw_i ∈ [0,1]。
+
+    `dimensions` 是三个维度的**原始 0~4 分**；缺项按 0 处理，超出量程做 clamp。
+    权重非负、和 <= 0 时直接返回 0（配置层会在启动时先拦住这种配置）。
+    """
+    resolved = dict(EE_DEFAULT_WEIGHTS)
+    if weights:
+        resolved.update(weights)
+    total = 0.0
+    numerator = 0.0
+    for name in EE_DIMENSIONS:
+        weight = float(resolved.get(name, 0.0) or 0.0)
+        if weight < 0:
+            weight = 0.0
+        raw = dimensions.get(name)
+        try:
+            score = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            score = 0.0
+        score = min(float(MAX_SCORE), max(0.0, score))
+        total += weight
+        numerator += weight * score
+    if total <= 0:
+        return 0.0
+    return round(min(1.0, max(0.0, numerator / (float(MAX_SCORE) * total))), 6)
 
 
 # 模型用来表达"这一项不存在"的占位词。需求写的是"返回空字符串"，

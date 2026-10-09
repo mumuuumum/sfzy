@@ -5,6 +5,7 @@
   * 事实一致性：``judge_fact_six_batch([(原文全文, 摘要全文)])``
   * 关键要素覆盖率：``judge_coverage_six_batch([(人工摘要, 候选摘要)])``
   * 信息必要性精确率：``judge_inp_batch([(原文, 人工摘要, 候选摘要)])``
+  * 表达效率：``judge_ee_batch([(原文, 人工摘要, 候选摘要)])``
 
 判定的输入输出都通过 ``runtime`` 抽象（本地 TorchRuntime / vLLM / API 都可以），
 所以这里只负责"怎么用模型 + 怎么把结果摊回每条候选"。
@@ -22,6 +23,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sfzy.judge.prompts import (
     build_coverage_six_messages,
+    build_ee_messages,
     build_fact_six_messages,
     build_inp_messages,
 )
@@ -32,11 +34,14 @@ from sfzy.judge.runtime import (
 )
 from sfzy.judge.schema import (
     DEFAULT_WEIGHTS,
+    EE_DEFAULT_WEIGHTS,
+    EE_DIMENSIONS,
     ELEMENTS,
     MAX_SCORE,
     JudgeResult,
     aggregate,
     aggregate_coverage,
+    expression_efficiency_score,
     summarize_scores,
 )
 
@@ -52,6 +57,7 @@ SUPPORTED_TASKS: tuple = (
     "fact_consistency",
     "element_coverage",
     "information_necessity_precision",
+    "expression_efficiency",
 )
 
 
@@ -201,10 +207,58 @@ def parse_inp(text: str) -> Dict[str, Any]:
     }
 
 
-class FactConsistencyJudge:
-    """事实一致性 / 覆盖率 / INP 的 Judge 本体。
+def parse_ee(text: str) -> Dict[str, int]:
+    """解析表达效率（EE）判定输出 → `{维度: 0-4}`。
 
-    三路信号都走"一次性判定"：直接喂全文，不再抽取六要素。
+    约定模型输出：
+        {"semantic_redundancy": 4, "verbal_redundancy": 3, "abstraction_adequacy": 2}
+    容错到"别让一条样本因为格式失败"：截 ``` 围栏 / 截 `{}` / 正则兜底。
+    缺失的维度不在这里补，由调用方按中性分处理。
+    """
+    raw = (text or "").strip()
+    fence = _FENCE_RE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+    candidates = [raw]
+    if "{" in raw and "}" in raw:
+        candidates.append(raw[raw.find("{"): raw.rfind("}") + 1])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        try:
+            data = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        out: Dict[str, int] = {}
+        for name in EE_DIMENSIONS:
+            value = data.get(name)
+            if value is None:
+                continue
+            if isinstance(value, str):
+                match = re.search(r"[0-4]", value)
+                if not match:
+                    continue
+                value = match.group()
+            clamped = _clamp_score(value)
+            if clamped is not None:
+                out[name] = clamped
+        if out:
+            return out
+
+    fixed = raw.replace("“", '"').replace("”", '"')
+    out = {}
+    for match in re.finditer(r'"?([a-z_]+)"?\s*[:：]\s*([0-4])', fixed):
+        if match.group(1) in EE_DIMENSIONS:
+            out[match.group(1)] = int(match.group(2))
+    return out
+
+
+class FactConsistencyJudge:
+    """事实一致性 / 覆盖率 / INP / 表达效率 的 Judge 本体。
+
+    各路信号都走"一次性判定"：直接喂全文，不再抽取六要素。
     """
 
     def __init__(
@@ -215,6 +269,7 @@ class FactConsistencyJudge:
         max_batch_size: int = 4,
         weights: Optional[Dict[str, float]] = None,
         coverage_weights: Optional[Dict[str, float]] = None,
+        ee_weights: Optional[Dict[str, float]] = None,
         tasks: Optional[Sequence[str]] = None,
         max_input_tokens: int = 8192,
         runtime: Optional[TorchRuntime] = None,
@@ -246,6 +301,8 @@ class FactConsistencyJudge:
         self.weights = dict(weights or DEFAULT_WEIGHTS)
         # 覆盖率自己的六要素权重。没给就沿用一致性的那份（同一套要素）。
         self.coverage_weights = dict(coverage_weights or self.weights)
+        # 表达效率三个维度自己的内部权重。没给就用 schema 里的默认（0.4/0.2/0.4）。
+        self.ee_weights = dict(ee_weights or EE_DEFAULT_WEIGHTS)
         # 这次要跑哪些任务。只跑需要的，能省掉对应的判定调用。
         self.tasks = tuple(tasks) if tasks else ("fact_consistency",)
         unknown = [t for t in self.tasks if t not in SUPPORTED_TASKS]
@@ -367,6 +424,31 @@ class FactConsistencyJudge:
         raws = self._generate(conversations, "[Judge:information_necessity_precision]")
         return [parse_inp(raw) for raw in raws]
 
+    def judge_ee_batch(
+        self, items: Sequence[Tuple[str, str, str]]
+    ) -> List[Dict[str, Any]]:
+        """表达效率 EE：`[(原文, 人工摘要, 候选摘要)]` → 每条的
+        `{三个维度原始分, "ee": 加权分 ∈ [0,1]}`。
+
+        一次调用给出三个维度的 0~4 分；加权用 `self.ee_weights`（来自配置）。
+        缺维度按中性分 2 处理，和另外几路保持一致。
+        """
+        if not items:
+            return []
+        conversations = [
+            build_ee_messages(doc, ref, cand) for doc, ref, cand in items
+        ]
+        raws = self._generate(conversations, "[Judge:expression_efficiency]")
+        results: List[Dict[str, Any]] = []
+        for raw in raws:
+            parsed = parse_ee(raw)
+            dims = {name: parsed.get(name, 2) for name in EE_DIMENSIONS}
+            results.append({
+                **dims,
+                "ee": expression_efficiency_score(dims, self.ee_weights),
+            })
+        return results
+
     # ---------------------------------------------------------------- GRPO 入口
     def judge_candidates(
         self,
@@ -380,8 +462,9 @@ class FactConsistencyJudge:
             results = judge.judge_candidates(原文, 8 条采样, reference=人工摘要)
             signals = [r.signals for r in results]
 
-        事实一致性对每条候选判一次；覆盖率 / INP 需要人工摘要，且"候选=人工摘要"
-        的自评臂直接短路（覆盖率满分，INP=1.0），不发请求。
+        事实一致性对每条候选判一次；覆盖率 / INP / 表达效率都需要人工摘要，
+        且"候选=人工摘要"的自评臂直接短路（覆盖率满分，INP=1.0，EE=1.0），
+        不发请求 —— 否则请求里【候选摘要】和【人工参考摘要】会是同一段文字。
         """
         candidates = list(candidates)
         ids = (
@@ -430,6 +513,29 @@ class FactConsistencyJudge:
                     inp_details.append(details[pos])
                     pos += 1
 
+        ee_details: List[Dict[str, Any]] = []
+        if "expression_efficiency" in self.tasks:
+            if reference is None:
+                raise ValueError(
+                    "expression_efficiency 需要人工摘要（reference），"
+                    "但调用时没有传。"
+                )
+            # 人工臂（候选=人工摘要）短路为 1.0：否则请求里两段摘要完全相同，
+            # 既没有信息量又多花一次调用。
+            call_items = [(ci, t) for ci, t in enumerate(candidates) if t != reference]
+            details = self.judge_ee_batch([
+                (document, reference, text) for _ci, text in call_items
+            ])
+            ee_pos = {ci: k for k, (ci, _text) in enumerate(call_items)}
+            for ci in range(len(candidates)):
+                if ci in ee_pos:
+                    ee_details.append(details[ee_pos[ci]])
+                else:
+                    ee_details.append({
+                        **{name: MAX_SCORE for name in EE_DIMENSIONS},
+                        "ee": 1.0,
+                    })
+
         results: List[JudgeResult] = []
         for ci in range(len(candidates)):
             signals: Dict[str, Optional[float]] = {}
@@ -463,6 +569,9 @@ class FactConsistencyJudge:
                 signals["information_necessity_precision"] = float(
                     inp_details[ci]["inp"]
                 )
+
+            if "expression_efficiency" in self.tasks:
+                signals["expression_efficiency"] = float(ee_details[ci]["ee"])
 
             result.signals = signals
             results.append(result)

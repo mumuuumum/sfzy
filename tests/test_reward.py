@@ -336,6 +336,53 @@ def test_不开fbeta时coverage与inp各自独立加权():
     assert score == pytest.approx(0.5 * 0.8 + 0.5 * 0.4)
 
 
+# ---------------------------------------------------------------- 表达效率（EE）
+
+def test_EE作为独立裁判项进入总分():
+    spec = {"terms": {
+        "rouge_l": {"enabled": True, "weight": 0.5},
+        "expression_efficiency": {"enabled": True, "weight": 0.5},
+    }}
+    score, bd = compute_reward(
+        REF, REF, spec=spec, judge_signals={"expression_efficiency": 0.6},
+    )
+    assert bd.values["expression_efficiency"] == pytest.approx(0.6)
+    # REF vs REF 的 ROUGE-L 是 1.0 → 0.5×1 + 0.5×0.6
+    assert score == pytest.approx(0.8)
+
+
+def test_EE缺信号要报错():
+    spec = {"terms": {"expression_efficiency": {"enabled": True, "weight": 1.0}}}
+    with pytest.raises(ValueError, match="expression_efficiency"):
+        compute_reward(REF, REF, spec=spec, judge_signals={})
+
+
+def test_EE不引入新的硬门控():
+    """EE 即使得 0 分也只把这一项打到 0，不会像事实硬门控那样让整条 reward 归零。"""
+    spec = {"terms": {"expression_efficiency": {"enabled": True, "weight": 1.0}}}
+    score, bd = compute_reward(
+        REF, REF, spec=spec, judge_signals={"expression_efficiency": 0.0},
+    )
+    assert bd.gated is False
+    assert bd.values["expression_efficiency"] == 0.0
+    assert score == pytest.approx(0.0)
+
+
+def test_EE与fact各自独立加权():
+    spec = {"terms": {
+        "fact_consistency": {"enabled": True, "weight": 0.7,
+                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "expression_efficiency": {"enabled": True, "weight": 0.3},
+    }, "gate": {"fact_consistency_min_raw": 0}}
+    score, bd = compute_reward(
+        REF, REF, spec=spec,
+        judge_signals={"fact_consistency": 0.8, "expression_efficiency": 0.5},
+    )
+    assert score == pytest.approx(0.7 * 0.8 + 0.3 * 0.5)
+    # 不含事实门控辅助信号 —— EE 没有把 gate 信号带进来
+    assert "fact_consistency_min_raw" not in bd.values
+
+
 # ---------------------------------------------------------------- 批量与统计
 
 def test_批量打分_带多信号():

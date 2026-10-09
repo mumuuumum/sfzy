@@ -45,6 +45,21 @@ FACT_ELEMENTS: Tuple[str, ...] = (
     "judgment_result",
 )
 
+# Expression Efficiency 的三个维度。和 judge/schema.py 的 EE_DIMENSIONS 必须一致
+# （由 tests/test_judge.py 的一致性断言钉住）。这里同样抄一份，避免把 torch 拉进来。
+EE_DIMENSIONS: Tuple[str, ...] = (
+    "semantic_redundancy",
+    "verbal_redundancy",
+    "abstraction_adequacy",
+)
+
+# 三个维度的默认内部权重（非负、和 > 0 即可；R_EE 公式自带按权重和归一）。
+EE_DEFAULT_WEIGHTS: Dict[str, float] = {
+    "semantic_redundancy": 0.4,
+    "verbal_redundancy": 0.2,
+    "abstraction_adequacy": 0.4,
+}
+
 
 @dataclass(frozen=True)
 class TermSpec:
@@ -67,6 +82,10 @@ class TermSpec:
     signal: Optional[str] = None    # judge 项消费的信号名；rule 项为 None
     description: str = ""
     internal_weight_fields: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    # 与 internal_weight_fields 的区别：这里只要求**非负且和 > 0**，不强制和为 1
+    # （用于 EE 这类公式自带按权重和归一的分项）。缺省时用 default_weight_fields。
+    flexible_weight_fields: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    default_weight_fields: Dict[str, Dict[str, float]] = field(default_factory=dict)
     # 组合项（composite）：依赖哪些信号、把哪些项"吞并"（被吞并的项不再参与独立加权和），
     # 以及除权重外的标量参数（如 beta / eps）。
     depends_on: Tuple[str, ...] = ()
@@ -103,6 +122,15 @@ TERM_REGISTRY: Dict[str, TermSpec] = {
         signal="information_necessity_precision",
         description="信息必要性精确率 INP：候选原子命题的必要性得分均值 ∈ [0,1]",
         # 按原子命题算，没有六要素内部权重。
+    ),
+    "expression_efficiency": TermSpec(
+        name="expression_efficiency",
+        source="judge",
+        signal="expression_efficiency",
+        description="表达效率 EE：语义冗余/表达冗余/抽象适当性三维加权分 ∈ [0,1]",
+        # 三个维度权重可配置，缺省用默认；只要求非负、和 > 0。
+        flexible_weight_fields={"dimension_weights": EE_DIMENSIONS},
+        default_weight_fields={"dimension_weights": EE_DEFAULT_WEIGHTS},
     ),
     "quality_fbeta": TermSpec(
         name="quality_fbeta",

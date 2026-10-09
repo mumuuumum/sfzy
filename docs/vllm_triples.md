@@ -14,6 +14,14 @@
 HF 版本对齐，所以输出的 `data/triples/sft_train.jsonl` 可以直接喂给
 `tools/select_rl_prompts.py --triples ...` 做 GRPO 的 SFT 基线锚。
 
+需要**一篇文书多个候选**时加 `--num N`：产物多一个 `outputs` 列表字段
+（`output` 仍是第一个候选，读单字段的下游不受影响）：
+
+```json
+{"id": "...", "source": "文书全文", "reference": "参考摘要",
+ "output": "候选1", "outputs": ["候选1", "候选2", "候选3", "候选4"]}
+```
+
 ---
 
 ## 一、为什么不能直接用现有环境
@@ -107,6 +115,26 @@ CUDA_VISIBLE_DEVICES=1 python scripts/generate_triples_vllm.py ... --shard 1/2
 
 6B 模型在单张 4090 上装得下，**数据并行（B）通常比 tensor parallel 更快**，
 因为省掉了跨卡通信；tensor parallel 更适合单卡装不下的情况。
+
+### 一篇文书多个候选：`--num N`
+
+多候选是采样的产物，`n=N` 直接交给 vLLM：
+
+```bash
+# 每篇 4 个候选，默认写 data/triples/sft_train_n4.jsonl
+python scripts/generate_triples_vllm.py --config configs/sft_cloud.yaml \
+    --adapter outputs/sft_chatglm3/step_000336.pt \
+    --split train --num 4 --temperature 0.7
+```
+
+* `--num 1`（默认）走贪心，产物和以前**逐字节同构**（只有 4 个字段）。
+* `--num >1` 必须采样：`--temperature` 不能为 0，否则 N 个候选完全相同。
+  不显式传 `--temperature` 时，`--num>1` 自动取 `0.7`；`--top-p` 默认 `1.0`。
+* `--num>1` 时产物是 5 个字段，多了 `outputs` 列表；`output` = `outputs[0]`。
+  只读 `output` 的 `tools/select_rl_prompts.py`、`tools/score_fact_judge.py`、
+  `tools/bench_metrics.py` 不用改就能继续用。
+* 默认输出路径会带 `_n{num}`（如 `sft_train_n4.jsonl`），不会覆盖单候选文件。
+* 想固定随机种子做可复现的多候选：`--seed`（默认 42）会传给 vLLM 引擎。
 
 ## 四、和 HF 版本的差异（写报告时要提）
 

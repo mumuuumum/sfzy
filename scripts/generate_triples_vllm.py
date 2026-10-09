@@ -67,6 +67,23 @@ vLLM 的版本和 transformers 强绑定，**不要装进 ChatGLM3 的那个环�
 支持断点续跑（输出文件里已有的 id 会被跳过）、``--shard I/N`` 数据分片，
 输出格式与 ``generate_triples.py`` 完全一致：
 ``{"id", "source", "reference", "output"}``。
+
+一个 prompt 生成多个候选（``--num N``）
+======================================
+默认 ``--num 1``，退化回贪心解码，产物和以前逐字节同构。传 ``--num N>1`` 时
+用**采样**给每篇文书生成 N 个候选摘要（``n=N`` 交给 vLLM），产物多一个
+``"outputs"`` 列表字段：``{"id", "source", "reference", "output", "outputs"}``。
+``"output"`` 仍是第一个候选，保证 select_rl_prompts / score_fact_judge /
+bench_metrics 这些只读 ``output`` 的下游不用改。
+
+    # 每篇文书 4 个候选（默认写 data/triples/sft_{split}_n4.jsonl，避免和
+    # 单候选产物混在同一个文件里）
+    python scripts/generate_triples_vllm.py --config configs/sft_cloud.yaml \
+        --adapter outputs/sft_chatglm3/step_000336.pt \
+        --split train --num 4 --temperature 0.7
+
+多候选必须采样：``--num>1`` 时 ``--temperature`` 不能为 0（贪心 N 次只会拿到
+N 份一样的文本）。不显式传 ``--temperature`` 时，``--num>1`` 自动取 0.7。
 """
 
 from __future__ import annotations
@@ -369,7 +386,9 @@ def run_vllm(args: argparse.Namespace) -> None:
         # 命名，而不是 sft_{split}.jsonl —— 否则会把 val 的三元组覆盖掉。
         base = Path(args.input).stem if args.input else f"sft_{args.split}"
         suffix = f"_shard{shard_idx}of{shard_total}" if shard_total else ""
-        out_path = resolve(f"data/triples/{base}{suffix}.jsonl")
+        # 多候选产物多加 _n{num}，避免和单候选文件落在同一个路径里互相覆盖 / 混淆
+        num_suffix = f"_n{args.num}" if args.num > 1 else ""
+        out_path = resolve(f"data/triples/{base}{num_suffix}{suffix}.jsonl")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     done = load_done_ids(out_path)
     todo = [r for r in records if r["id"] not in done]
@@ -462,14 +481,18 @@ def run_vllm(args: argparse.Namespace) -> None:
         except TypeError:
             lora_request = LoRARequest("sft", 1, lora_local_path=str(lora_dir))
 
+    # num==1 默认贪心（和 HF 路径的 do_sample=False 对齐，产物逐字节同构）；
+    # num>1 必须采样，否则 n 份输出会一模一样。
     sampling = SamplingParams(
-        n=1,
-        temperature=0.0,               # 贪心，和 HF 路径的 do_sample=False 对齐
-        top_p=1.0,
+        n=args.num,
+        temperature=args.temperature,
+        top_p=args.top_p,
         repetition_penalty=args.repetition_penalty,
         max_tokens=args.max_new_tokens,
         skip_special_tokens=True,
     )
+    logger.info("每条生成 %d 个候选（temperature=%.3f, top_p=%.3f）",
+                args.num, args.temperature, args.top_p)
 
     started = time.time()
     count = 0
@@ -490,15 +513,20 @@ def run_vllm(args: argparse.Namespace) -> None:
                 use_tqdm=False,
             )
             for record, output in zip(chunk, outputs):
-                summary = output.outputs[0].text.strip()
-                f.write(json.dumps({
+                # vLLM 按采样顺序返回 n 个 completion；num==1 时就是 [0]。
+                candidates = [o.text.strip() for o in output.outputs]
+                entry = {
                     "id": record["id"],
                     "source": record["source"],
                     "reference": record.get("summary", ""),
-                    "output": summary,
-                }, ensure_ascii=False) + "\n")
+                    # "output" 恒为第一个候选，兼容只读单字段的下游
+                    "output": candidates[0] if candidates else "",
+                }
+                if args.num > 1:
+                    entry["outputs"] = candidates
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
                 f.flush()
-                out_lengths.append(len(summary))
+                out_lengths.extend(len(c) for c in candidates)
                 count += 1
             elapsed = time.time() - started
             rate = count / elapsed if elapsed > 0 else 0.0
@@ -540,6 +568,14 @@ def main() -> None:
                              "各自用 CUDA_VISIBLE_DEVICES 绑不同的卡，产物再拼起来")
     parser.add_argument("--prompt-style", default=None)
     parser.add_argument("--max-new-tokens", type=int, default=384)
+    parser.add_argument("--num", type=int, default=1,
+                        help="每篇文书生成多少个候选摘要。1（默认）走贪心，产物和以前完全一致；"
+                             ">1 时走采样，产物多一个 outputs 列表字段（output 仍是第一个候选）")
+    parser.add_argument("--temperature", type=float, default=None,
+                        help="采样温度。默认：num==1 时 0.0（贪心），num>1 时 0.7。"
+                             "num>1 时不能为 0，否则 N 个候选会完全相同")
+    parser.add_argument("--top-p", type=float, default=1.0,
+                        help="自 nucleus 采样阈值，仅在 temperature>0 时生效")
     parser.add_argument("--max-prompt-len", type=int, default=None,
                         help="prompt 截断长度，默认取配置的 sft.max_length")
     parser.add_argument("--max-model-len", type=int, default=None,
@@ -558,6 +594,20 @@ def main() -> None:
                         help="关掉 CUDA graph，省显存/好调试，代价是慢一点")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
+
+    # ---- num / temperature 的默认与校验（放在这里，run_vllm 直接用解析后的值）----
+    if args.num < 1:
+        parser.error(f"--num 至少为 1，收到 {args.num}")
+    if args.temperature is None:
+        # num==1 保持旧的贪心行为；num>1 需要采样才能拿到不同候选
+        args.temperature = 0.0 if args.num == 1 else 0.7
+    if args.num > 1 and args.temperature <= 0:
+        parser.error(
+            f"--num={args.num}>1 需要采样：--temperature 必须 >0（贪心会生成 "
+            f"{args.num} 份完全相同的候选）。显式传一个正数，或省略让脚本取默认 0.7"
+        )
+    if not (0.0 < args.top_p <= 1.0):
+        parser.error(f"--top-p 要在 (0, 1] 内，收到 {args.top_p}")
 
     run_vllm(args)
 

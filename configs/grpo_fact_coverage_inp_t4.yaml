@@ -99,8 +99,19 @@ rl:
       # ---- INP（信息必要性精确率）----
       # prompt 常量 INP_JUDGE_PROMPT 已由使用者填写，打开即生效。
       information_necessity_precision:
-        enabled: true
+        enabled: false
         weight: 1            # 与 quality_fbeta 同时开启时，这个权重会失效
+      # ---- Expression Efficiency（表达效率）----
+      # prompt 常量 EE_JUDGE_PROMPT 目前是空串，由使用者填写后再打开。
+      # 三维权重可整段省略（默认 0.4 / 0.2 / 0.4）；写了就必须写全，
+      # 只要求非负、和 > 0（R_EE 自带按权重和归一）。
+      expression_efficiency:
+        enabled: true
+        weight: 1
+        dimension_weights:
+          semantic_redundancy: 0.3
+          verbal_redundancy: 0.3
+          abstraction_adequacy: 0.4
       # ---- Coverage × INP 的 Fβ 组合 ----
       # 启用后 coverage / inp 不再参与独立加权和，改由 Fβ 一项参与。
       # quality_fbeta:

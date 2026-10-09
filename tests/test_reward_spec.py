@@ -197,6 +197,81 @@ def test_未知字段要报错():
         spec({"rouge_l": {"enabled": True, "weight": 1.0, "typo": 1}})
 
 
+# ---------------------------------------------------------------- 表达效率（EE）
+
+EE_WEIGHTS = {
+    "semantic_redundancy": 0.4,
+    "verbal_redundancy": 0.2,
+    "abstraction_adequacy": 0.4,
+}
+
+
+def ee_term(**over):
+    entry = {"enabled": True, "weight": 0.3}
+    entry.update(over)
+    return entry
+
+
+def test_EE_省略三维权重时用默认值():
+    s = spec({"expression_efficiency": ee_term()})
+    assert s.required_signals == {"expression_efficiency"}
+    assert s.terms["expression_efficiency"].options["dimension_weights"] == EE_WEIGHTS
+    assert s.judge_term_options() == {"expression_efficiency": {"dimension_weights": EE_WEIGHTS}}
+
+
+def test_EE_自定义三维权重不要求和为1():
+    """R_EE 自带按权重和归一，所以 4/2/4 和 0.4/0.2/0.4 等价。"""
+    s = spec({"expression_efficiency": ee_term(dimension_weights={
+        "semantic_redundancy": 4, "verbal_redundancy": 2, "abstraction_adequacy": 4,
+    })})
+    assert s.terms["expression_efficiency"].options["dimension_weights"] == {
+        "semantic_redundancy": 4.0, "verbal_redundancy": 2.0, "abstraction_adequacy": 4.0,
+    }
+
+
+def test_EE_三维权重键必须写全():
+    with pytest.raises(RewardConfigError, match="键不对"):
+        spec({"expression_efficiency": ee_term(
+            dimension_weights={"semantic_redundancy": 1.0}
+        )})
+
+
+def test_EE_三维权重多了未知键要报错():
+    bad = dict(EE_WEIGHTS, unknown_dimension=0.1)
+    with pytest.raises(RewardConfigError, match="键不对"):
+        spec({"expression_efficiency": ee_term(dimension_weights=bad)})
+
+
+def test_EE_三维权重不能为负():
+    bad = dict(EE_WEIGHTS)
+    bad["semantic_redundancy"] = -0.4
+    with pytest.raises(RewardConfigError, match="不能为负"):
+        spec({"expression_efficiency": ee_term(dimension_weights=bad)})
+
+
+def test_EE_三维权重和必须大于0():
+    bad = {k: 0.0 for k in EE_WEIGHTS}
+    with pytest.raises(RewardConfigError, match="必须大于 0"):
+        spec({"expression_efficiency": ee_term(dimension_weights=bad)})
+
+
+def test_EE_可与其他reward一起归一化加权():
+    s = spec({
+        "rouge_l": {"enabled": True, "weight": 0.5},
+        "expression_efficiency": ee_term(weight=0.5),
+    })
+    assert s.normalized_weights() == {
+        "rouge_l": pytest.approx(0.5), "expression_efficiency": pytest.approx(0.5),
+    }
+
+
+def test_EE_不是硬门控信号():
+    s = spec({"expression_efficiency": ee_term()})
+    assert s.fact_element_gate_enabled is False
+    assert s.gate_signals == set()
+    assert s.needed_signals == {"expression_efficiency"}
+
+
 # ---------------------------------------------------------------- 结构校验
 
 def test_未知term报错并列出可用名():

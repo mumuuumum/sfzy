@@ -44,7 +44,7 @@ reward 配置直接从 `--config` 的 `rl.reward` 读，和 train_grpo.py 用的
 ============================ 分批，别一条一条喂 ============================
 vLLM 的连续批处理是吞吐的来源。脚本按 `--chunk-size` 条记录切成一批：
 
-  1. 这一批里每一臂的三路判定（事实一致性 / 覆盖率 / INP）分别攒成一批；
+  1. 这一批里每一臂的各路判定（事实一致性 / 覆盖率 / INP / 表达效率）分别攒成一批；
   2. 每路判定各走一次批量前向（一次 generate，几十条序列一起批）；
   3. 再按记录切回去聚合。
 
@@ -130,6 +130,7 @@ from sfzy.utils.text_fit import truncate_text as _truncate_text  # noqa: E402
 # 六要素 Judge 的受限解码头，和 sfzy/judge/runtime.py 用同一个词表
 from sfzy.judge.runtime import DIGITS                        # noqa: E402
 from sfzy.judge.schema import (                              # noqa: E402
+    EE_DIMENSIONS,
     ELEMENT_ZH,
     ELEMENTS,
     MAX_SCORE,
@@ -168,6 +169,9 @@ def _prompt_fingerprint() -> Dict[str, str]:
         ).hexdigest()[:12],
         "information_necessity_precision": hashlib.sha1(
             pm.INP_JUDGE_PROMPT.encode("utf-8")
+        ).hexdigest()[:12],
+        "expression_efficiency": hashlib.sha1(
+            pm.EE_JUDGE_PROMPT.encode("utf-8")
         ).hexdigest()[:12],
     }
 
@@ -433,6 +437,7 @@ def score_chunk(
     six_items: List[Tuple[str, str]] = []              # (原文, 候选摘要)
     cov_items: List[Tuple[str, str]] = []              # (人工摘要, 候选摘要)
     inp_items: List[Tuple[str, str, str]] = []         # (原文, 人工摘要, 候选摘要)
+    ee_items: List[Tuple[str, str, str]] = []          # (原文, 人工摘要, 候选摘要)
     entries: List[Dict[str, Any]] = []
     for rec in records:
         rid = str(rec.get("id", ""))
@@ -465,15 +470,25 @@ def score_chunk(
                 else:
                     entry["inp_idx"] = len(inp_items)
                     inp_items.append((document, reference, cand_text))
+            if "expression_efficiency" in tasks:
+                # 人工臂是"人工摘要自评"（候选=参考）→ 与覆盖率/INP 一样短路，
+                # 不再发一条【候选摘要】和【人工参考摘要】完全相同的请求。
+                if cand_text == reference:
+                    entry["ee_self"] = True
+                else:
+                    entry["ee_idx"] = len(ee_items)
+                    ee_items.append((document, reference, cand_text))
             entries.append(entry)
 
-    # ---- 2. 三路判定各一次批量前向 ----
+    # ---- 2. 各路判定各一次批量前向 ----
     # 事实一致性：每个 (原文, 候选摘要) 一次调用
     six_raws = judge.judge_fact_six_batch(six_items) if six_items else []
     # 覆盖率：每个 (人工摘要, 候选摘要) 一次调用
     cov_raws = judge.judge_coverage_six_batch(cov_items) if cov_items else []
     # INP：每个 (原文, 人工摘要, 候选摘要) 一次调用
     inp_details = judge.judge_inp_batch(inp_items) if inp_items else []
+    # 表达效率：每个 (原文, 人工摘要, 候选摘要) 一次调用
+    ee_details = judge.judge_ee_batch(ee_items) if ee_items else []
 
     # ---- 3. 切回每条记录的两臂，聚合 + 算奖励 ---------------------------
     rows: List[Dict[str, Any]] = []
@@ -485,6 +500,8 @@ def score_chunk(
         cov_present: List[str] = []
         inp_value: Optional[float] = None
         inp_detail: Dict[str, Any] = {}
+        ee_value: Optional[float] = None
+        ee_detail: Dict[str, Any] = {}
         error = entry["error"]
         try:
             if "fact_consistency" in tasks and "six_idx" in entry:
@@ -518,6 +535,16 @@ def score_chunk(
                     inp_detail = inp_details[entry["inp_idx"]]
                 inp_value = float(inp_detail.get("inp", 0.0))
                 signals["information_necessity_precision"] = inp_value
+            if "expression_efficiency" in tasks and "ee_idx" in entry:
+                ee_detail = ee_details[entry["ee_idx"]]
+                ee_value = float(ee_detail.get("ee", 0.0))
+                signals["expression_efficiency"] = ee_value
+            elif "expression_efficiency" in tasks and entry.get("ee_self"):
+                # 自评短路：候选就是人工摘要 → EE 视为满分
+                ee_detail = {name: MAX_SCORE for name in EE_DIMENSIONS}
+                ee_detail["ee"] = 1.0
+                ee_value = 1.0
+                signals["expression_efficiency"] = 1.0
         except Exception as exc:  # noqa: BLE001 — 单条失败不该毁掉整批
             error = error or f"{type(exc).__name__}: {exc}"
 
@@ -581,6 +608,11 @@ def score_chunk(
             "inp": inp_value,
             "inp_propositions": inp_detail.get("propositions", []),
             "inp_groups": inp_detail.get("groups", []),
+            # 表达效率：三维原始分 / 加权后的 EE
+            "expression_efficiency": ee_value,
+            "ee_dimensions": {
+                name: ee_detail.get(name) for name in EE_DIMENSIONS
+            },
             # 覆盖率的分项：原始 0~4 / 归一化 0~1。一次判定里六个要素都参与
             # （参考摘要没写到的那一项，prompt 要求模型给 4）。
             "coverage_raw": dict(cov_raw),
@@ -795,6 +827,8 @@ def _c2_verdict(corr: Dict[str, Any], passed: bool, subject: str = "候选 rewar
 _TERM_LABELS: Dict[str, str] = {
     "fact_consistency": "候选摘要的事实一致性",
     "element_coverage": "候选摘要的要素覆盖率",
+    "information_necessity_precision": "候选摘要的信息必要性精确率",
+    "expression_efficiency": "候选摘要的表达效率",
     "rouge_l": "候选摘要的 ROUGE-L",
 }
 
@@ -1263,6 +1297,11 @@ def write_run_config(
                 t.name: dict(t.options.get("element_weights") or {})
                 for t in spec.enabled_terms
             },
+            # 各 term 的全部内部权重（如 EE 的 dimension_weights）也留一份，
+            # 免得换个字段名的 reward 在存档里看不到权重。
+            "term_options": {
+                t.name: dict(t.options) for t in spec.enabled_terms
+            },
             "gate": {"enabled": spec.gate.enabled, **spec.gate.cfg},
             "rouge_mode": spec.rouge_mode,
         },
@@ -1596,6 +1635,7 @@ def main() -> None:
         runtime=runtime,
         weights=(options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(options.get("element_coverage") or {}).get("element_weights"),
+        ee_weights=(options.get("expression_efficiency") or {}).get("dimension_weights"),
         tasks=judge_tasks,
         max_input_tokens=args.max_input_tokens,
         six_max_new_tokens=six_max_new_tokens,

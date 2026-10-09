@@ -115,6 +115,7 @@ def _build_six_element_scorer(
         # 不带 term_options 时，FactConsistencyJudge 会用 schema.DEFAULT_WEIGHTS。
         weights=(term_options.get("fact_consistency") or {}).get("element_weights"),
         coverage_weights=(term_options.get("element_coverage") or {}).get("element_weights"),
+        ee_weights=(term_options.get("expression_efficiency") or {}).get("dimension_weights"),
         tasks=tasks,
         six_max_new_tokens=int(
             spec.get("six_max_new_tokens", spec.get("extract_max_new_tokens", 512))

@@ -134,6 +134,43 @@ def _validate_internal_weights(
     return weights
 
 
+def _validate_flexible_weights(
+    term: str, field_name: str, required: Sequence[str], raw: Any
+) -> Dict[str, float]:
+    """校验"非负且和 > 0"的内部权重（如 EE 的三维权重）。
+
+    和 `_validate_internal_weights` 的区别：**不要求和为 1**。EE 的 R_EE 公式
+    自带按权重和归一，所以 0.4/0.2/0.4 和 4/2/4 等价。
+    """
+    if not isinstance(raw, Mapping):
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 必须是 {{键: 权重}} 形式的映射，收到 {raw!r}"
+        )
+    missing = [k for k in required if k not in raw]
+    unknown = [k for k in raw if k not in required]
+    if missing or unknown:
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 的键不对。\n"
+            f"  缺少：{missing}\n"
+            f"  多余：{unknown}\n"
+            f"  必须且只能写：{list(required)}"
+        )
+    weights: Dict[str, float] = {}
+    for key, value in raw.items():
+        weight = _as_float(value, f"terms.{term}.{field_name}.{key}")
+        if weight < 0:
+            raise RewardConfigError(
+                f"terms.{term}.{field_name}.{key} 不能为负：{weight}"
+            )
+        weights[key] = weight
+    total = sum(weights.values())
+    if total <= 0:
+        raise RewardConfigError(
+            f"terms.{term}.{field_name} 的权重之和必须大于 0，当前是 {total:.6f}。"
+        )
+    return weights
+
+
 @dataclass
 class RewardSpec:
     terms: Dict[str, TermConfig]
@@ -179,6 +216,7 @@ class RewardSpec:
             allowed = (
                 set(_RESERVED_FIELDS)
                 | set(term_spec.internal_weight_fields)
+                | set(term_spec.flexible_weight_fields)
                 | set(term_spec.scalar_options)
             )
             unknown = sorted(set(entry) - allowed)
@@ -215,6 +253,21 @@ class RewardSpec:
                         f"terms.{name}.{field_name} 下，\n"
                         f"  键必须且只能是 {list(required_keys)}，权重之和必须为 1。"
                     )
+            # 弹性内部权重（如 EE 的三维权重）：可省 → 用代码默认；写就必须写全，
+            # 只校验非负 + 和 > 0。
+            for field_name, required_keys in term_spec.flexible_weight_fields.items():
+                if field_name in entry:
+                    options[field_name] = _validate_flexible_weights(
+                        name, field_name, required_keys, entry[field_name]
+                    )
+                else:
+                    default = term_spec.default_weight_fields.get(field_name)
+                    if default is not None:
+                        options[field_name] = dict(default)
+                    elif enabled:
+                        raise RewardConfigError(
+                            f"terms.{name} 被启用，但没有写 {field_name}，也没有默认值。"
+                        )
             # 组合项/规则项的标量参数（如 quality_fbeta 的 beta / eps），可选
             for field_name in term_spec.scalar_options:
                 if field_name in entry:
