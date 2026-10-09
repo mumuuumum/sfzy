@@ -263,7 +263,218 @@ def metric_columns() -> List[Tuple[str, str, str]]:
                         f"{_element_label(name)} 的均值", "judge"))
     for level in range(5):
         columns.append((f"judge/score_ratio/{level}", f"{level} 分占比", "judge"))
-    return columns
+    columns.extend(
+        (key, name, key.split("/")[0]) for key, name in MONITOR_COLUMNS
+    )
+    # 去重：同一个上报键只保留第一次出现的定义（列顺序稳定，不重复声明）
+    seen: set = set()
+    unique: List[Tuple[str, str, str]] = []
+    for key, name, chart in columns:
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append((key, name, chart))
+    return unique
+
+
+# ---------------------------------------------------------------------------
+# 新监控体系的列定义（`GRPOMonitor` 产出的 `模块/指标`）
+# ---------------------------------------------------------------------------
+# 这里只声明**主指标**的中文名与面板分组；分位数、std 等派生曲线靠 swanlab
+# 按 `/` 前缀自动分组。列顺序 = 面板顺序。
+MONITOR_COLUMNS: List[Tuple[str, str]] = [
+    # ---- train/ 策略优化与稳定性 ----
+    ("train/loss", "总损失"),
+    ("train/policy_loss", "策略损失（不含 KL）"),
+    ("train/learning_rate", "学习率"),
+    ("train/grad_norm_preclip", "梯度范数（裁剪前）"),
+    ("train/grad_norm_postclip", "梯度范数（裁剪后）"),
+    ("train/gradient_clip_applied_rate", "触发梯度裁剪的比例"),
+    ("train/global_step", "优化步"),
+    ("train/ratio_mean", "重要性比率均值"),
+    ("train/ratio_std", "重要性比率标准差"),
+    ("train/ratio_max", "重要性比率最大值"),
+    ("train/ratio_p90", "重要性比率 P90"),
+    ("train/clip_frac", "PPO 裁剪比例"),
+    ("train/clip_frac_low", "低于下界被裁比例"),
+    ("train/clip_frac_high", "高于上界被裁比例"),
+    ("train/entropy", "策略熵（生成段）"),
+    ("train/ref_kl_estimate", "相对参考策略 KL 估计"),
+    ("train/kl_penalty", "计入损失 KL 惩罚"),
+    ("train/lora_update_norm", "LoRA 参数更新范数"),
+    # ---- grpo/ 组内奖励 ----
+    ("grpo/group_reward_mean", "组内奖励均值"),
+    ("grpo/group_reward_std_mean", "组内奖励标准差均值"),
+    ("grpo/group_reward_std_p10", "组内奖励标准差 P10"),
+    ("grpo/group_reward_std_p50", "组内奖励标准差 P50"),
+    ("grpo/group_reward_std_p90", "组内奖励标准差 P90"),
+    ("grpo/group_reward_range_mean", "组内奖励极差均值"),
+    ("grpo/group_reward_range_p90", "组内奖励极差 P90"),
+    ("grpo/zero_std_group_rate", "零方差组占比"),
+    ("grpo/near_zero_std_group_rate", "近零方差组占比"),
+    ("grpo/all_zero_group_rate", "全 0 奖励组占比"),
+    ("grpo/all_equal_positive_group_rate", "全等正奖励组占比"),
+    ("grpo/effective_group_rate", "有效组占比"),
+    ("grpo/kept_group_rate", "保留组占比"),
+    ("grpo/filtered_group_rate", "被过滤组占比"),
+    ("grpo/groups_per_step", "每步组数"),
+    ("grpo/effective_groups_per_step", "每步有效组数"),
+    ("grpo/unique_completion_ratio", "组内唯一输出比例"),
+    ("grpo/duplicate_completion_group_rate", "含重复候选的组占比"),
+    ("grpo/completion_length_group_std", "组内长度标准差均值"),
+    # ---- advantage/ ----
+    ("advantage/raw_abs_mean", "原始优势绝对值均值"),
+    ("advantage/raw_abs_p90", "原始优势绝对值 P90"),
+    ("advantage/raw_positive_ratio", "原始优势为正比例"),
+    ("advantage/raw_negative_ratio", "原始优势为负比例"),
+    ("advantage/raw_zero_ratio", "原始优势为零比例"),
+    ("advantage/effective_abs_mean", "有效优势绝对值均值"),
+    ("advantage/effective_abs_p90", "有效优势绝对值 P90"),
+    ("advantage/effective_zero_ratio", "有效优势为零比例"),
+    # ---- reward/ 总奖励 ----
+    ("reward/raw_mean", "门控前奖励均值"),
+    ("reward/raw_std", "门控前奖励标准差"),
+    ("reward/raw_group_std", "门控前组内标准差"),
+    ("reward/raw_zero_std_group_rate", "门控前零方差组占比"),
+    ("reward/final_mean", "最终奖励均值"),
+    ("reward/final_std", "最终奖励标准差"),
+    ("reward/final_group_std", "最终组内标准差"),
+    ("reward/final_zero_rate", "最终奖励为 0 比例"),
+    ("reward/final_zero_std_group_rate", "最终零方差组占比"),
+    # ---- fact/ ----
+    ("fact/mean", "事实一致性均值"),
+    ("fact/zero_rate", "事实一致性 0 分比例"),
+    ("fact/gate_rate", "事实门控拦截比例"),
+    ("fact/pass_rate", "事实门控通过比例"),
+    ("fact/group_std", "事实一致性组内标准差"),
+    ("fact/zero_element_count_mean", "0 分要素数均值"),
+    ("fact/multi_zero_element_rate", "多要素 0 分比例"),
+    ("fact/min_element_score_mean", "最低要素分均值"),
+    ("fact/group_mixed_gate_rate", "组内混合门控比例"),
+    ("fact/group_all_pass_rate", "组内全通过比例"),
+    ("fact/group_all_fail_rate", "组内全拦截比例"),
+    ("fact/score_ratio_0", "要素 0 分占比"),
+    ("fact/score_ratio_1", "要素 1 分占比"),
+    ("fact/score_ratio_2", "要素 2 分占比"),
+    ("fact/score_ratio_3", "要素 3 分占比"),
+    ("fact/score_ratio_4", "要素 4 分占比"),
+    # ---- coverage/ ----
+    ("coverage/mean", "要素覆盖率均值"),
+    ("coverage/std", "要素覆盖率标准差"),
+    ("coverage/zero_rate", "覆盖率 0 分比例"),
+    ("coverage/full_score_rate", "覆盖率满分比例"),
+    ("coverage/group_std", "覆盖率组内标准差"),
+    ("coverage/nonzero_group_std_rate", "覆盖率非零方差组占比"),
+    ("coverage/length_spearman", "覆盖率-长度相关"),
+    ("coverage/group_length_spearman", "组内覆盖率-长度相关"),
+    # ---- ee/ ----
+    ("ee/mean", "表达效率均值"),
+    ("ee/std", "表达效率标准差"),
+    ("ee/low_score_rate", "低分比例"),
+    ("ee/high_score_rate", "高分比例"),
+    ("ee/group_std", "表达效率组内标准差"),
+    ("ee/nonzero_group_std_rate", "表达效率非零方差组占比"),
+    ("ee/semantic_redundancy_mean", "语义冗余维度均值"),
+    ("ee/verbal_redundancy_mean", "表达冗余维度均值"),
+    ("ee/abstraction_adequacy_mean", "抽象适当性维度均值"),
+    ("ee/length_spearman", "表达效率-长度相关"),
+    ("ee/group_length_spearman", "组内表达效率-长度相关"),
+    # ---- gate/ ----
+    ("gate/total_rate", "总门控拦截比例"),
+    ("gate/fact_rate", "事实门控拦截比例"),
+    ("gate/length_too_long_rate", "过长拦截比例"),
+    ("gate/length_too_short_rate", "过短拦截比例"),
+    ("gate/min_length_rate", "最短长度拦截比例"),
+    ("gate/no_result_marker_rate", "无结果标记拦截比例"),
+    ("gate/forbidden_prefix_rate", "禁用前缀拦截比例"),
+    ("gate/other_rate", "其它门控拦截比例"),
+    ("gate/all_gated_group_rate", "整组被拦截比例"),
+    ("gate/mixed_group_rate", "门控混合组比例"),
+    ("gate/all_passed_group_rate", "整组通过比例"),
+    ("gate/group_std_before", "门控前组内标准差"),
+    ("gate/group_std_after", "门控后组内标准差"),
+    ("gate/advantage_sign_change_rate", "门控前后优势符号变化率"),
+    # ---- relation/ ----
+    ("relation/coverage_ee_spearman", "覆盖率-表达效率相关"),
+    ("relation/coverage_fact_spearman", "覆盖率-事实一致性相关"),
+    ("relation/ee_fact_spearman", "表达效率-事实一致性相关"),
+    ("relation/coverage_length_spearman", "覆盖率-长度相关"),
+    ("relation/ee_length_spearman", "表达效率-长度相关"),
+    ("relation/final_reward_length_spearman", "最终奖励-长度相关"),
+    ("relation/group_coverage_ee_spearman", "组内覆盖率-表达效率相关"),
+    ("relation/group_reward_length_spearman", "组内奖励-长度相关"),
+    ("relation/high_coverage_low_ee_rate", "高覆盖低表达比例"),
+    ("relation/low_coverage_high_ee_rate", "低覆盖高表达比例"),
+    ("relation/coverage_top1_flip_rate", "移除覆盖率后最优翻转率"),
+    ("relation/ee_top1_flip_rate", "移除表达效率后最优翻转率"),
+    ("relation/fact_soft_top1_flip_rate", "移除事实软分后最优翻转率"),
+    ("relation/coverage_advantage_sign_flip_rate", "移除覆盖率后优势符号翻转率"),
+    ("relation/ee_advantage_sign_flip_rate", "移除表达效率后优势符号翻转率"),
+    ("relation/coverage_advantage_change_mean", "移除覆盖率后优势变化均值"),
+    ("relation/ee_advantage_change_mean", "移除表达效率后优势变化均值"),
+    ("relation/effective_signal_length_spearman", "有效信号-长度相关"),
+    # ---- length/ ----
+    ("length/output_mean", "输出长度均值"),
+    ("length/output_std", "输出长度标准差"),
+    ("length/output_p50", "输出长度中位数"),
+    ("length/output_p90", "输出长度 P90"),
+    ("length/output_max", "输出长度最大值"),
+    ("length/tokens_mean", "输出 token 均值"),
+    ("length/tokens_p90", "输出 token P90"),
+    ("length/ratio_mean", "长度比均值"),
+    ("length/ratio_p50", "长度比中位数"),
+    ("length/ratio_p90", "长度比 P90"),
+    ("length/ratio_over_1_2_rate", "长度比 >1.2 比例"),
+    ("length/ratio_over_1_5_rate", "长度比 >1.5 比例"),
+    ("length/near_upper_gate_rate", "接近长度上界比例"),
+    ("length/normalization_factor_mean", "长度归一化因子均值"),
+    ("length/normalization_factor_p90", "长度归一化因子 P90"),
+    # ---- behavior/ ----
+    ("behavior/truncation_rate", "截断比例"),
+    ("behavior/eos_termination_rate", "正常结束比例"),
+    ("behavior/result_marker_rate", "含结果标记比例"),
+    ("behavior/forbidden_prefix_rate", "含禁用前缀比例"),
+    ("behavior/repetition_rate", "重复 n-gram 比例"),
+    # ---- eval/ 固定验证集 ----
+    ("eval/rouge_1", "验证集 ROUGE-1"),
+    ("eval/rouge_2", "验证集 ROUGE-2"),
+    ("eval/rouge_l", "验证集 ROUGE-L"),
+    ("eval/rouge_total", "验证集 ROUGE 总分"),
+    ("eval/length_ratio_mean", "验证集长度比均值"),
+    ("eval/length_ratio_p50", "验证集长度比中位数"),
+    ("eval/fact_mean", "验证集事实一致性"),
+    ("eval/coverage_mean", "验证集覆盖率"),
+    ("eval/ee_mean", "验证集表达效率"),
+    ("eval/final_reward_mean", "验证集最终奖励"),
+    ("eval/delta_rouge_l", "相对基线 ROUGE-L 变化"),
+    ("eval/delta_coverage", "相对基线覆盖率变化"),
+    ("eval/delta_ee", "相对基线表达效率变化"),
+    ("eval/delta_fact_mean", "相对基线事实一致性变化"),
+    ("eval/delta_length_ratio", "相对基线长度比变化"),
+] + [
+    # 六要素逐项（fact 与 coverage 各一组），键名固定、顺序与 ELEMENTS 一致
+    (f"fact/{element}/{stat}", f"{zh} {label}")
+    for element, zh in (
+        ("case_type", "案件类型"),
+        ("plaintiff_claims", "原告诉讼请求"),
+        ("defendant_defenses", "被告辩称"),
+        ("court_facts", "法院查明事实与说理"),
+        ("legal_basis", "法律依据"),
+        ("judgment_result", "裁判结果"),
+    )
+    for stat, label in (("mean", "均值"), ("zero_rate", "0 分比例"), ("group_std", "组内标准差"))
+] + [
+    (f"coverage/{element}/{stat}", f"{zh} 覆盖率{label}")
+    for element, zh in (
+        ("case_type", "案件类型"),
+        ("plaintiff_claims", "原告诉讼请求"),
+        ("defendant_defenses", "被告辩称"),
+        ("court_facts", "法院查明事实与说理"),
+        ("legal_basis", "法律依据"),
+        ("judgment_result", "裁判结果"),
+    )
+    for stat, label in (("mean", "均值"), ("missing_rate", "漏覆盖比例"), ("group_std", "组内标准差"))
+]
 
 
 def flatten_config(cfg: Any, prefix: str = "") -> Dict[str, Any]:

@@ -184,6 +184,12 @@ def main() -> None:
             "gate": {"enabled": reward_spec.gate.enabled, **reward_spec.gate.cfg},
             "rouge_mode": reward_spec.rouge_mode,
         },
+        # 监控口径也是一种"实际生效的配置"：日志频率、阈值、长度归一化模式都必须
+        # 跟着 run 一起存档，否则事后看曲线无法复现它是在什么口径下算的。
+        "_resolved_monitor": {
+            "length_norm": rl_cfg.get("length_norm", "sqrt"),
+            "config": dict(rl_cfg.get("monitor") or {}),
+        },
     }
     logger.info("配置继承链: %s", chain_text)
     logger.info("实际生效的配置（defaults 已展开、--override 已应用）：\n%s",

@@ -90,6 +90,29 @@ rl:
     enabled: false
     slack: 0.05
 
+  # ---- SwanLab 监控（见 docs/grpo_monitoring.md）----
+  monitor:
+    log_interval: 1
+    reward_log_interval: 10
+    relation_log_interval: 20
+    entropy_log_interval: 20
+    lora_update_log_interval: 20
+    correlation_window: 512
+    near_zero_std_eps: 1.0e-6
+    near_upper_gate_margin: 0.1
+    ee_low_threshold: 0.5
+    ee_high_threshold: 0.75
+    repetition_ngram: 3
+    relation_enabled: true
+    eval:
+      enabled: false
+      data_file: null
+      every_n_steps: 100
+      max_samples: 100
+      max_new_tokens: 384
+      max_length: 2048
+      baseline: {}
+
 # ---- 裁判（模型 B）：卡 1，40GB 装得下 7B 全精度 ----
 semantic:
   backend: fact

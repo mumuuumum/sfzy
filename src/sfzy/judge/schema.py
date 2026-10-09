@@ -223,6 +223,13 @@ class JudgeResult:
     # 这次判定产出的**所有信号**（事实一致性 / 关键要素覆盖率 / 以后新增的）。
     # 动态字典：加一个 reward 只需要往这里多放一个键，不用改数据类。
     signals: Dict[str, Optional[float]] = field(default_factory=dict)
+    # 监控用：关键要素覆盖率判定的**逐要素原始 0-4 分**（`signals` 里只有聚合值）。
+    # 只读派生数据，不参与任何评分或聚合。覆盖率 prompt 的语义是"参考摘要没有
+    # 写到的要素直接给 4（该项无需覆盖）"，所以逐要素分里 4 分同时可能是
+    # "参考没有该要素"和"完整覆盖"，监控端据此只把 0 分当作确定性的漏覆盖。
+    coverage_raw: Dict[str, int] = field(default_factory=dict)
+    # 监控用：表达效率 EE 的三个维度原始 0-4 分（越高越好）。
+    ee_dims: Dict[str, int] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -233,6 +240,8 @@ class JudgeResult:
             "signals": dict(self.signals),
             "min_element_score": self.min_element_score,
             "judgment_result_score": self.judgment_result_score,
+            "coverage_raw": dict(self.coverage_raw),
+            "ee_dims": dict(self.ee_dims),
         }
 
 

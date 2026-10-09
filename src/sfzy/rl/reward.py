@@ -190,6 +190,98 @@ def _as_spec(spec: Optional[Any]) -> RewardSpec:
     return spec if isinstance(spec, RewardSpec) else RewardSpec.from_config(spec)
 
 
+def _eval_terms(
+    candidate: str,
+    reference: str,
+    source: Optional[str],
+    spec: RewardSpec,
+    judge_signals: Mapping[str, Optional[float]],
+) -> Dict[str, float]:
+    """逐项求值（**不施加任何门控**），返回 `{term 名: 该项得分}`。
+
+    训练路径的 `_compute_one` 只在门控通过后才调它，所以数值行为完全不变；
+    监控路径的 `compute_pre_gate_reward` 用它算"门控前奖励"。抽出来是为了让
+    两条路径共用同一套分项计算，避免监控口径和奖励口径漂移。
+
+    judge 项拿不到信号时仍然报错（与训练一致）；监控端只会传已经补齐的信号。
+    """
+    values: Dict[str, float] = {}
+    for term in spec.active_terms:
+        ts = term.spec
+        if ts.source == "rule":
+            value = compute_rule_term(
+                ts.name, candidate, reference, source, rouge_mode=spec.rouge_mode
+            )
+        elif ts.source == "composite":
+            value = compute_composite_term(ts.name, judge_signals, term.options)
+        else:
+            value = judge_signals.get(ts.signal)
+            if value is None:
+                raise ValueError(
+                    f"reward term {ts.name!r} 需要裁判信号 {ts.signal!r}，但收到 None。\n"
+                    "  检查 semantic.backend=fact 的裁判是否接上、以及组内补缺是否生效。"
+                )
+            value = float(value)
+            # 量纲护栏：judge 信号必须是 [0,1]，接成 0-100 会把其它项压成噪声。
+            if not 0.0 <= value <= 1.0 + 1e-6:
+                raise ValueError(
+                    f"裁判信号 {ts.signal!r} 的值 {value} 不在 [0,1]。"
+                    "六要素 Judge 的 weighted_reward 本来就是 [0,1]，不做量纲换算。"
+                )
+        values[ts.name] = value
+    return values
+
+
+def compute_pre_gate_reward(
+    candidate: str,
+    reference: str,
+    source: Optional[str] = None,
+    spec: Optional[Any] = None,
+    judge_signals: Optional[Mapping[str, Optional[float]]] = None,
+) -> Tuple[float, Dict[str, float]]:
+    """**仅监控用**：按同一套分项与归一化权重算"门控前奖励"。
+
+    定义：
+        raw_total = Σ_i w_i · term_i / Σ_i w_i     （i 取真实参与加权和的 active 项）
+
+    也就是"如果门控不生效、这条候选会拿多少分"。它**不参与训练**，只用于
+    `reward/raw_*`、`gate/group_std_before`、`gate/advantage_sign_change_rate`
+    以及分项消融的对照。门控不通过时训练奖励仍是 0，这里返回的是未截断值，
+    这样"门控是否抹掉了质量差异"才看得出来。
+
+    与训练共享同一份 `judge_signals`（即已经做过组内补缺的那份），保证分项口径一致。
+    """
+    resolved = _as_spec(spec)
+    weights = resolved.normalized_weights()
+    values = _eval_terms(candidate, reference, source, resolved, judge_signals or {})
+    total = sum(weights[name] * value for name, value in values.items())
+    return total, values
+
+
+def compute_pre_gate_rewards(
+    candidates: Sequence[str],
+    references: Sequence[str],
+    sources: Optional[Sequence[str]] = None,
+    spec: Optional[Any] = None,
+    judge_signals: Optional[Mapping[str, Sequence[Optional[float]]]] = None,
+) -> List[Tuple[float, Dict[str, float]]]:
+    """批量版 `compute_pre_gate_reward`：一条候选一个 `(raw_total, 分项)`。"""
+    resolved = _as_spec(spec)
+    sources = sources or [None] * len(candidates)
+    judge_signals = dict(judge_signals or {})
+    n = len(candidates)
+    for name, values in judge_signals.items():
+        if len(values) != n:
+            raise ValueError(
+                f"裁判信号 {name!r} 的个数 {len(values)} 与候选数 {n} 不一致"
+            )
+    out: List[Tuple[float, Dict[str, float]]] = []
+    for i, (cand, ref, src) in enumerate(zip(candidates, references, sources)):
+        signals = {name: values[i] for name, values in judge_signals.items()}
+        out.append(compute_pre_gate_reward(cand, ref, src, resolved, signals))
+    return out
+
+
 def _compute_one(
     candidate: str,
     reference: str,
@@ -218,32 +310,10 @@ def _compute_one(
     # ---- 第二层：逐项求值 + 归一化加权求和 ----
     weights = spec.normalized_weights()
     total = 0.0
-    # 被组合项（quality_fbeta）吞并的项不再参与独立加权和
-    for term in spec.active_terms:
-        ts = term.spec
-        if ts.source == "rule":
-            value = compute_rule_term(
-                ts.name, candidate, reference, source, rouge_mode=spec.rouge_mode
-            )
-        elif ts.source == "composite":
-            value = compute_composite_term(ts.name, judge_signals, term.options)
-        else:
-            value = judge_signals.get(ts.signal)
-            if value is None:
-                raise ValueError(
-                    f"reward term {ts.name!r} 需要裁判信号 {ts.signal!r}，但收到 None。\n"
-                    "  检查 semantic.backend=fact 的裁判是否接上、以及组内补缺是否生效。"
-                )
-            value = float(value)
-            # 量纲护栏：judge 信号必须是 [0,1]，接成 0-100 会把其它项压成噪声。
-            if not 0.0 <= value <= 1.0 + 1e-6:
-                raise ValueError(
-                    f"裁判信号 {ts.signal!r} 的值 {value} 不在 [0,1]。"
-                    "六要素 Judge 的 weighted_reward 本来就是 [0,1]，不做量纲换算。"
-                )
-        bd.values[ts.name] = value
-        total += weights[ts.name] * value
-
+    values = _eval_terms(candidate, reference, source, spec, judge_signals)
+    for name, value in values.items():
+        bd.values[name] = value
+        total += weights[name] * value
     bd.total = total
     return total, bd
 

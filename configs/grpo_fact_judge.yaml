@@ -100,6 +100,31 @@ rl:
     enabled: false
     slack: 0.05
 
+  # ---- SwanLab 监控（见 src/sfzy/rl/monitor.py）----
+  # 全部指标只从训练已产生的数据派生，不额外调用裁判、不重新生成摘要。
+  monitor:
+    log_interval: 1                 # 基础训练指标：每个优化步
+    reward_log_interval: 10         # Reward 分项 / 六要素 / Gate：每 10 步
+    relation_log_interval: 20       # 相关性 / 分项消融：每 20 步
+    entropy_log_interval: 20        # 策略熵（同一次前向，低频）
+    lora_update_log_interval: 20    # LoRA 更新范数（低频）
+    correlation_window: 512         # 跨步相关性窗口（样本数）
+    near_zero_std_eps: 1.0e-6       # "近零方差组"阈值
+    near_upper_gate_margin: 0.1     # 距长度比上界多近算"接近上界"
+    ee_low_threshold: 0.5           # 表达效率低分阈值（∈[0,1]）
+    ee_high_threshold: 0.75         # 表达效率高分阈值（∈[0,1]）
+    repetition_ngram: 3             # 重复 n-gram 的 n
+    relation_enabled: true
+    # 固定验证集（可选）：项目没有内置验证流程时保持 enabled=false。
+    eval:
+      enabled: false
+      data_file: null
+      every_n_steps: 100
+      max_samples: 100
+      max_new_tokens: 384
+      max_length: 2048
+      baseline: {}
+
 semantic:
   backend: fact
   model: /root/autodl-tmp/models/Qwen2.5-7B-Instruct   # 换成你机器上的路径

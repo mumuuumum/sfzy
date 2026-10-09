@@ -28,6 +28,8 @@ GRPO 的采样量是 SFT 的 G 倍（G=8），不批处理根本跑不完。
 
 from __future__ import annotations
 
+import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -39,13 +41,19 @@ from sfzy.data.prompts import build_messages
 from sfzy.models.chat_template import encode_prompt
 from sfzy.rl.dpo import sequence_logprob
 from sfzy.rl.grpo import compute_advantages, group_mask, grpo_loss, kl_penalty
+from sfzy.rl.grpo import group_advantages
+from sfzy.rl.monitor import GRPOMonitor, MonitorBatch, MonitorConfig
+from sfzy.rl.monitor import eval_metrics
 from sfzy.rl.reward import (
     compute_rewards,
+    compute_pre_gate_rewards,
     summarize_gate_reasons,
 )
+from sfzy.rl.reward import RESULT_MARKERS
 from sfzy.rl.reward_spec import RewardSpec
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sfzy.sft.infer import generate_batch
+from sfzy.eval.rouge import score_corpus
 from sfzy.utils.logging import get_logger
 from sfzy.utils.tracking import group_metrics
 
@@ -148,6 +156,17 @@ class GRPOTrainer:
         self.optimizer = torch.optim.AdamW(trainable, lr=rl.get("learning_rate", 1e-5))
         self.device = next(model.parameters()).device
         self.state = RLState()
+
+        # ---- 监控层（只读派生，不参与任何训练计算）----
+        enabled = {t.name for t in self.reward_spec.enabled_terms}
+        self.monitor = GRPOMonitor(
+            MonitorConfig.from_config(rl.get("monitor")),
+            fact_enabled="fact_consistency" in enabled,
+            coverage_enabled="element_coverage" in enabled,
+            ee_enabled="expression_efficiency" in enabled,
+        )
+        # 本步要上报给 tracker 的**完整分组指标**（与 history 里的扁平键分开）。
+        self._last_monitor_metrics: Dict[str, float] = {}
 
     # ------------------------------------------------------------------
     def score_semantic(
@@ -323,6 +342,7 @@ class GRPOTrainer:
         pad_id = self.tokenizer.pad_token_id
         sequences = []
         prompt_lens = []
+        response_token_counts = []
         for i, (messages, _) in enumerate(zip(messages_list, prompts)):
             prompt_ids = encode_prompt(self.tokenizer, messages, add_generation_prompt=True)
             if len(prompt_ids) > self.max_length:
@@ -330,6 +350,8 @@ class GRPOTrainer:
             for j in range(self.group_size):
                 text = responses[i * self.group_size + j]
                 gen_ids = self.tokenizer(text, add_special_tokens=False).input_ids
+                # 监控用：记录**截断前**的生成 token 数，用于判断是否被 max_new_tokens 截断。
+                response_token_counts.append(min(len(gen_ids), self.max_new_tokens))
                 gen_ids = gen_ids[: self.max_new_tokens] + [self.tokenizer.eos_token_id]
                 sequences.append(prompt_ids + gen_ids)
                 prompt_lens.append(len(prompt_ids))
@@ -347,11 +369,15 @@ class GRPOTrainer:
             "responses": responses,
             "prompt_index": torch.arange(len(prompts)).repeat_interleave(self.group_size),
             "prompt_lens": prompt_lens,
+            "response_token_counts": response_token_counts,
         }
 
     # ------------------------------------------------------------------
     def step(self, prompts: List[Dict[str, Any]]) -> Dict[str, float]:
         """一个优化步：rollout → 打分 → advantage → 反向。"""
+        log_step = self.state.step + 1          # 实际 optimizer global_step
+        want_entropy = self.monitor.entropy_due(log_step)
+        want_lora = self.monitor.lora_due(log_step)
         batch = self.rollout(prompts)
 
         # ---- 打分 ----
@@ -359,7 +385,15 @@ class GRPOTrainer:
         for i in batch["prompt_index"].tolist():
             refs.append(prompts[i]["summary"])
             sources.append(prompts[i]["source"])
-        signals = self.score_semantic(batch["responses"], refs, sources)
+        # `signals_raw` 是裁判的**原始**输出（缺失处为 None），只喂给监控；
+        # `signals` 是补缺后的，喂给奖励（与改动前完全一致）。
+        signals_raw = self.score_semantic(batch["responses"], refs, sources)
+        judge_results: List[Any] = []
+        if signals_raw is not None:
+            get_results = getattr(self.scorer, "aligned_results", None)
+            if callable(get_results):
+                judge_results = list(get_results())
+        signals = signals_raw
         judge_missing = 0.0
         if signals is not None:
             signals, judge_missing = self.fill_semantic_gaps(signals, self.group_size)
@@ -367,6 +401,16 @@ class GRPOTrainer:
             batch["responses"], refs, sources,
             spec=self.reward_spec, judge_signals=signals,
         )
+        # 门控前奖励 / 分项得分（仅监控；不改变上面 `breakdowns` 的任何数值）
+        pre_gate = compute_pre_gate_rewards(
+            batch["responses"], refs, sources,
+            spec=self.reward_spec, judge_signals=signals,
+        )
+        pre_gate_rewards = [float(total) for total, _ in pre_gate]
+        term_values: Dict[str, List[float]] = {
+            term.name: [float(values.get(term.name, 0.0)) for _, values in pre_gate]
+            for term in self.reward_spec.active_terms
+        }
         # ★ 奖励/长度/基线必须建在**模型所在的设备**上。
         # 默认的 torch.tensor([...]) 建在 CPU；后续 advantages 也就留在 CPU，
         # 而 logprobs 在 GPU —— grpo_loss 里 `ratio * advantages` 会直接报
@@ -429,16 +473,28 @@ class GRPOTrainer:
 
         # ---- 策略 logprob（带梯度）----
         self.optimizer.zero_grad(set_to_none=True)
-        logprobs = sequence_logprob(
-            self.model, batch["input_ids"], batch["labels"],
-            micro_batch=self.logprob_micro_batch,
-        )
-        loss, clipped_frac = grpo_loss(
+        # 监控用的策略熵在**同一次前向**里算（不额外跑模型）；只在低频步开启。
+        entropy_values: Optional[List[float]] = None
+        if want_entropy:
+            logprobs, entropy_tensor = sequence_logprob(
+                self.model, batch["input_ids"], batch["labels"],
+                micro_batch=self.logprob_micro_batch, return_entropy=True,
+            )
+            entropy_values = [float(x) for x in entropy_tensor.detach().reshape(-1).tolist()]
+        else:
+            logprobs = sequence_logprob(
+                self.model, batch["input_ids"], batch["labels"],
+                micro_batch=self.logprob_micro_batch,
+            )
+        policy_loss, clipped_frac = grpo_loss(
             logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
         )
+        loss = policy_loss
 
         # ---- KL 惩罚（可选）----
         kl_value = 0.0
+        kl_estimate_value: Optional[float] = None
+        kl_penalty_value: Optional[float] = None
         if self.kl_coef > 0:
             if self.reference_model is not None:
                 ref_model = self.reference_model
@@ -458,6 +514,25 @@ class GRPOTrainer:
                 kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
                 loss = loss + kl_term
                 kl_value = float(kl_term.detach())
+                # k3 无偏估计 = 加权惩罚 / 系数；两者分开记录，避免混淆。
+                kl_estimate_value = kl_value / self.kl_coef
+                kl_penalty_value = kl_value
+
+        # 监控用：比值分布（old/current 在同一参数状态、同一次更新前算，应接近 1）
+        ratio_values = [
+            float(x) for x in torch.exp(logprobs.detach() - old_logprobs).reshape(-1).tolist()
+        ]
+
+        # 监控用：LoRA 更新幅度（低频）。先快照，再在 optimizer.step() 后比差。
+        lora_before: Optional[Dict[str, torch.Tensor]] = None
+        if want_lora:
+            snapshot = {
+                name: param.detach().clone()
+                for name, param in self.model.named_parameters()
+                if param.requires_grad and "lora_" in name
+            }
+            # 没有 LoRA 参数时保持 None（不适用），而不是记一个 0。
+            lora_before = snapshot or None
 
         loss.backward()
         # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
@@ -466,7 +541,19 @@ class GRPOTrainer:
         grad_norm = torch.nn.utils.clip_grad_norm_(
             [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
         )
+        grad_norm_preclip = float(grad_norm)
+        grad_norm_postclip = min(grad_norm_preclip, float(self.max_grad_norm))
+        clip_applied = 1.0 if grad_norm_preclip > float(self.max_grad_norm) else 0.0
         self.optimizer.step()
+
+        lora_update_norm: Optional[float] = None
+        if lora_before is not None:
+            sq = 0.0
+            for name, param in self.model.named_parameters():
+                if name in lora_before:
+                    delta = (param.detach() - lora_before[name]).float()
+                    sq += float((delta * delta).sum())
+            lora_update_norm = float(sq ** 0.5)
 
         gate_stats = summarize_gate_reasons(breakdowns)
         metrics = {
@@ -509,6 +596,64 @@ class GRPOTrainer:
         # **不需要 trainer 认识六要素**，耦合面就一个方法名。
         if hasattr(self.scorer, "summarize_last"):
             metrics.update(self.scorer.summarize_last())
+
+        # ---- 监控层：把本步已产生的数据摊平成 SwanLab 指标 ----
+        gate_cfg = self.reward_spec.gate.cfg if self.reward_spec.gate.enabled else {}
+        upper_ratio = None
+        if self.reward_spec.gate.enabled:
+            rng = gate_cfg.get("length_ratio_range", [0.5, 1.5])
+            if rng and len(rng) >= 2:
+                upper_ratio = float(rng[1])
+        flat_lengths = lengths.reshape(-1).clamp(min=1)
+        if self.length_mode == "none":
+            norm_factors = [1.0] * flat_lengths.numel()
+        elif self.length_mode == "mean":
+            norm_factors = [float(x) for x in flat_lengths.tolist()]
+        else:
+            norm_factors = [float(math.sqrt(x)) for x in flat_lengths.tolist()]
+        raw_adv = group_advantages(rewards).reshape(-1)
+        monitor_batch = MonitorBatch(
+            step=log_step,
+            group_size=self.group_size,
+            responses=list(batch["responses"]),
+            references=list(refs),
+            final_rewards=[float(b.total) for b in breakdowns],
+            pre_gate_rewards=pre_gate_rewards,
+            gate_flags=[bool(b.gated) for b in breakdowns],
+            gate_reasons=[str(b.gate_reason or "") for b in breakdowns],
+            term_values=term_values,
+            term_weights=self.reward_spec.normalized_weights(),
+            raw_signals=dict(signals_raw or {}),
+            judge_results=judge_results,
+            advantages_raw=[float(x) for x in raw_adv.tolist()],
+            advantages_effective=[float(x) for x in advantages.reshape(-1).tolist()],
+            kept_mask=[bool(x) for x in keep.tolist()],
+            output_lengths=[int(x) for x in lengths.reshape(-1).tolist()],
+            token_lengths=list(batch["response_token_counts"]),
+            ratios=ratio_values,
+            normalization_factors=norm_factors,
+            length_norm_mode=self.length_mode,
+            clip_frac=float(clipped_frac),
+            policy_loss=float(policy_loss.detach()),
+            total_loss=float(loss.detach()),
+            grad_norm_preclip=grad_norm_preclip,
+            grad_norm_postclip=grad_norm_postclip,
+            clip_applied=clip_applied,
+            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+            clip_ratio=float(self.clip_ratio),
+            fact_gate_enabled=self.reward_spec.fact_element_gate_enabled,
+            fact_gate_min_raw=self.reward_spec.fact_element_min_raw,
+            upper_length_ratio=upper_ratio,
+            result_markers=tuple(gate_cfg.get("require_result_marker") and RESULT_MARKERS or ()),
+            forbidden_prefixes=tuple(gate_cfg.get("forbidden_prefixes", [])),
+            max_new_tokens=self.max_new_tokens,
+            entropy=entropy_values,
+            lora_update_norm=lora_update_norm,
+            kl_estimate=kl_estimate_value,
+            kl_penalty=kl_penalty_value,
+        )
+        self._last_monitor_metrics = self.monitor.observe(monitor_batch)
+        metrics.update(self._last_monitor_metrics)
         return metrics
 
     # ------------------------------------------------------------------
@@ -519,6 +664,7 @@ class GRPOTrainer:
             # 便宜（一次前向），换来的是每步都能查表。
             self.prepare_baseline(prompts)
         n_steps = len(prompts) // self.prompts_per_step
+        self.monitor.set_total_steps(max(1, n_steps))
         logger.info(
             "GRPO 开始: %d 个 prompt，每步 %d 个，共 %d 步，G=%d",
             len(prompts), self.prompts_per_step, n_steps, self.group_size,
@@ -528,13 +674,20 @@ class GRPOTrainer:
             metrics = self.step(chunk)
             self.state.step = step + 1
 
+            if self.is_main_process and self.monitor.eval_due(self.state.step):
+                eval_result = self._run_eval(self.state.step)
+                if eval_result:
+                    self._last_monitor_metrics.update(eval_result)
+
             if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
                 self.state.history.append({"step": self.state.step, **metrics})
                 self._log_step(self.state.step, n_steps, metrics)
                 if self.tracker is not None:
-                    # 上报名带 `/<分组>` 前缀（见 tracking.GRPO_METRICS），
-                    # 面板上按 reward/group/judge 分块；history 里仍是原始键名。
-                    self.tracker.log(group_metrics(metrics), self.state.step)
+                    # 只上报监控层产出的**完整分组指标**（`模块/指标`），
+                    # 避免与 history 里的扁平键重复成两条曲线。
+                    self.tracker.log(
+                        group_metrics(dict(self._last_monitor_metrics)), self.state.step
+                    )
 
             if self.is_main_process and self.state.step % self.save_every_n_steps == 0:
                 self.save()
@@ -588,6 +741,92 @@ class GRPOTrainer:
                 "  裁判有 %.0f%% 的组失败，最近一条：%s",
                 m["judge_missing"] * 100, str(errors[-1])[:300],
             )
+
+    # ------------------------------------------------------------------
+    def _load_eval_records(self) -> List[Dict[str, Any]]:
+        """读固定验证集（只读一次，之后缓存在内存）。"""
+        cached = getattr(self, "_eval_records", None)
+        if cached is not None:
+            return cached
+        spec = self.monitor.cfg.eval_data_file
+        path = Path(spec)
+        if not path.is_absolute():
+            root = Path(__file__).resolve().parents[3]
+            candidate = root / path
+            path = candidate if candidate.exists() else path
+        records: List[Dict[str, Any]] = []
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+        records = records[: self.monitor.cfg.eval_max_samples]
+        self._eval_records = records
+        return records
+
+    def _run_eval(self, step: int) -> Dict[str, float]:
+        """固定验证集评估（可选；默认关闭，不影响训练）。
+
+        - 固定数据、固定贪心解码、固定分词口径 → 各 checkpoint 可比；
+        - 复用已有的 `generate_batch` / `score_corpus` / `compute_rewards`；
+        - 生成阶段临时切 eval，结束后恢复原模式，不写梯度。
+        """
+        try:
+            records = self._load_eval_records()
+        except (OSError, ValueError) as exc:
+            logger.warning("验证集读取失败，跳过本次 eval：%s", exc)
+            return {}
+        if not records:
+            return {}
+        cf = self.monitor.cfg
+        prompt_style = self.cfg.path_("rl.prompt_style", "structured")
+        messages_list = [build_messages(r["source"], prompt_style) for r in records]
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                responses = generate_batch(
+                    self.model, self.tokenizer, messages_list,
+                    # 不超过训练生成长度，保证验证与训练同一解码预算。
+                    max_new_tokens=min(cf.eval_max_new_tokens, self.max_new_tokens),
+                    # 不超过训练用的 max_length：验证集 prompt 也必须按同一规则截断。
+                    max_length=min(cf.eval_max_length, self.max_length),
+                    do_sample=False,
+                    num_return_sequences=1,
+                )
+        finally:
+            if was_training:
+                self.model.train()
+        refs = [r["summary"] for r in records]
+        sources = [r["source"] for r in records]
+        preds = {str(r["id"]): resp for r, resp in zip(records, responses)}
+        ref_map = {str(r["id"]): r["summary"] for r in records}
+        try:
+            rouge = score_corpus(preds, ref_map, mode=self.reward_spec.rouge_mode)
+        except Exception as exc:  # noqa: BLE001 — 缺 id 等不该毁掉训练
+            logger.warning("验证集 ROUGE 计算失败，跳过：%s", exc)
+            rouge = None
+        signals_raw = self.score_semantic(responses, refs, sources)
+        if signals_raw is not None:
+            filled, _ = self.fill_semantic_gaps(signals_raw, group_size=1)
+        else:
+            filled = None
+        breakdowns = compute_rewards(
+            responses, refs, sources, spec=self.reward_spec, judge_signals=filled
+        )
+        length_ratios = [
+            len(c.strip()) / max(len(r.strip()), 1) for c, r in zip(responses, refs)
+        ]
+        metrics = eval_metrics(
+            rouge, length_ratios, dict(signals_raw or {}),
+            [float(b.total) for b in breakdowns], cf.eval_baseline,
+        )
+        if metrics:
+            logger.info("验证集 step %d: %s", step, {
+                k.split("/")[1]: round(v, 4) for k, v in metrics.items()
+                if k.split("/")[1] in ("rouge_l", "coverage_mean", "ee_mean", "fact_mean")
+            })
+        return metrics
 
     # ------------------------------------------------------------------
     def save(self, tag: str = "last") -> Path:

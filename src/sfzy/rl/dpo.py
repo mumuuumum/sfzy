@@ -46,7 +46,8 @@ def sequence_logprob(
     attention_mask: Optional[torch.Tensor] = None,
     shift: bool = True,
     micro_batch: Optional[int] = None,
-) -> torch.Tensor:
+    return_entropy: bool = False,
+):
     """算每条序列上**答案部分**的对数概率之和，返回形状 (B,)。
 
     GRPO 和 DPO 都要用这个函数：前者要 rollout 时的 old_logprobs，
@@ -78,6 +79,11 @@ def sequence_logprob(
     这样做**不改变数值**：logsumexp 只在最后一维（vocab）上做，每条序列的结果
     与同批的其它序列无关；拆开算再拼起来，和一次算是同一组数。
     `None`（默认）＝ 不切分，行为与之前完全一致。
+
+    `return_entropy=True` 时额外返回生成段的**逐序列平均策略熵**（形状 (B,)），
+    在**同一次前向**里从 logits 算，不重复跑模型。完整词表熵需要物化
+    `(B, L, V)` 的 fp32 概率，显存开销明显，所以默认关闭、只在需要时按低频开启
+    （配合 `micro_batch` 控制峰值）。开启与否不改变 logprob 的数值。
     """
     if micro_batch is not None and 0 < micro_batch < input_ids.shape[0]:
         parts = [
@@ -88,9 +94,15 @@ def sequence_logprob(
                 None if attention_mask is None else attention_mask[start:start + micro_batch],
                 shift=shift,
                 micro_batch=None,
+                return_entropy=return_entropy,
             )
             for start in range(0, input_ids.shape[0], micro_batch)
         ]
+        if return_entropy:
+            return (
+                torch.cat([p[0] for p in parts], dim=0),
+                torch.cat([p[1] for p in parts], dim=0),
+            )
         return torch.cat(parts, dim=0)
 
     outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -115,7 +127,18 @@ def sequence_logprob(
     log_z = torch.logsumexp(logits, dim=-1)
     token_logprobs = target_logits.float() - log_z.float()
 
-    return (token_logprobs * mask).sum(dim=-1)
+    logprob = (token_logprobs * mask).sum(dim=-1)
+    if not return_entropy:
+        return logprob
+
+    # 生成段逐 token 熵：-(Σ_v p_v · log p_v)。只有在这里才物化完整词表的 fp32
+    # 概率，因此把它放在按需分支里，并依赖 micro_batch 压低峰值。
+    log_probs_full = logits.float() - torch.logsumexp(logits.float(), dim=-1, keepdim=True)
+    probs = log_probs_full.exp()
+    token_entropy = -(probs * log_probs_full).sum(dim=-1)          # (B, L)
+    denom = mask.sum(dim=-1).clamp(min=1)
+    entropy = (token_entropy * mask).sum(dim=-1) / denom
+    return logprob, entropy
 
 
 @contextmanager

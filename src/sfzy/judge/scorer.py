@@ -65,6 +65,10 @@ class SixElementScorer:
         # 最近一次 score_batch 的逐条判定结果，供训练日志取统计量（需求第十二节）
         self.last_results: List[JudgeResult] = []
         self.last_errors: List[str] = []
+        # 监控用：与输入 items **一一对应**的判定结果（失败位置为 None）。
+        # `last_results` 是按 source 分组后的顺序，只有每组候选连续时位置才恰好
+        # 对齐；这里显式按原始下标摊回，保证监控取到的分数和候选文本一一对应。
+        self.last_item_results: List[Optional[JudgeResult]] = []
 
     def clear_cache(self) -> None:
         self.judge.clear_cache()
@@ -89,6 +93,7 @@ class SixElementScorer:
         signals: List[Dict[str, Optional[float]]] = [{} for _ in norm]
         self.last_results = []
         self.last_errors = []
+        self.last_item_results = [None] * len(norm)
 
         # 按 source 分组，但保持每组内的原始顺序 —— 分数要摊回原位置，
         # 顺序错了不报错，只是奖励悄悄错位。
@@ -123,7 +128,15 @@ class SixElementScorer:
                     for name, value in result.signals.items()
                 }
                 self.last_results.append(result)
+                self.last_item_results[i] = result
         return signals
+
+    def aligned_results(self) -> List[Optional[JudgeResult]]:
+        """最近一次 `score_batch_signals` 的逐条结果，按输入顺序对齐。
+
+        监控专用只读接口：失败（或整组失败）的位置是 `None`。不参与任何奖励计算。
+        """
+        return list(getattr(self, "last_item_results", []) or [])
 
     def score_batch_signals(
         self, items: Sequence[Dict[str, Any]]

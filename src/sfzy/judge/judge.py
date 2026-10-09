@@ -564,6 +564,8 @@ class FactConsistencyJudge:
                 signals["element_coverage"] = aggregate_coverage(
                     raw, list(ELEMENTS), self.coverage_weights
                 )
+                # 监控用：保留逐要素原始分（不参与评分/聚合）。
+                result.coverage_raw = {name: int(raw[name]) for name in ELEMENTS}
 
             if "information_necessity_precision" in self.tasks:
                 signals["information_necessity_precision"] = float(
@@ -572,6 +574,10 @@ class FactConsistencyJudge:
 
             if "expression_efficiency" in self.tasks:
                 signals["expression_efficiency"] = float(ee_details[ci]["ee"])
+                # 监控用：保留 EE 三个维度的原始 0-4 分（不参与评分/聚合）。
+                result.ee_dims = {
+                    name: int(ee_details[ci].get(name, 2)) for name in EE_DIMENSIONS
+                }
 
             result.signals = signals
             results.append(result)
