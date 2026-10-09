@@ -111,6 +111,10 @@ python scripts/generate_triples_vllm.py --config configs/sft_cloud.yaml \
 # B. 数据并行：两个进程各绑一张卡、各跑一个分片，最后按 id 合并
 CUDA_VISIBLE_DEVICES=0 python scripts/generate_triples_vllm.py ... --shard 0/2
 CUDA_VISIBLE_DEVICES=1 python scripts/generate_triples_vllm.py ... --shard 1/2
+
+# 分片产物拼起来（tools/merge_jsonl.py；--dedup 按 id 去重，默认纯拼接）
+python tools/merge_jsonl.py data/triples/sft_train_n4_shard0of2.jsonl \
+    data/triples/sft_train_n4_shard1of2.jsonl -o data/triples/sft_train_n4.jsonl
 ```
 
 6B 模型在单张 4090 上装得下，**数据并行（B）通常比 tensor parallel 更快**，
@@ -135,6 +139,19 @@ python scripts/generate_triples_vllm.py --config configs/sft_cloud.yaml \
   `tools/bench_metrics.py` 不用改就能继续用。
 * 默认输出路径会带 `_n{num}`（如 `sft_train_n4.jsonl`），不会覆盖单候选文件。
 * 想固定随机种子做可复现的多候选：`--seed`（默认 42）会传给 vLLM 引擎。
+
+### 只生成所选集合的前 N 条：`--limit N`
+
+`--limit N` 取所选集合的前 N 条。**集合就是 `--input` 指定的文件**（没给
+`--input` 时就是 `--split` 切分），按文件顺序截断，发生在分片（`--shard`）和
+断点续跑过滤**之前** —— 所以两个 shard 合起来正好覆盖这前 N 条。
+
+```bash
+# 给 RL prompt 池（已按事实个数降序）里信号最强的 200 条生成候选
+python scripts/generate_triples_vllm.py --config configs/sft_cloud.yaml \
+    --adapter outputs/sft_chatglm3/step_000336.pt \
+    --input data/splits/rl_prompts.jsonl --limit 200 --num 4 --temperature 0.7
+```
 
 ## 四、和 HF 版本的差异（写报告时要提）
 

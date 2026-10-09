@@ -562,7 +562,12 @@ def main() -> None:
                         help="直接指定输入 jsonl，覆盖 --split（如 data/splits/rl_prompts.jsonl）")
     parser.add_argument("--data-dir", default=None)
     parser.add_argument("--out", default=None, help="默认 data/triples/sft_{split}.jsonl")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="只生成所选集合的前 N 条。集合就是 --input 指定的文件，"
+                             "没给 --input 时就是 --split 切分；按文件顺序截断，发生在"
+                             "分片（--shard）和断点续跑过滤**之前**，所以两个分片合起来"
+                             "正好覆盖这前 N 条（如 rl_prompts.jsonl 已按事实个数降序，"
+                             "--limit 200 就是信号最强的 200 条）")
     parser.add_argument("--shard", default=None, metavar="I/N",
                         help="数据分片。多卡不想用 tensor parallel 时，用两个进程各跑一个分片，"
                              "各自用 CUDA_VISIBLE_DEVICES 绑不同的卡，产物再拼起来")

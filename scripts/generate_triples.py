@@ -121,7 +121,10 @@ def main() -> None:
     parser.add_argument("--data-dir", default=None,
                         help="覆盖数据目录：本地冒烟 data/processed，全量切分 data/splits")
     parser.add_argument("--out", default=None, help="默认 data/triples/sft_{split}.jsonl")
-    parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--limit", type=int, default=None,
+                        help="只生成所选集合的前 N 条。集合就是 --input 指定的文件，"
+                             "没给 --input 时就是 --split 切分；按文件顺序截断，发生在"
+                             "分片（--shard）和断点续跑过滤**之前**")
     parser.add_argument("--shard", default=None, metavar="I/N",
                         help="数据分片，形如 0/2 或 1/2。**多卡推理用这个，不要用 DDP** —— "
                              "推理没有梯度，DDP 的 all-reduce 无事可做，只会引入 NCCL "
