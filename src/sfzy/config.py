@@ -16,11 +16,52 @@
 from __future__ import annotations
 
 import copy
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import yaml
+
+
+# ---------------------------------------------------------------------------
+# YAML 1.1 的科学计数法缺口
+# ---------------------------------------------------------------------------
+# PyYAML 按 YAML 1.1 的浮点正则解析，**尾数必须带小数点**：
+#
+#     yaml.safe_load("3e-6")   → "3e-6"   （字符串！）
+#     yaml.safe_load("3.0e-6") → 3e-06    （float）
+#     yaml.safe_load("2e-4")   → "2e-4"   （字符串！）
+#
+# 这个字符串会一路穿过装配层（它看着像数字，没人会怀疑），直到 AdamW / 调度器
+# 构造时才炸，报的还是 `TypeError: '<=' not supported between instances of
+# 'float' and 'str'` —— 报错位置离原因很远，而这时 6B 模型已经加载完、裁判已经
+# 接上、prompt 池已经读完。所以**在读文件这一层就补正**。
+#
+# 正则只认"整串就是科学计数法"的形状（`3e-6` / `1E5` / `2.5e-3`），
+# `auto` / `nf4` / `bfloat16` / `data/splits/x.jsonl` 这些都不会被误转。
+_SCI_NOTATION_RE = re.compile(r"^[+-]?\d+(?:\.\d+)?[eE][+-]?\d+$")
+
+
+def coerce_yaml_scalar(value: Any) -> Any:
+    """把 YAML 1.1 漏掉的科学计数法字符串补成 float；其它值原样返回。"""
+    if isinstance(value, str) and _SCI_NOTATION_RE.match(value):
+        try:
+            return float(value)
+        except ValueError:  # 正则可匹配但 float() 仍失败（几乎不可能），保持原样
+            return value
+    return value
+
+
+def normalize_yaml_numbers(node: Any) -> Any:
+    """递归地对整份配置做 `coerce_yaml_scalar`（返回新结构，不改原对象）。"""
+    if isinstance(node, Mapping):
+        return {key: normalize_yaml_numbers(value) for key, value in node.items()}
+    if isinstance(node, list):
+        return [normalize_yaml_numbers(value) for value in node]
+    if isinstance(node, tuple):
+        return tuple(normalize_yaml_numbers(value) for value in node)
+    return coerce_yaml_scalar(node)
 
 
 class Config(dict):
@@ -86,6 +127,9 @@ def load_config(
         merged = deep_merge(merged, parent)
 
     merged = deep_merge(merged, raw)
+    # 读文件这一层就补上 YAML 1.1 的科学计数法缺口（见模块顶部的说明）：
+    # 不补的话 `learning_rate: 3e-6` 会以字符串的身份一路走到 optimizer 构造。
+    merged = normalize_yaml_numbers(merged)
     merged["_config_path"] = str(path)
     return Config(merged)
 

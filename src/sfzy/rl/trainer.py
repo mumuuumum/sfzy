@@ -63,6 +63,24 @@ from sfzy.utils.tracking import group_metrics
 logger = get_logger("grpo")
 
 
+def _as_learning_rate(value: Any) -> float:
+    """学习率必须是数字 —— 字符串这种最常见的来源见 config.py 顶部的 YAML 说明。
+
+    真实的报错现场是 `TypeError: '<=' not supported between instances of 'float'
+    and 'str'`，抛在 `torch.optim.AdamW.__init__` 里，而没有哪个词提示"去看 yaml"。
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"rl.learning_rate 必须是数字，收到 {value!r}（{type(value).__name__}）。\n"
+            "  最常见来源：YAML 里写 `learning_rate: 3e-6` —— YAML 1.1 会把**尾数不带"
+            "小数点**的科学计数法解析成字符串，它一路走到 AdamW 才炸。\n"
+            "  三种写法都行：① `3.0e-6`（带小数点）；② 命令行 "
+            "--override rl.learning_rate=3e-6；③ 从文件读入时 config.py 已自动补正，"
+            "所以只有**带引号的数字**（\"3e-6\"）才会落到这里。"
+        )
+    return float(value)
+
+
 @dataclass
 class RLState:
     step: int = 0
@@ -239,7 +257,9 @@ class GRPOTrainer:
                 )
 
         trainable = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(trainable, lr=rl.get("learning_rate", 1e-5))
+        self.optimizer = torch.optim.AdamW(
+            trainable, lr=_as_learning_rate(rl.get("learning_rate", 1e-5))
+        )
         self.device = next(model.parameters()).device
         self.state = RLState()
 

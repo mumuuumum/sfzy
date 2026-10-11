@@ -67,6 +67,56 @@ from sfzy.utils.tracking import (                         # noqa: E402
 logger = get_logger("train_grpo")
 
 
+# RL 里必须是数字的键。**高危**：科学计数法（`3e-6`）在 YAML 1.1 里是字符串，
+# 带引号的数字（`"3e-6"`）也是。config.py 读文件时已经补正前者，这里再兜一道 ——
+# 关键在**时机**：在加载 6B 模型之前拦下，而不是等 AdamW 构造时才报
+# `TypeError: '<=' not supported between instances of 'float' and 'str'`
+# （实测踩过：那次模型已经加载、裁判已接上、prompt 池已读完，白等十几分钟）。
+_RL_FLOAT_KEYS = (
+    "learning_rate", "kl_coef", "clip_ratio", "temperature", "top_p", "max_grad_norm",
+)
+# 同一类隐患的另一半：带引号的整数（`save_every_n_steps: "25"`）。它在
+# `state.step % save_every_n_steps` 里才会炸 —— 同样是"模型加载完之后"。
+# `logprob_micro_batch` / `limit_prompts` / `resume_from` 可以为 null，所以这里
+# 不列它们（None 一律跳过）。
+_RL_INT_KEYS = (
+    "group_size", "prompts_per_step", "max_length", "max_new_tokens",
+    "inner_iterations", "save_every_n_steps", "keep_last_n_checkpoints",
+    "log_every_n_steps",
+)
+
+
+def check_rl_numbers(rl_cfg) -> None:
+    bad = []
+    for key in _RL_FLOAT_KEYS:
+        value = rl_cfg.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            bad.append((key, value, "数字"))
+    for key in _RL_INT_KEYS:
+        value = rl_cfg.get(key)
+        if value is None:
+            continue
+        is_int = isinstance(value, int) and not isinstance(value, bool)
+        is_int_float = isinstance(value, float) and value.is_integer()
+        if not (is_int or is_int_float):
+            bad.append((key, value, "整数"))
+    if not bad:
+        return
+    lines = "\n".join(
+        f"    rl.{key} = {value!r}（{type(value).__name__}）—— 应该是{kind}"
+        for key, value, kind in bad
+    )
+    raise ValueError(
+        "配置里的数值字段类型不对：\n" + lines + "\n"
+        "  最常见来源：YAML 1.1 会把**尾数不带小数点**的科学计数法当字符串"
+        "（`3e-6`），带引号的数字（`\"3e-6\"`、`\"25\"`）也一样。\n"
+        "  改法：写成 `3.0e-6`（带小数点）、去掉引号，或用命令行 "
+        "--override rl.<键>=<值>（命令行那条路有 float() 兜底）。"
+    )
+
+
 def resolve(path) -> Path:
     path = Path(path)
     return path if path.is_absolute() else ROOT / path
@@ -123,6 +173,8 @@ def main() -> None:
     # 奖励规格尽早解析：配置写错（缺权重、缺内部权重、和不为 1）当场报错，
     # 不要等模型加载完、跑了半小时才发现。
     reward_spec = RewardSpec.from_config(rl_cfg.get("reward"))
+    # 数值字段同样尽早校验（见 check_rl_numbers 的说明）
+    check_rl_numbers(rl_cfg)
 
     local_rank = init_distributed()
     set_seed(cfg.get("seed", 42))

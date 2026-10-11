@@ -29,7 +29,7 @@ rl:
   output_dir: outputs/grpo_fact_coverage_ee_vGPU48
   prompt_style: structured
   prompt_file: data/splits/rl_prompts_full.jsonl
-  sft_adapter: outputs/sft_chatglm3/step_000336.pt   # 换成你机器上的路径
+  sft_adapter: /root/autodl-tmp/models/sft/step_000336.pt   # 换成你机器上的路径
   limit_prompts: null
 
   quantize: true
