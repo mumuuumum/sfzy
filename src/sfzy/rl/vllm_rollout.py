@@ -95,7 +95,11 @@ class VLLMRollout:
         # 同理：采样参数对象也允许注入（没装 vllm 的机器上测试用）
         self._sampling_params_factory = sampling_params_factory
         self._lora: Any = None
-        self.stats: Dict[str, float] = {"sync_calls": 0, "sync_seconds": 0.0, "generate_calls": 0}
+        self.stats: Dict[str, float] = {
+            "sync_calls": 0, "sync_seconds": 0.0,
+            "generate_calls": 0, "generate_seconds": 0.0,
+            "init_seconds": 0.0,
+        }
 
     # ------------------------------------------------------------------ 引擎
     def _build_engine(self) -> Any:
@@ -132,7 +136,12 @@ class VLLMRollout:
             self.base_model, self.dtype, self.quantization or "（无）",
             self.gpu_memory_utilization, self.max_model_len, self.lora_rank,
         )
+        start = time.perf_counter()
         self._engine = LLM(**kwargs)
+        # 引擎初始化是**一次性**开销（加载权重 + KV cache + CUDA graph 捕获），
+        # 实测 25~45 秒。必须单独计时：混进"生成耗时"里会让第一步看起来慢十倍。
+        self.stats["init_seconds"] += time.perf_counter() - start
+        logger.info("vLLM 引擎初始化完成：%.1fs（一次性开销）", self.stats["init_seconds"])
         return self._engine
 
     @property
@@ -218,12 +227,14 @@ class VLLMRollout:
             top_p=float(top_p),
             max_tokens=int(max_new_tokens),
         )
+        # ★ 先把引擎取出来（懒加载会在这里发生），再开始计时 —— 否则第一次的
+        #   初始化开销会被算进"生成耗时"（踩过：40.7s 里 40s 是初始化）。
+        engine = self.engine
         start = time.perf_counter()
-        outputs = self.engine.generate(
-            prompt_ids, sampling, lora_request=self._lora
-        )
+        outputs = engine.generate(prompt_ids, sampling, lora_request=self._lora)
         self.stats["generate_calls"] += 1
         elapsed = time.perf_counter() - start
+        self.stats["generate_seconds"] += elapsed
 
         texts: List[str] = []
         for out in outputs:

@@ -141,6 +141,7 @@ def main() -> None:
             top_p=float(rl.get("top_p", 0.95)),
         )
         gen_s = time.perf_counter() - t1
+        init_s = backend.stats.get("init_seconds", 0.0)
     except Exception as exc:  # noqa: BLE001 - 冒烟脚本的价值就在于把原因讲清楚
         import torch
         logger.error("vLLM rollout 冒烟失败：%s: %s", type(exc).__name__, exc)
@@ -174,12 +175,22 @@ def main() -> None:
     import torch
 
     peak = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
+    # 注意：vLLM 0.11 的引擎核心跑在**子进程**里（日志前缀 EngineCore_DP0），
+    # 父进程的 max_memory_allocated 看不到它 —— 所以还要看**整卡**用量。
+    whole_card = ""
+    if torch.cuda.is_available():
+        free, total = torch.cuda.mem_get_info()
+        whole_card = f"（整卡已用 {(total - free) / 1024**3:.1f} GiB / {total / 1024**3:.1f} GiB）"
     print("\n================ vLLM rollout 冒烟结果 ================")
     print(f"  条数        : {len(texts)}（期望 {group}）")
     print(f"  vLLM 量化   : {quantization or '（无，按 dtype 加载）'}")
+    print(f"  引擎初始化  : {init_s:.1f}s（一次性；加载权重 + KV cache + CUDA graph 捕获）")
     print(f"  策略同步    : {sync_s:.2f}s（导出 LoRA + 挂 LoRARequest）")
-    print(f"  生成 {args.max_new_tokens:>3d} token: {gen_s:.2f}s（{group} 条合计）")
-    print(f"  显存峰值    : {peak:.1f} GiB")
+    print(f"  生成 {args.max_new_tokens:>3d} token: {gen_s:.2f}s（{group} 条合计，"
+          f"约 {group * args.max_new_tokens / max(gen_s, 1e-6):.0f} tok/s）")
+    print(f"  本进程显存峰值: {peak:.1f} GiB {whole_card}")
+    print("  注：上一步的『生成 X s』已扣掉引擎初始化；训练时第一步会额外多出这"
+          f"{init_s:.0f}s（只付一次）。")
     print(f"  样例输出    : {texts[0][:120]!r}")
     print("  ✔ vLLM rollout 可用 —— 可以去跑 scripts/train_grpo.py 了")
 
