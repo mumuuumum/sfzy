@@ -130,11 +130,11 @@ rl:
     terms:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
-        enabled: true
+        enabled: false
         weight: 0.1
       element_coverage:
         enabled: true
-        weight: 0.45
+        weight: 0.5
         element_weights:
           case_type:          0.05
           plaintiff_claims:   0.15
@@ -153,7 +153,7 @@ rl:
       # 只要求非负、和 > 0（R_EE 自带按权重和归一）。
       expression_efficiency:
         enabled: true
-        weight: 0.45
+        weight: 0.5
         dimension_weights:
           semantic_redundancy: 0.2
           verbal_redundancy: 0.2
