@@ -658,6 +658,10 @@ class GRPOTrainer:
         # 分阶段计时（`SFZY_PROFILE=1`）。prof=None 时这些 with 都是空上下文，零开销。
         prof: Optional[Dict[str, float]] = {} if _PROFILE_ENABLED else None
         self._prof = prof
+        if prof is not None and torch.cuda.is_available():
+            # 每步重置峰值统计：这样 `_log_profile` 里的"本步峰值"就是**这一步**的
+            # 真实峰值（训练前向/反向通常最高），而不是"进程启动至今"的累计值。
+            torch.cuda.reset_peak_memory_stats()
         step_start = time.perf_counter()
         with _timed(prof, "rollout"):
             batch = self.rollout(prompts)
@@ -1032,7 +1036,13 @@ class GRPOTrainer:
         gen_median = sorted(gen)[len(gen) // 2] if gen else 0
         vram = ""
         if torch.cuda.is_available():
-            vram = f"，峰值显存 {torch.cuda.max_memory_allocated() / 1024**3:.1f}G"
+            # 本步峰值（step 开头 reset 过）+ 整卡当前用量（含 vLLM 引擎子进程）
+            vram = f"，本步本进程峰值 {torch.cuda.max_memory_allocated() / 1024**3:.1f}G"
+            try:
+                free, total = torch.cuda.mem_get_info()
+                vram += f"，整卡 {((total - free) / 1024**3):.1f}/{total / 1024**3:.1f}G 已用"
+            except Exception:  # noqa: BLE001 - 只是日志
+                pass
         ranked = " | ".join(f"{k} {v:.1f}s" for k, v in sorted(prof.items(), key=lambda x: -x[1]))
         logger.info(
             "[profile] step %d 总 %.1fs（N=%d，序列宽度 %d，生成长度 中位 %d/上限 %d%s）"
