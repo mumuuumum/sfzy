@@ -271,11 +271,16 @@ def test_补正不会误伤普通字符串(tmp_path):
 
 
 def test_真实配置的学习率是数字():
-    """回归：vGPU48 那份配置写的是 `learning_rate: 3e-6`，曾经在 AdamW 构造时
-    报 `TypeError: '<=' not supported between instances of 'float' and 'str'`。"""
+    """回归：vGPU48 那份配置曾写 `learning_rate: 3e-6`，在 AdamW 构造时报
+    `TypeError: '<=' not supported between instances of 'float' and 'str'`。
+
+    这里只断言"读进来是**数字**且量级合理"，不锁具体数值 —— 那份配置是实验用的，
+    学习率会随时被调（例如为了压 clip 比例从 3e-6 降到 1e-6），锁死数值会让测试
+    变成噪声。科学计数法本身的补正由上面的 `test_yaml里的科学计数法会被补成数字` 覆盖。
+    """
     cfg = load_config(ROOT / "configs" / "grpo_fact_coverage_vGPU48.yaml")
     assert isinstance(cfg.path_("rl.learning_rate"), float)
-    assert cfg.path_("rl.learning_rate") == pytest.approx(3e-6)
+    assert 1e-8 < cfg.path_("rl.learning_rate") < 1e-2
 
 
 def test_所有配置读进来后都不残留科学计数法字符串():

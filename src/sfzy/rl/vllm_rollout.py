@@ -66,6 +66,7 @@ class VLLMRollout:
         engine: Any = None,
         lora_request_factory: Any = None,
         sampling_params_factory: Any = None,
+        collect_logprobs: bool = True,
     ) -> None:
         self.base_model = str(base_model)
         self.tokenizer = tokenizer
@@ -94,7 +95,14 @@ class VLLMRollout:
         self._lora_request_factory = lora_request_factory
         # 同理：采样参数对象也允许注入（没装 vllm 的机器上测试用）
         self._sampling_params_factory = sampling_params_factory
+        # 让 vLLM 顺带返回**采样 token 的 logprob**：这样 old_logprobs 不用再跑一次
+        # 训练侧前向（每步省一次 N×L 的前向 ≈ 11% 的步时），而且它天然就是"采样那一刻"
+        # 的值，比事后重算更严格。
+        self.collect_logprobs = bool(collect_logprobs)
         self._lora: Any = None
+        # 最近一次生成的原生结果（token id / 文本 / logprob），供 trainer 直接用
+        self.last_token_ids: Optional[List[List[int]]] = None
+        self.last_logprobs: Optional[List[List[float]]] = None
         self.stats: Dict[str, float] = {
             "sync_calls": 0, "sync_seconds": 0.0,
             "generate_calls": 0, "generate_seconds": 0.0,
@@ -237,6 +245,8 @@ class VLLMRollout:
             temperature=float(temperature),
             top_p=float(top_p),
             max_tokens=int(max_new_tokens),
+            # logprobs=0 ⇒ 只返回**被采样到的那个 token** 的 logprob（正是我们要的）
+            logprobs=0 if self.collect_logprobs else None,
         )
         # ★ 先把引擎取出来（懒加载会在这里发生），再开始计时 —— 否则第一次的
         #   初始化开销会被算进"生成耗时"（踩过：40.7s 里 40s 是初始化）。
@@ -248,14 +258,40 @@ class VLLMRollout:
         self.stats["generate_seconds"] += elapsed
 
         texts: List[str] = []
+        token_ids: List[List[int]] = []
+        logprobs: List[List[float]] = []
+        complete = True
         for out in outputs:
             for item in out.outputs:
                 texts.append(str(item.text).strip())
+                ids = [int(t) for t in (getattr(item, "token_ids", None) or [])]
+                token_ids.append(ids)
+                # `item.logprobs` 是"每个位置一个 {token_id: Logprob}" 的列表
+                step_lp: List[float] = []
+                for entry in (getattr(item, "logprobs", None) or []):
+                    if not entry:
+                        step_lp.append(0.0)
+                        continue
+                    picked = entry.get(ids[len(step_lp)]) if len(ids) > len(step_lp) else None
+                    if picked is None:
+                        picked = max(entry.values(), key=lambda v: getattr(v, "logprob", -1e30))
+                    step_lp.append(float(getattr(picked, "logprob", 0.0)))
+                logprobs.append(step_lp)
+                if not ids or len(step_lp) != len(ids):
+                    complete = False
         expected = len(messages_list) * int(num_return_sequences)
         if len(texts) != expected:
             raise ValueError(
                 f"vLLM 返回 {len(texts)} 条，期望 {expected} 条（{len(messages_list)} 个 prompt × "
                 f"{num_return_sequences}）—— 数量对不上说明接口用错了，先别继续训练。"
+            )
+        # 只有在**每一条都完整**时才交给 trainer 用（否则它会回退到本地前向）
+        self.last_token_ids = token_ids if complete else None
+        self.last_logprobs = logprobs if complete else None
+        if self.collect_logprobs and not complete:
+            logger.warning(
+                "vLLM 没有为所有结果返回 token_ids+logprobs，本次回退到"
+                "『训练侧自己跑 old_logprobs』（多一次前向，但结果仍正确）。"
             )
         logger.info(
             "vLLM 生成完成：%d 个 prompt × %d 条，用时 %.1fs（%.2f 条/秒）",

@@ -547,7 +547,8 @@ def test_generation_config_默认值回填():
     model = _Model()
     assert ensure_generation_config_defaults(model) is True
     assert model.generation_config.max_length == 8192       # 取 seq_length
-    assert model.generation_config.use_cache is False        # 跟随 config
+    # use_cache 强制 True（生成必须有 KV cache），**不跟随** config.use_cache
+    assert model.generation_config.use_cache is True
     assert ensure_generation_config_defaults(model) is False, "已有值就不该再改"
 
     # max_length 优先取 config.max_length（存在时）
@@ -563,3 +564,25 @@ def test_generation_config_默认值回填():
     m2 = _Model2()
     ensure_generation_config_defaults(m2)
     assert m2.generation_config.max_length == 4096
+
+
+def test_生成时永远保留KV_cache_不跟随训练侧的use_cache():
+    """训练侧会故意把 `config.use_cache` 设成 False（不需要 cache）；
+    但生成必须用 cache，否则退化成每 token 重算前缀（慢几百倍且不报错）。"""
+    from sfzy.models.compat import ensure_generation_config_defaults
+
+    class _Gen:
+        max_length = None
+        use_cache = None
+
+    class _Cfg:
+        seq_length = 8192
+        use_cache = False          # ← 梯度检查点开着时的真实取值
+
+    class _Model:
+        config = _Cfg()
+        generation_config = _Gen()
+
+    model = _Model()
+    assert ensure_generation_config_defaults(model) is True
+    assert model.generation_config.use_cache is True, "生成必须保留 KV cache"

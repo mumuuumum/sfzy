@@ -36,7 +36,7 @@ rl:
 
   group_size: 4
   prompts_per_step: 2
-  max_length: 7168
+  max_length: 5000
   max_new_tokens: 496
   temperature: 0.9
   top_p: 0.95
@@ -57,7 +57,7 @@ rl:
   inner_iterations: 2
   kl_coef: 0.03
   length_norm: sqrt
-  learning_rate: 3e-6
+  learning_rate: 1e-6
   max_grad_norm: 1.0
 
   save_every_n_steps: 500
@@ -168,7 +168,7 @@ semantic:
     # 被截断。Model Studio 兼容模式用这个字段关掉思考（直接进请求体顶层）。
     extra_body:
       enable_thinking: false
-    concurrency: 16                            # 线程池并发（API 是 I/O 密集）
+    concurrency: 48                            # 线程池并发（API 是 I/O 密集）
     max_retries: 3
     timeout_s: 60
     max_logprobs: 20         

@@ -43,7 +43,7 @@ import torch
 
 from sfzy.config import Config
 from sfzy.data.prompts import build_messages
-from sfzy.models.chat_template import encode_prompt
+from sfzy.models.chat_template import decode, encode_prompt
 from sfzy.models.lora import lora_snapshot_scale, use_lora_weights
 from sfzy.rl.dpo import sequence_logprob
 from sfzy.rl.grpo import compute_advantages, group_mask, grpo_loss, kl_penalty
@@ -617,6 +617,24 @@ class GRPOTrainer:
                     self.model.train()
 
         pad_id = self.tokenizer.pad_token_id
+        # vLLM 后端如果带回了**原生 token id + logprob**，就直接用它们：
+        #   1. 省掉"解码成文本再重新分词"的往返（两边 tokenization 不一致时会静默偏掉）；
+        #   2. old_logprobs 直接用采样那一刻的 per-token logprob —— 省掉一次前向
+        #      （N=8、L≈3300 时约 8s/步 ≈ 11%），而且它天然就是"行为策略"的概率。
+        native_ids = getattr(self.rollout_backend, "last_token_ids", None)
+        native_lp = getattr(self.rollout_backend, "last_logprobs", None)
+        use_native = (
+            self.rollout_backend is not None
+            and isinstance(native_ids, list)
+            and len(native_ids) == len(responses)
+            and isinstance(native_lp, list)
+            and len(native_lp) == len(responses)
+        )
+        if use_native:
+            responses = [
+                decode(self.tokenizer, ids).strip() if ids else responses[k]
+                for k, ids in enumerate(native_ids)
+            ]
         sequences = []
         prompt_lens = []
         response_token_counts = []
@@ -625,11 +643,17 @@ class GRPOTrainer:
             if len(prompt_ids) > self.max_length:
                 prompt_ids = prompt_ids[-self.max_length:]
             for j in range(self.group_size):
-                text = responses[i * self.group_size + j]
-                gen_ids = self.tokenizer(text, add_special_tokens=False).input_ids
+                k = i * self.group_size + j
+                if use_native:
+                    # 原生 token id：不再重新分词，也**不额外补 eos**（补了会让
+                    # old_logprobs 的求和范围与 policy 前向的 labels 范围不一致）
+                    gen_ids = list(native_ids[k])[: self.max_new_tokens]
+                else:
+                    text = responses[k]
+                    gen_ids = self.tokenizer(text, add_special_tokens=False).input_ids
+                    gen_ids = gen_ids[: self.max_new_tokens] + [self.tokenizer.eos_token_id]
                 # 监控用：记录**截断前**的生成 token 数，用于判断是否被 max_new_tokens 截断。
                 response_token_counts.append(min(len(gen_ids), self.max_new_tokens))
-                gen_ids = gen_ids[: self.max_new_tokens] + [self.tokenizer.eos_token_id]
                 sequences.append(prompt_ids + gen_ids)
                 prompt_lens.append(len(prompt_ids))
 
@@ -640,14 +664,20 @@ class GRPOTrainer:
             input_ids[k, : len(seq)] = torch.tensor(seq)
             labels[k, plen:len(seq)] = torch.tensor(seq[plen:])
 
-        return {
+        batch = {
             "input_ids": input_ids.to(self.device),
             "labels": labels.to(self.device),
             "responses": responses,
             "prompt_index": torch.arange(len(prompts)).repeat_interleave(self.group_size),
             "prompt_lens": prompt_lens,
             "response_token_counts": response_token_counts,
+            "old_logprobs": None,
         }
+        if use_native:
+            # Σ logp（只累加生成段）—— 与 labels 的非 -100 位置**一一对应**
+            sums = [float(sum(lp[: len(native_ids[k])])) for k, lp in enumerate(native_lp)]
+            batch["old_logprobs"] = torch.tensor(sums, dtype=torch.float32, device=self.device)
+        return batch
 
     # ------------------------------------------------------------------
     def step(self, prompts: List[Dict[str, Any]]) -> Dict[str, float]:
@@ -760,11 +790,16 @@ class GRPOTrainer:
         # 它就是"采样那一刻的行为策略" π_θold，在整个内层循环里是常数 —— 也正因为
         # 如此，μ=1 时 ρ≡1（clip 不生效），μ>1 时第 2 次起 ρ≠1 才开始生效。
         with _timed(prof, "old_logprobs"):
-            with torch.no_grad():
-                old_logprobs = sequence_logprob(
-                    self.model, batch["input_ids"], batch["labels"],
-                    micro_batch=self.logprob_micro_batch,
-                ).detach()
+            if batch.get("old_logprobs") is not None:
+                # 后端（vLLM）已经给了采样那一刻的 per-token logprob：直接用，
+                # 不再跑这一趟前向（省 ~11% 步时，而且更严格）。这一段计时会接近 0。
+                old_logprobs = batch["old_logprobs"]
+            else:
+                with torch.no_grad():
+                    old_logprobs = sequence_logprob(
+                        self.model, batch["input_ids"], batch["labels"],
+                        micro_batch=self.logprob_micro_batch,
+                    ).detach()
 
         # 监控用：LoRA 更新幅度（低频）。在循环之前快照、循环之后比差 ——
         # 量到的是整步漂移（μ 次更新累积），这才是"这一步把策略推了多远"。

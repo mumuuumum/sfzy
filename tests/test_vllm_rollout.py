@@ -37,15 +37,33 @@ class FakeLoRARequest:
 
 
 class _Out:
-    def __init__(self, texts):
-        self.outputs = [type("O", (), {"text": t})() for t in texts]
+    def __init__(self, items):
+        self.outputs = list(items)
+
+
+def _item(text: str, *, with_logprobs: bool, seed: int = 0):
+    """造一条 CompletionOutput 形状的对象（text / token_ids / logprobs）。"""
+    o = type("O", (), {})()
+    o.text = text
+    if not with_logprobs:
+        o.token_ids = None
+        o.logprobs = None
+        return o
+    ids = [10 + seed % 5, 11 + seed % 5, 12 + seed % 5]
+    o.token_ids = ids
+    # 每个位置是 {token_id: Logprob}，只给被采样到的那个
+    o.logprobs = [
+        {tid: type("L", (), {"logprob": -(0.5 + 0.1 * k)})()} for k, tid in enumerate(ids)
+    ]
+    return o
 
 
 class FakeEngine:
     """记录每次 generate 的入参，并按 n 返回固定文本。"""
 
-    def __init__(self):
+    def __init__(self, with_logprobs: bool = False):
         self.calls = []
+        self.with_logprobs = with_logprobs
 
     def generate(self, prompts, sampling_params, lora_request=None):
         self.calls.append({
@@ -55,7 +73,10 @@ class FakeEngine:
         })
         n = int(sampling_params.kwargs["n"])
         return [
-            _Out([f"prompt{i}-cand{j}" for j in range(n)])
+            _Out([
+                _item(f"prompt{i}-cand{j}", with_logprobs=self.with_logprobs, seed=i * 10 + j)
+                for j in range(n)
+            ])
             for i in range(len(prompts))
         ]
 
@@ -176,24 +197,81 @@ def test_prompt编码与截断必须和hf路径一致(tmp_path):
 
 
 def test_采样参数与条数顺序(tmp_path):
-    backend = make_backend(tmp_path, h.FakeTokenizer())
+    # collect_logprobs=False：这条只测"采样参数与顺序"，不掺 logprob 路径
+    backend = make_backend(tmp_path, h.FakeTokenizer(), collect_logprobs=False)
     backend.sync_policy(h.lora_model(), 0)
     msgs = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]]
 
     texts = backend.generate(msgs, num_return_sequences=3, max_new_tokens=16,
                              max_length=64, temperature=0.9, top_p=0.95)
     call = backend.engine.calls[-1]
-    assert call["sampling"] == {"n": 3, "temperature": 0.9, "top_p": 0.95, "max_tokens": 16}
+    assert call["sampling"] == {
+        "n": 3, "temperature": 0.9, "top_p": 0.95, "max_tokens": 16, "logprobs": None,
+    }
     assert call["lora"] is not None
     # prompt 优先、组内连续 —— rollout() 按 responses[i*G + j] 取用
     assert texts == ["prompt0-cand0", "prompt0-cand1", "prompt0-cand2",
                      "prompt1-cand0", "prompt1-cand1", "prompt1-cand2"]
 
 
+def test_默认让vLLM返回采样logprob(tmp_path):
+    """默认 collect_logprobs=True：old_logprobs 可以直接用采样那一刻的值，省一次前向。"""
+    backend = make_backend(tmp_path, h.FakeTokenizer(),
+                           engine=FakeEngine(with_logprobs=True))
+    backend.sync_policy(h.lora_model(), 0)
+    backend.generate([[{"role": "user", "content": "a"}]], num_return_sequences=2,
+                     max_new_tokens=8, max_length=64)
+    assert backend.engine.calls[-1]["sampling"]["logprobs"] == 0
+    assert backend.last_token_ids is not None and backend.last_logprobs is not None
+    assert len(backend.last_token_ids[0]) == len(backend.last_logprobs[0]) == 3
+
+
+def test_带logprobs时old_logprobs直接用采样值并省掉一次前向(tmp_path, monkeypatch):
+    """这是这一步的收益来源：少跑一次 N×L 的前向（实测约 11% 步时）。"""
+    import sfzy.rl.trainer as trainer_mod
+
+    calls = {"n": 0}
+    real = trainer_mod.sequence_logprob
+
+    def counting(*args, **kwargs):
+        calls["n"] += 1
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_mod, "sequence_logprob", counting)
+
+    def run(with_logprobs: bool):
+        calls["n"] = 0
+        backend = make_backend(tmp_path, h.FakeTokenizer(),
+                               engine=FakeEngine(with_logprobs=with_logprobs),
+                               collect_logprobs=True)
+        torch.manual_seed(0)
+        trainer = h.GRPOTrainer(
+            model=h.lora_model(), tokenizer=h.FakeTokenizer(),
+            cfg=h.make_cfg(kl_coef=0.0, group_size=2, prompts_per_step=2, inner_iterations=2),
+            output_dir=str(tmp_path / f"lp{with_logprobs}"),
+            scorer=h.FactStubScorer(), rollout_backend=backend,
+        )
+        batch = trainer.rollout(h.make_prompts(2))
+        metrics = trainer.step(h.make_prompts(2))
+        return batch, metrics, calls["n"]
+
+    batch_on, _, calls_on = run(True)
+    batch_off, _, calls_off = run(False)
+
+    assert batch_on["old_logprobs"] is not None, "有 logprob 时该直接用采样值"
+    assert batch_off["old_logprobs"] is None, "没有 logprob 时该回退到本地前向"
+    assert calls_on == calls_off - 1, "省掉的正是 old_logprobs 那一次前向"
+    # 采样值就是"Σ 每 token logprob"，与 labels 的非 -100 位置一一对应
+    assert batch_on["old_logprobs"].shape[0] == 4
+    # 夹具给的每条 logprob 都是 [-0.5, -0.6, -0.7] → 和 = -1.8
+    assert torch.allclose(batch_on["old_logprobs"], torch.full((4,), -1.8), atol=1e-5)
+
+
 def test_返回条数不对时直接报错(tmp_path):
     class ShortEngine(FakeEngine):
         def generate(self, prompts, sampling_params, lora_request=None):
-            return [_Out(["只有一条"]) for _ in prompts]      # 少给了
+            # 少给了：每个 prompt 只回 1 条
+            return [_Out([_item("只有一条", with_logprobs=False)]) for _ in prompts]
 
     backend = make_backend(tmp_path, h.FakeTokenizer(), engine=ShortEngine())
     backend.sync_policy(h.lora_model(), 0)

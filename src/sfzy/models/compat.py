@@ -329,11 +329,13 @@ def ensure_generation_config_defaults(model: Any) -> bool:
             generation_config.max_length = int(fallback)
             changed = True
     if getattr(generation_config, "use_cache", None) is None:
-        config = getattr(model, "config", None)
-        # config.use_cache 在 5.x 上可能是 None（缺失），这时默认 True：
-        # 关掉 KV cache 会让生成退化成每 token 重算整个前缀（慢几百倍）。
-        cached = getattr(config, "use_cache", True)
-        generation_config.use_cache = True if cached is None else bool(cached)
+        # **生成永远要 KV cache**，所以这里强制 True，不跟随 `model.config.use_cache`。
+        # 原因：`load_model` 在开启梯度检查点时会故意把 `config.use_cache = False`
+        # （训练不需要 cache），如果这里跟着它走，ChatGLM3 的 `stream_generate`
+        # 就会拿到 use_cache=False → 退化成"每个 token 重算整个前缀"（慢几百倍），
+        # 而且**不会报错**。chatglm3-6b 自带的 generation_config.json 里恰好写了
+        # use_cache: true 所以没暴露，但换个模型/版本就会踩。
+        generation_config.use_cache = True
         changed = True
     return changed
 
