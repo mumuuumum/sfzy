@@ -74,12 +74,12 @@ rl:
   vllm:
     dtype: bfloat16            # 底座精度。bf16 最省心（约 12.4GB）；
                                # 显存不够就按文档转 AWQ 并把下面这行打开：
-    # quantization: awq        # ← 也填 bitsandbytes 可**就地验证**「bnb 4-bit + LoRA」
+    quantization: bitsandbytes        # ← 也填 bitsandbytes 可**就地验证**「bnb 4-bit + LoRA」
                                #   （官方未测试组合；能跑的话底座从 12.4GB 降到 ~3.5GB。
                                #    等价于：tools/check_vllm_rollout.py --quantization bitsandbytes）
     trust_remote_code: true    # ★ 必须 true：本地目录里有 configuration_chatglm.py，
                                #   vLLM 读 config 时要放行（模型前向仍走 vLLM 自己的实现）
-    gpu_memory_utilization: 0.30   # ★ 与训练同卡时必须压住：默认 0.9 会把训练挤爆
+    gpu_memory_utilization: 0.13   # ★ 与训练同卡时必须压住：默认 0.9 会把训练挤爆
     max_loras: 1               # 每步换一个 int_id，旧的按 LRU 淘汰
     # max_model_len: null      # 默认 = rl.max_length + rl.max_new_tokens + 8，且不超模型 seq_length
     # extra_llm_kwargs: {}     # 透传给 vllm.LLM（如 enforce_eager: true 省显存、换更稳的启动）

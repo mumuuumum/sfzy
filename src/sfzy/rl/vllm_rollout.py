@@ -251,6 +251,24 @@ class VLLMRollout:
             len(messages_list), num_return_sequences, elapsed,
             expected / max(elapsed, 1e-6),
         )
+        if self.stats["generate_calls"] == 1:
+            # 第一次生成后打一次**整卡**显存：vLLM 引擎跑在子进程里，训练进程的
+            # `torch.cuda.memory_allocated()` 看不到它 —— 调 gpu_memory_utilization
+            # 时必须看整卡，否则就是在猜。
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    free, total = torch.cuda.mem_get_info()
+                    logger.info(
+                        "显存：整卡 %.1f/%.1f GiB 已用（本进程 %.1f GiB；引擎在子进程，"
+                        "gpu_memory_utilization=%.2f 决定它占多少）",
+                        (total - free) / 1024**3, total / 1024**3,
+                        torch.cuda.memory_allocated() / 1024**3,
+                        self.gpu_memory_utilization,
+                    )
+            except Exception:  # noqa: BLE001 - 只是日志，失败不影响训练
+                pass
         return texts
 
     # ------------------------------------------------------------------ 收尾
