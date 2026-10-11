@@ -11,7 +11,18 @@ vLLM 自带 ChatGLM3 实现 + 连续批处理 + PagedAttention，是这条路的
 | vLLM | `0.11.2` | 支持 ChatGLM3；文档里有运行时动态 LoRA（`VLLM_ALLOW_RUNTIME_LORA_UPDATING` / `load_inplace`） |
 | torch | `==2.9.0` | vLLM 0.11.2 的 wheel METADATA 硬 pin，别手动改 |
 | transformers | `>=4.56.0,<5` | vLLM 0.11.2 自己的上限；**4.x 是仓库 compat 层的主场** |
-| 底座精度 | **bf16**（默认）或 AWQ | vLLM 的 LoRA 白名单只有 AWQ/GPTQ；bitsandbytes 底座 + LoRA 是未测试组合 |
+| 底座精度 | **训练与 vLLM 两侧都用 bf16**（见下面的实测结论） | vLLM 的 LoRA 白名单只有 AWQ/GPTQ；bitsandbytes 底座 + LoRA 是未测试组合；两侧精度不一致还会让 ratio 偏离 1 |
+
+### 实测结论（2026-10-11，单卡 4090-48G，ChatGLM3-6B + LoRA r=16）
+
+| 配置 | 每步耗时（N=8, L≈3300） | 训练进程峰值 | 问题 |
+|---|---|---|---|
+| 训练 4-bit(bnb) + vLLM bnb | **74 s** | 29.3 G | 慢；且 `old_logprobs`(vLLM/bnb) 与 `policy logprobs`(本地/bf16) 精度不一致 → 第 1 次内层迭代就开始裁剪 |
+| **训练 bf16 + vLLM bf16**（当前选择） | **≈33 s（1.8×）** | **24.1 G** | 无（显存也更省：bnb 去量化在反传时要物化 bf16 权重副本） |
+
+分项对比：`inner_backward 31.0→15.3s`、`inner_forward 16.6→6.8s`、`reference_logprobs 8.3→3.4s`。
+`gpu_memory_utilization` 也从 0.13 提到 **0.30**（bf16 底座 12.4GB 是大头）。
+整卡合计约 40/47.4 GiB。
 
 关于"ChatGLM3 挑 transformers 版本"：这个问题**已经解决**。仓库的 `models/compat.py`
 补齐了 5.x 删掉的两个生成辅助方法（`_get_logits_warper`、
@@ -79,6 +90,11 @@ PY
 换过去等于换了底座精度，"精度与 SFT 一致"这条要重新表述。所以**优先 bf16**。
 
 ### 3.1 顺便验证一下"bnb 4-bit 底座 + LoRA"（2 分钟，可能省 7GB）
+
+> **实测答案（2026-10-11）：能跑**（`quantization: bitsandbytes` + 动态 LoRA 在 vLLM 0.11.2 上成功生成），
+> 但**最终没有采用**：训练侧 4-bit 又慢又费显存（见上表），而"训练 bf16 + 采样 bnb"会让
+> `old_logprobs` 与 `policy logprobs` 来自两套数值实现 → ratio 在第 1 次内层迭代就偏离 1。
+> 两侧统一 bf16 更简单也更快。下面这段保留，供显存实在不够时参考。
 
 vLLM 0.11.2 的 LoRA 支持的底座类型是有源码清单的（`vllm/lora/layers/utils.py`）：
 未量化 Linear、compressed-tensors（`weight_packed`）、**GPTQ/AWQ**（`qweight`）、

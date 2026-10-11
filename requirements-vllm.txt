@@ -20,17 +20,20 @@
 #     python tools/check_vllm_rollout.py --config configs/grpo_fact_coverage_vGPU48.yaml
 # =====================================================================
 
-# ---- 训练侧（照旧）----
+# ---- 训练侧 ----
 transformers>=4.56.0,<5
 sentencepiece>=0.2.0        # ChatGLM3 的 tokenizer 依赖它
 accelerate>=1.10.0
 peft>=0.17.0                # 0.13 配 transformers 4.56 会缺接口
-bitsandbytes>=0.48.0        # 0.46 配 torch 2.9 有兼容问题
 datasets>=3.0
 jieba>=0.42
 pyyaml>=6.0
 pytest>=8.0
 swanlab>=0.9
+
+# bitsandbytes 现在**不需要**了：训练与 vLLM 两侧都用 bf16（实测比 4-bit 快 1.8×
+# 且峰值显存更低，见 docs/vllm_rollout.md）。只有想切回 4-bit 训练时再装：
+# bitsandbytes>=0.48.0        # 0.46 配 torch 2.9 有兼容问题
 
 # ---- rollout 引擎 ----
 vllm==0.11.2

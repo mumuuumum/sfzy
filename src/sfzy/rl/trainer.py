@@ -1074,8 +1074,13 @@ class GRPOTrainer:
             # 本步峰值（step 开头 reset 过）+ 整卡当前用量（含 vLLM 引擎子进程）
             vram = f"，本步本进程峰值 {torch.cuda.max_memory_allocated() / 1024**3:.1f}G"
             try:
-                free, total = torch.cuda.mem_get_info()
-                vram += f"，整卡 {((total - free) / 1024**3):.1f}/{total / 1024**3:.1f}G 已用"
+                # ★ 变量名不能叫 total：它是本函数的入参（本步秒数），被覆盖后
+                #   日志里的"总 X s"会打印成显存字节数（实测踩过：打印 50864390144.0s）。
+                free_b, total_b = torch.cuda.mem_get_info()
+                vram += (
+                    f"，整卡 {((total_b - free_b) / 1024**3):.1f}"
+                    f"/{total_b / 1024**3:.1f}G 已用"
+                )
             except Exception:  # noqa: BLE001 - 只是日志
                 pass
         ranked = " | ".join(f"{k} {v:.1f}s" for k, v in sorted(prof.items(), key=lambda x: -x[1]))
