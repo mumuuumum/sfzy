@@ -136,6 +136,17 @@ class VLLMRollout:
             self.base_model, self.dtype, self.quantization or "（无）",
             self.gpu_memory_utilization, self.max_model_len, self.lora_rank,
         )
+        if not self.quantization:
+            # 没指定量化 → vLLM 会按 dtype 加载**整个**底座（6B bf16 ≈ 12.4GB 显存），
+            # 而不是训练侧那种 bnb 4-bit（≈3.5GB）。这一步差出来的 ~9GB 会直接决定
+            # 能不能和训练同卡 —— 实测就有人把冒烟时用的 `--quantization bitsandbytes`
+            # 忘了写进配置，于是训练时 vLLM 悄悄吃了 15.5GB 并 OOM。
+            logger.warning(
+                "vLLM 未指定量化：会按 %s 加载完整底座（6B 约 12.4GB）+ KV cache。"
+                "与训练同卡时要么把 gpu_memory_utilization 提到 ~0.30，"
+                "要么改用 rl.vllm.quantization: bitsandbytes（约 3.5GB，已验证可用）。",
+                self.dtype,
+            )
         start = time.perf_counter()
         self._engine = LLM(**kwargs)
         # 引擎初始化是**一次性**开销（加载权重 + KV cache + CUDA graph 捕获），

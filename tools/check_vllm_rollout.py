@@ -60,9 +60,9 @@ def main() -> None:
     parser.add_argument(
         "--quantization", default=None,
         help="覆盖 rl.vllm.quantization。可选 bitsandbytes / awq / gptq / none。\n"
-             "★ 用 `--quantization bitsandbytes` 可以就地验证『bnb 4-bit 底座 + LoRA』这个\n"
-             "  官方未测试的组合到底能不能跑（vLLM 0.11.2 里它既没进支持清单、也没被禁止）；\n"
-             "  能跑的话底座显存从 12.4GB 降到约 3.5GB。跑不通就回到默认的 bf16。",
+             "★ **只影响本工具，不影响训练**：训练要在配置里写 rl.vllm.quantization，\n"
+             "  否则 vLLM 会按 dtype 加载完整底座（6B bf16 ≈ 12.4GB）而不是 bnb 4-bit（≈3.5GB）。\n"
+             "  （实测踩过：冒烟用 --quantization bitsandbytes 成功，训练忘了写进配置 → OOM。）",
     )
     args = parser.parse_args()
     print(f"[check_vllm_rollout r{TOOL_REVISION}] 支持参数: {TOOL_FLAGS}")
