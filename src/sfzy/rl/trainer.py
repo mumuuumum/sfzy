@@ -623,14 +623,17 @@ class GRPOTrainer:
         #      （N=8、L≈3300 时约 8s/步 ≈ 11%），而且它天然就是"行为策略"的概率。
         native_ids = getattr(self.rollout_backend, "last_token_ids", None)
         native_lp = getattr(self.rollout_backend, "last_logprobs", None)
-        use_native = (
+        use_native_ids = (
             self.rollout_backend is not None
             and isinstance(native_ids, list)
             and len(native_ids) == len(responses)
+        )
+        use_vllm_lp = (
+            use_native_ids
             and isinstance(native_lp, list)
             and len(native_lp) == len(responses)
         )
-        if use_native:
+        if use_native_ids:
             responses = [
                 decode(self.tokenizer, ids).strip() if ids else responses[k]
                 for k, ids in enumerate(native_ids)
@@ -644,7 +647,7 @@ class GRPOTrainer:
                 prompt_ids = prompt_ids[-self.max_length:]
             for j in range(self.group_size):
                 k = i * self.group_size + j
-                if use_native:
+                if use_native_ids:
                     # 原生 token id：不再重新分词，也**不额外补 eos**（补了会让
                     # old_logprobs 的求和范围与 policy 前向的 labels 范围不一致）
                     gen_ids = list(native_ids[k])[: self.max_new_tokens]
@@ -673,7 +676,7 @@ class GRPOTrainer:
             "response_token_counts": response_token_counts,
             "old_logprobs": None,
         }
-        if use_native:
+        if use_vllm_lp:
             # Σ logp（只累加生成段）—— 与 labels 的非 -100 位置**一一对应**
             sums = [float(sum(lp[: len(native_ids[k])])) for k, lp in enumerate(native_lp)]
             batch["old_logprobs"] = torch.tensor(sums, dtype=torch.float32, device=self.device)

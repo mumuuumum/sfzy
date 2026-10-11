@@ -41,16 +41,15 @@ class _Out:
         self.outputs = list(items)
 
 
-def _item(text: str, *, with_logprobs: bool, seed: int = 0):
+def _item(text: str, *, with_logprobs: bool, seed: int = 0, with_ids: bool = True):
     """造一条 CompletionOutput 形状的对象（text / token_ids / logprobs）。"""
     o = type("O", (), {})()
     o.text = text
+    ids = [10 + seed % 5, 11 + seed % 5, 12 + seed % 5]
+    o.token_ids = ids if with_ids else None
     if not with_logprobs:
-        o.token_ids = None
         o.logprobs = None
         return o
-    ids = [10 + seed % 5, 11 + seed % 5, 12 + seed % 5]
-    o.token_ids = ids
     # 每个位置是 {token_id: Logprob}，只给被采样到的那个
     o.logprobs = [
         {tid: type("L", (), {"logprob": -(0.5 + 0.1 * k)})()} for k, tid in enumerate(ids)
@@ -61,9 +60,10 @@ def _item(text: str, *, with_logprobs: bool, seed: int = 0):
 class FakeEngine:
     """记录每次 generate 的入参，并按 n 返回固定文本。"""
 
-    def __init__(self, with_logprobs: bool = False):
+    def __init__(self, with_logprobs: bool = False, with_ids: bool = True):
         self.calls = []
         self.with_logprobs = with_logprobs
+        self.with_ids = with_ids
 
     def generate(self, prompts, sampling_params, lora_request=None):
         self.calls.append({
@@ -74,7 +74,8 @@ class FakeEngine:
         n = int(sampling_params.kwargs["n"])
         return [
             _Out([
-                _item(f"prompt{i}-cand{j}", with_logprobs=self.with_logprobs, seed=i * 10 + j)
+                _item(f"prompt{i}-cand{j}", with_logprobs=self.with_logprobs,
+                      seed=i * 10 + j, with_ids=self.with_ids)
                 for j in range(n)
             ])
             for i in range(len(prompts))
@@ -214,9 +215,27 @@ def test_采样参数与条数顺序(tmp_path):
                      "prompt1-cand0", "prompt1-cand1", "prompt1-cand2"]
 
 
-def test_默认让vLLM返回采样logprob(tmp_path):
-    """默认 collect_logprobs=True：old_logprobs 可以直接用采样那一刻的值，省一次前向。"""
+def test_默认不要vLLM的logprob但保留tokenid(tmp_path):
+    """默认 collect_logprobs=False：
+
+    * 不向 vLLM 要 logprob（``SamplingParams.logprobs`` 为 None）；
+    * 但 token_ids 照常带回 —— 训练侧用它直通建序列，省掉 decode→re-encode；
+    * old_logprobs 由训练侧重算（见下一条测试的理由）。
+    """
     backend = make_backend(tmp_path, h.FakeTokenizer(),
+                           engine=FakeEngine(with_logprobs=True))
+    backend.sync_policy(h.lora_model(), 0)
+    backend.generate([[{"role": "user", "content": "a"}]], num_return_sequences=2,
+                     max_new_tokens=8, max_length=64)
+    assert backend.engine.calls[-1]["sampling"]["logprobs"] is None
+    assert backend.last_token_ids is not None, "token id 仍要带回"
+    assert backend.last_logprobs is None, "没要 logprob 就不该有"
+
+
+def test_可选的采样logprob路径(tmp_path):
+    """显式打开 use_sampling_logprobs 时才向 vLLM 要 logprob（省一次前向，
+    但会让第 1 次内层迭代的裁剪率从 0% 涨到 25~50% —— 见 docs/vllm_rollout.md）。"""
+    backend = make_backend(tmp_path, h.FakeTokenizer(), collect_logprobs=True,
                            engine=FakeEngine(with_logprobs=True))
     backend.sync_policy(h.lora_model(), 0)
     backend.generate([[{"role": "user", "content": "a"}]], num_return_sequences=2,
@@ -306,7 +325,8 @@ def test_trainer用vllm后端生成且批次结构与hf一致(tmp_path, monkeypa
             monkeypatch.setattr(trainer_mod, "generate_batch", lambda *a, **k: list(texts))
         return trainer.rollout(prompts)
 
-    backend = make_backend(tmp_path, tok)
+    # 这个假引擎不回 token id → vLLM 路径回退到"解码文本再分词"，与 HF 路径可比
+    backend = make_backend(tmp_path, tok, engine=FakeEngine(with_ids=False))
     got = run_with(backend)
     ref = run_with(None, fixed)
 

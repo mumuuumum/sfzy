@@ -43,6 +43,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from sfzy.config import load_config               # noqa: E402
 from sfzy.rl.reward import extract_facts     # noqa: E402
 from sfzy.utils.io import ensure_dir, write_jsonl  # noqa: E402
 
@@ -104,6 +105,14 @@ def main() -> None:
                         help="SFT 三元组 jsonl（含 id/output）。给了就把 SFT 输出挂到 "
                              "每个 prompt 的 sft_output 字段上，训练时用来做基线锚。"
                              "输入自带 output 时不需要再传")
+    parser.add_argument("--max-prompt-tokens", type=int, default=None,
+                        help="按**真实 tokenizer** 丢掉 prompt 超过这个 token 数的样本。\n"
+                             "  用途：给 GRPO 的 rl.max_length 设一个安全上限（训练侧显存 ∝ 序列宽度）。\n"
+                             "  用 `--prompt-style` 决定拼模板的方式，与训练严格一致。")
+    parser.add_argument("--model-config", default="configs/model_chatglm3_6b.yaml",
+                        help="提供 tokenizer 的模型配置（读它的 model.model_name_or_path）")
+    parser.add_argument("--prompt-style", default="structured",
+                        help="与 rl.prompt_style 一致（zeroshot/structured/rag）")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
@@ -134,6 +143,30 @@ def main() -> None:
 
     if args.shuffle:
         random.Random(args.seed).shuffle(selected)
+
+    # ---- 可选：按真实 tokenizer 丢掉超长 prompt（控制训练侧显存）----
+    if args.max_prompt_tokens:
+        import sys as _sys
+
+        _sys.path.insert(0, str(ROOT / "src"))
+        from sfzy.data.prompts import build_messages
+        from sfzy.models.chat_template import encode_prompt
+        from sfzy.models.loader import load_tokenizer
+
+        model_cfg = load_config(_resolve(args.model_config)).get("model", {})
+        tokenizer = load_tokenizer(model_cfg)
+        kept, dropped = [], 0
+        for r in selected:
+            # 必须用 **source（文书原文）** 拼模板，与训练时 rollout 的输入完全一致
+            messages = build_messages(r.get("source", ""), args.prompt_style)
+            n_tokens = len(encode_prompt(tokenizer, messages, add_generation_prompt=True))
+            if n_tokens > args.max_prompt_tokens:
+                dropped += 1
+            else:
+                kept.append(r)
+        print(f"\n按 prompt ≤ {args.max_prompt_tokens} token 过滤："
+              f"丢掉 {dropped} 条（{dropped / max(len(selected), 1):.1%}），剩 {len(kept)} 条")
+        selected = kept
 
     # ---- 挂上 SFT 输出（可选的基线锚要用）----
     by_id: dict = {}

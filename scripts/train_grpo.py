@@ -402,6 +402,9 @@ def main() -> None:
             # （本地目录里有 configuration_chatglm.py + auto_map），否则报
             # "contains custom code which must be executed ... pass trust_remote_code=True"
             trust_remote_code=bool(vcfg.get("trust_remote_code", True)),
+            # 默认 False：old_logprobs 由训练侧重算（vLLM 与 HF 两套实现差 > ±20% 带时，
+            # 直接被裁的样本梯度为 0 —— 实测第 1 次内层迭代裁剪率 0% → 25~50%）
+            collect_logprobs=bool(vcfg.get("use_sampling_logprobs", False)),
             extra_llm_kwargs=vcfg.get("extra_llm_kwargs"),
         )
         logger.info(

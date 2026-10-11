@@ -42,7 +42,15 @@ rl:
 
   group_size: 4
   prompts_per_step: 2
-  max_length: 5000
+  # ★ 3072：把训练序列宽度封顶在 3072+496≈3568。训练侧峰值 ∝ L（权重固定 +
+  #   检查点激活 + 反传要保留的 fp32 logits）：
+  #     L=3568 → 训练≈26.4G，加 vLLM 13.3G ≈ 41G ✔
+  #     L=4592（max_length 4096）→ ≈45G ✘   L=5496（5000）→ ≈49G ✘
+  #   你上一轮 max_length 设 5000，遇到 p90 以上的长文书就会 OOM。
+  #   代价：>3072 token 的 prompt 会截掉开头（约 7%）。想**零截断**就用
+  #   `tools/select_rl_prompts.py --max-prompt-tokens 3072` 生成过滤后的池子，
+  #   再把 prompt_file 指过去（那样只丢掉那 7%，其余一条不截）。
+  max_length: 3072
   max_new_tokens: 496
   temperature: 0.9
   top_p: 0.95
@@ -90,10 +98,10 @@ rl:
     dtype: bfloat16            # 与训练侧的 torch_dtype 保持一致
     trust_remote_code: true    # ★ 必须 true：本地目录里有 configuration_chatglm.py，
                                #   vLLM 读 config 时要放行（模型前向仍走 vLLM 自己的实现）
-    gpu_memory_utilization: 0.30   # bf16 底座：12.4 权重 + ~1.0 graph + ~1.6 KV ≈ 15 GB
+    gpu_memory_utilization: 0.28   # bf16 底座：12.4 权重 + ~1.0 graph + ~0.9 KV ≈ 14 GB
                                    # （0.30×47.4≈14.2GB，vLLM 上次实测可用）。
                                    # 报 "No available memory for the cache blocks" 就 +0.02；
-                                   # 若与训练抢显存（训练峰值约 24.7G），降到 0.28 也够。
+                                   # 0.28 是给训练侧留余量（峰值随 max_length 变化，现在约 26G）。
     max_loras: 1               # 每步换一个 int_id，旧的按 LRU 淘汰
     # max_model_len: null      # 默认 = rl.max_length + rl.max_new_tokens + 8，且不超模型 seq_length
     # extra_llm_kwargs: {}     # 透传给 vllm.LLM（如 enforce_eager: true 省显存、换更稳的启动）
