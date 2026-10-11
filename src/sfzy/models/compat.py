@@ -199,6 +199,145 @@ def patch_generation_private_attrs() -> bool:
     return patched_any
 
 
+def patch_logits_warper() -> bool:
+    """给 `GenerationMixin` 补回 `_get_logits_warper`（transformers 5.x 删了它）。
+
+    ChatGLM3 的 `stream_generate()` 是自己写的一套循环，中间会调
+
+        logits_warper = self._get_logits_warper(generation_config)
+
+    4.x 里这是 `GenerationMixin` 的方法；**5.x 把它删了**（warper 被并进
+    logits_processor 管线），于是远程代码必崩：
+
+        AttributeError: 'ChatGLMForConditionalGeneration' object has no
+        attribute '_get_logits_warper'
+
+    好消息是**那些 warper 类还在**（`TemperatureLogitsWarper` / `TopKLogitsWarper`
+    / `TopPLogitsWarper`），所以这里照 4.x 的语义重建一个入口就够了，
+    采样行为与 4.x 完全一致：
+
+        temperature → TopK → TopP   （顺序与 4.x 的 `_get_logits_warper` 相同）
+
+    4.x 上本来就有这个方法，函数直接返回 False、零副作用。
+    """
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except ImportError:  # pragma: no cover - transformers 一定装得上
+        return False
+    if hasattr(GenerationMixin, "_get_logits_warper"):
+        return False
+
+    def _get_logits_warper(self, generation_config, *args, **kwargs):
+        try:
+            from transformers.generation.logits_process import (
+                LogitsProcessorList,
+                TemperatureLogitsWarper,
+                TopKLogitsWarper,
+                TopPLogitsWarper,
+            )
+        except ImportError:  # 更老的版本里没有这些类也没关系
+            return []
+        warpers = LogitsProcessorList()
+        temperature = getattr(generation_config, "temperature", None)
+        if temperature is not None and temperature != 1.0:
+            warpers.append(TemperatureLogitsWarper(temperature))
+        top_k = getattr(generation_config, "top_k", None)
+        if top_k is not None and top_k != 0:
+            warpers.append(TopKLogitsWarper(top_k=top_k, min_tokens_to_keep=1))
+        top_p = getattr(generation_config, "top_p", None)
+        if top_p is not None and top_p < 1.0:
+            warpers.append(TopPLogitsWarper(top_p=top_p, min_tokens_to_keep=1))
+        return warpers
+
+    _get_logits_warper._sfzy_patched = True
+    GenerationMixin._get_logits_warper = _get_logits_warper
+    return True
+
+
+def patch_extract_past_from_model_output() -> bool:
+    """给 `GenerationMixin` 补回 `_extract_past_from_model_output`（5.x 删了它）。
+
+    ChatGLM3 的 `stream_generate()` 走的是它自己覆写的
+    `_update_model_kwargs_for_generation()`，而后者会调：
+
+        model_kwargs["past_key_values"] = self._extract_past_from_model_output(outputs)
+
+    5.x 上直接崩：
+
+        AttributeError: 'ChatGLMForConditionalGeneration' object has no
+        attribute '_extract_past_from_model_output'
+
+    这里照抄 4.40.2 的实现（依次找 `past_key_values` / `mems` /
+    `past_buckets_states` 三个键）。`standardize_cache_format` 那条 Bloom 专用
+    分支不搬 —— 本项目的 `ensure_legacy_cache` 已经强制走旧版缓存格式。
+
+    4.x 上本来就有这个方法，函数直接返回 False、零副作用。
+    """
+    try:
+        from transformers.generation.utils import GenerationMixin
+    except ImportError:  # pragma: no cover
+        return False
+    if hasattr(GenerationMixin, "_extract_past_from_model_output"):
+        return False
+
+    def _extract_past_from_model_output(self, outputs, *args, **kwargs):
+        for key in ("past_key_values", "mems", "past_buckets_states"):
+            if isinstance(outputs, (tuple, list)):
+                break
+            try:
+                if key in outputs:
+                    return outputs[key]
+            except TypeError:
+                break
+        # 元组形式（老模型的 forward 可能直接返回 (logits, past)）
+        if isinstance(outputs, (tuple, list)) and len(outputs) > 1:
+            return outputs[1]
+        return getattr(outputs, "past_key_values", None)
+
+    _extract_past_from_model_output._sfzy_patched = True
+    GenerationMixin._extract_past_from_model_output = _extract_past_from_model_output
+    return True
+
+
+def ensure_generation_config_defaults(model: Any) -> bool:
+    """把 4.x 时代"从 model config 继承来"的生成默认值补到 `generation_config` 上。
+
+    5.x 里 `GenerationConfig.from_model_config()` 不再把 `max_length` 带过来，
+    于是 ChatGLM3 的 `stream_generate()` 会走进这个分支：
+
+        if has_default_max_length and generation_config.max_new_tokens is None: ...
+        elif generation_config.max_new_tokens is not None:
+            generation_config.max_length = max_new_tokens + 输入长度
+            if not has_default_max_length:
+                logger.warn(f"...", UserWarning)     # ← 这里在 5.x 上直接抛
+
+    报错是 `TypeError: not all arguments converted during string formatting`
+    （transformers 的 `logger.warn` 约定变了），而且 `max_length` 默认值也会变成
+    只有"输入长度 + max_new_tokens"，与 4.x 的行为不一致。
+
+    所以这里补两件事：`max_length`（取 config.max_length / seq_length）与
+    `use_cache`。4.x 上它们本来就有值，函数返回 False、零副作用。
+    """
+    generation_config = getattr(model, "generation_config", None)
+    if generation_config is None:
+        return False
+    changed = False
+    if getattr(generation_config, "max_length", None) is None:
+        config = getattr(model, "config", None)
+        fallback = getattr(config, "max_length", None) or getattr(config, "seq_length", None)
+        if fallback:
+            generation_config.max_length = int(fallback)
+            changed = True
+    if getattr(generation_config, "use_cache", None) is None:
+        config = getattr(model, "config", None)
+        # config.use_cache 在 5.x 上可能是 None（缺失），这时默认 True：
+        # 关掉 KV cache 会让生成退化成每 token 重算整个前缀（慢几百倍）。
+        cached = getattr(config, "use_cache", True)
+        generation_config.use_cache = True if cached is None else bool(cached)
+        changed = True
+    return changed
+
+
 def patch_pretrained_config(config: Any, model_cfg: Optional[Dict[str, Any]] = None) -> None:
     """把新版 transformers 移走的 generation 属性回填到 config 上（就地修改）。
 
@@ -224,11 +363,23 @@ def patch_pretrained_config(config: Any, model_cfg: Optional[Dict[str, Any]] = N
     for field, value in GenerationConfig().to_dict().items():
         if field.startswith("_") or field in _SKIP_FIELDS:
             continue
-        if not hasattr(config, field):
-            setattr(config, field, value)
+        if hasattr(config, field):
+            continue
+        # ★ 5.x 起 GenerationConfig 里 `use_cache` / `temperature` 这类字段的默认值
+        #   变成了 None。照抄过去等于把"属性缺失"变成"属性是 None"，后者更难查：
+        #   读 `config.use_cache` 的地方拿到 None（falsy）会把 KV cache 静默关掉。
+        #   所以 None 一律跳过，需要默认值的字段在下面单独显式给。
+        if value is None:
+            continue
+        setattr(config, field, value)
 
     if not had_max_length and hasattr(config, "seq_length"):
         config.max_length = config.seq_length
+
+    # 旧模型（ChatGLM3）会直接读 config.use_cache 决定生成时要不要 KV cache；
+    # 5.x 的默认值是 None，缺失时必须给一个明确的 True，而不是留个 None。
+    if getattr(config, "use_cache", None) is None:
+        config.use_cache = True
 
     for field, value in ((model_cfg or {}).get("config_patches") or {}).items():
         if not hasattr(config, field):

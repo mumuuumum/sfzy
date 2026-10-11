@@ -34,7 +34,10 @@ from transformers import (
 )
 from sfzy.models.compat import (
     ensure_gradient_checkpointing,
+    ensure_generation_config_defaults,
     ensure_legacy_cache,
+    patch_extract_past_from_model_output,
+    patch_logits_warper,
     patch_generation_private_attrs,
     patch_pretrained_config,
     patch_tied_weights_keys,
@@ -218,6 +221,13 @@ def load_model(
     # generate() 才会设上的私有属性 _eos_token_tensor → AttributeError。
     # 补在类上，全局一次即可（幂等）。
     patch_generation_private_attrs()
+    # transformers 5.x 删了 GenerationMixin._get_logits_warper，而旧模型的生成循环
+    # 还在调它（4.x 上是空操作）。必须放在 from_pretrained **之前**：远程代码的类
+    # 是在加载时构造的，之后模型对象就查这张表了。
+    if patch_logits_warper():
+        logger.info("已为 GenerationMixin 补回 _get_logits_warper（transformers 5.x 删掉了它）")
+    if patch_extract_past_from_model_output():
+        logger.info("已为 GenerationMixin 补回 _extract_past_from_model_output（同上）")
 
     config = AutoConfig.from_pretrained(
         model_name,
@@ -308,6 +318,15 @@ def load_model(
     # 真的建 KV cache，白白吃显存，在 24GB 卡上可能就是 OOM 和不 OOM 的区别。
     if gradient_checkpointing and hasattr(model, "config"):
         model.config.use_cache = False
+
+    # 5.x 的 GenerationConfig 不再从 model config 继承 max_length/use_cache，
+    # 会让 ChatGLM3 的 stream_generate 走进一条会抛异常的告警分支（4.x 上方为真、没事）。
+    if ensure_generation_config_defaults(model):
+        logger.info(
+            "已回填 generation_config 默认值（max_length=%s, use_cache=%s）",
+            getattr(model.generation_config, "max_length", None),
+            getattr(model.generation_config, "use_cache", None),
+        )
 
     # ---- 旧版缓存路径 ----
     #

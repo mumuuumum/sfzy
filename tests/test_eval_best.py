@@ -51,10 +51,24 @@ def test_最后一个分位点必然落在最后一步():
         assert len(m.eval_schedule()) <= x
 
 
-def test_分位点多于总步数时自动去重():
-    m = _eval_only_monitor(quantile_points=10)
-    m.set_total_steps(3)
-    assert m.eval_schedule() == (1, 2, 3)
+def test_分位点不少于步数时退化成只在最后一步验证():
+    """短 run（冒烟测试）里，相邻分位点只差一步，中间那些没有信息量 ——
+    而每次验证都是 max_samples 条串行贪心生成（实测一次十几分钟）。
+    所以 x ≥ 步数时只在最后一步验一次，否则会变成"每一步都跑一次完整验证"。"""
+    for total in (1, 3, 8):
+        m = _eval_only_monitor(quantile_points=10)
+        m.set_total_steps(total)
+        assert m.eval_schedule() == (total,)
+
+    # 刚好相等也退化（x=4、4 步 → 只验最后一步，而不是每步都验）
+    m = _eval_only_monitor(quantile_points=4)
+    m.set_total_steps(4)
+    assert m.eval_schedule() == (4,)
+
+    # 分位点比步数少（正常长 run）时不受影响
+    m = _eval_only_monitor(quantile_points=4)
+    m.set_total_steps(1000)
+    assert m.eval_schedule() == (250, 500, 750, 1000)
 
 
 def test_不设分位点时仍按_every_n_steps_轮询():
@@ -173,3 +187,35 @@ def test_验证截断与训练用的_max_length_一致(tmp_path, monkeypatch):
     trainer.monitor.cfg.eval_max_length = 1024     # 显式给值：取 min(它, 训练值)
     trainer._run_eval(2)
     assert seen["max_length"] == 1024
+
+
+# ---------------------------------------------------------------- 分阶段计时
+
+def test_SFZY_PROFILE_只加计时不改训练结果(tmp_path, monkeypatch):
+    """`SFZY_PROFILE=1` 是排查"这一步为什么慢"用的：它必须**只读**。
+
+    开关打开时把各阶段耗时写进 `trainer._prof`（并打一行 [profile]），
+    关着时 `_prof is None`，两者 loss 必须逐位相同。
+    """
+    import sfzy.rl.trainer as trainer_mod
+
+    def run(enabled: bool):
+        monkeypatch.setattr(trainer_mod, "_PROFILE_ENABLED", enabled)
+        torch.manual_seed(0)
+        trainer = h.GRPOTrainer(
+            model=h.lora_model(), tokenizer=h.FakeTokenizer(),
+            cfg=h.make_cfg(kl_coef=0.0, inner_iterations=2),
+            output_dir=str(tmp_path), scorer=h.FactStubScorer(),
+        )
+        metrics = trainer.step(h.make_prompts())
+        return metrics["loss"], trainer._prof
+
+    loss_off, prof_off = run(False)
+    loss_on, prof_on = run(True)
+
+    assert prof_off is None
+    assert prof_on is not None
+    for key in ("rollout", "judge", "old_logprobs", "inner_forward", "inner_backward"):
+        assert key in prof_on, f"缺少阶段计时 {key}"
+    assert prof_on["inner_forward"] > 0.0
+    assert loss_on == pytest.approx(loss_off), "开了计时就不该改变训练结果"

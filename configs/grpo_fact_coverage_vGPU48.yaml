@@ -37,7 +37,7 @@ rl:
   group_size: 4
   prompts_per_step: 2
   max_length: 7168
-  max_new_tokens: 1023
+  max_new_tokens: 496
   temperature: 0.9
   top_p: 0.95
 
@@ -70,14 +70,14 @@ rl:
   # 综合分，以及各裁判信号；`best.pt` 只在综合分刷新时被覆盖。
   monitor:
     eval:
-      enabled: true
+      enabled: false
       data_file: data/splits/val.jsonl   # 1340 条，键 id/source/summary
       # ★ x：把总步数 n 等分成 x 段，在第 k/x 分位点各验一次（最后一点 = 最后一步）。
       #   你这份配置 n=10738、x=10 → 在第 1074/2148/3221/4295/5369/6443/7517/8590/9664/10738 步验证。
-      quantile_points: 10
+      quantile_points: 0
       # every_n_steps: 1000              # 旧的按步数触发；设了 quantile_points 就以它为准
       max_samples: 100                   # 每次只验前 100 条（案由分布与全量 1340 条接近）
-      max_new_tokens: 1023                # 贪心生成上限：选模型的口径必须固定
+      max_new_tokens: 496                # 贪心生成上限：选模型的口径必须固定
       max_length: null                   # null = 与训练同一个 rl.max_length（不要填更小的值）
       save_best: true                    # 刷新最好分就覆盖 best.pt（永不被 prune 清理）
       best_metric: rouge_total           # 官方口径 0.2*ROUGE-1 + 0.4*ROUGE-2 + 0.4*ROUGE-L

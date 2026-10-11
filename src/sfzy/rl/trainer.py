@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import torch
 
@@ -61,6 +64,32 @@ from sfzy.utils.logging import get_logger
 from sfzy.utils.tracking import group_metrics
 
 logger = get_logger("grpo")
+
+
+# 分阶段计时开关：`SFZY_PROFILE=1 python scripts/train_grpo.py ...`。
+# 只在需要回答"这一步到底慢在哪"时打开；关着时每步只多一次 `if` 判断。
+_PROFILE_ENABLED = os.environ.get("SFZY_PROFILE", "0") == "1"
+
+
+def _sync() -> None:
+    """计时前后都要同步：CUDA 是异步的，不同步量到的是"提交耗时"而不是"执行耗时"。"""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+@contextmanager
+def _timed(sink: Optional[Dict[str, float]], key: str) -> Iterator[None]:
+    """把一段耗时累加进 `sink[key]`；`sink is None`（未开 profiling）时零开销。"""
+    if sink is None:
+        yield
+        return
+    _sync()
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        _sync()
+        sink[key] = sink.get(key, 0.0) + (time.perf_counter() - start)
 
 
 def _as_learning_rate(value: Any) -> float:
@@ -182,6 +211,8 @@ class GRPOTrainer:
         self.log_every_n_steps = rl.get("log_every_n_steps", 1)
         self.reward_cfg = rl.get("reward", None)
         self.resume_from = rl.get("resume_from") or None
+        # `SFZY_PROFILE=1` 时，step() 会把本步各阶段耗时写进这里（默认 None）
+        self._prof: Optional[Dict[str, float]] = None
 
         # ---- SFT 基线锚：防止策略整体退化，见 grpo.group_mask ----
         anchor = rl.get("anchor") or {}
@@ -452,6 +483,7 @@ class GRPOTrainer:
         advantages: torch.Tensor,
         ref_logprobs: Optional[torch.Tensor],
         want_entropy: bool = False,
+        prof: Optional[Dict[str, float]] = None,
     ) -> Dict[str, Any]:
         """μ 循环的循环体：策略 logprob → GRPO loss(+KL) → 反传 → 裁剪 → 更新一步。
 
@@ -467,45 +499,51 @@ class GRPOTrainer:
         """
         self.optimizer.zero_grad(set_to_none=True)
 
-        # 监控用的策略熵在**同一次前向**里算（不额外跑模型）；只在低频步开启。
-        entropy_values: Optional[List[float]] = None
-        if want_entropy:
-            logprobs, entropy_tensor = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"],
-                micro_batch=self.logprob_micro_batch, return_entropy=True,
+        with _timed(prof, "inner_forward"):
+            # 监控用的策略熵在**同一次前向**里算（不额外跑模型）；只在低频步开启。
+            entropy_values: Optional[List[float]] = None
+            if want_entropy:
+                logprobs, entropy_tensor = sequence_logprob(
+                    self.model, batch["input_ids"], batch["labels"],
+                    micro_batch=self.logprob_micro_batch, return_entropy=True,
+                )
+                entropy_values = [
+                    float(x) for x in entropy_tensor.detach().reshape(-1).tolist()
+                ]
+            else:
+                logprobs = sequence_logprob(
+                    self.model, batch["input_ids"], batch["labels"],
+                    micro_batch=self.logprob_micro_batch,
+                )
+
+        with _timed(prof, "inner_loss"):
+            policy_loss, clipped_frac = grpo_loss(
+                logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
             )
-            entropy_values = [float(x) for x in entropy_tensor.detach().reshape(-1).tolist()]
-        else:
-            logprobs = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"],
-                micro_batch=self.logprob_micro_batch,
-            )
+            loss = policy_loss
 
-        policy_loss, clipped_frac = grpo_loss(
-            logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
-        )
-        loss = policy_loss
+            # KL 惩罚：参考 logprob 由调用方算好传进来（与策略参数无关，整步只算一次）。
+            kl_value = 0.0
+            if ref_logprobs is not None:
+                kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
+                loss = loss + kl_term
+                kl_value = float(kl_term.detach())
 
-        # KL 惩罚：参考 logprob 由调用方算好传进来（与策略参数无关，整步只算一次）。
-        kl_value = 0.0
-        if ref_logprobs is not None:
-            kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
-            loss = loss + kl_term
-            kl_value = float(kl_term.detach())
+            # 比值分布（μ>1 时它才是"漂移有多大"的真实读数：第 1 次恒为 1）
+            ratios = [
+                float(x)
+                for x in torch.exp(logprobs.detach() - old_logprobs).reshape(-1).tolist()
+            ]
 
-        # 比值分布（μ>1 时它才是"漂移有多大"的真实读数：第 1 次恒为 1）
-        ratios = [
-            float(x) for x in torch.exp(logprobs.detach() - old_logprobs).reshape(-1).tolist()
-        ]
-
-        loss.backward()
-        # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
-        # 单一信号：突然窜到几十说明这一步的 advantage 尺度失控（常见于
-        # 奖励被噪声污染、或被裁剪的 ratio 占了大头）。
-        grad_norm_preclip = float(torch.nn.utils.clip_grad_norm_(
-            [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
-        ))
-        self.optimizer.step()
+        with _timed(prof, "inner_backward"):
+            loss.backward()
+            # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
+            # 单一信号：突然窜到几十说明这一步的 advantage 尺度失控（常见于
+            # 奖励被噪声污染、或被裁剪的 ratio 占了大头）。
+            grad_norm_preclip = float(torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
+            ))
+            self.optimizer.step()
 
         return {
             "loss": float(loss.detach()),
@@ -599,7 +637,12 @@ class GRPOTrainer:
         log_step = self.state.step + 1          # 实际 optimizer global_step
         want_entropy = self.monitor.entropy_due(log_step)
         want_lora = self.monitor.lora_due(log_step)
-        batch = self.rollout(prompts)
+        # 分阶段计时（`SFZY_PROFILE=1`）。prof=None 时这些 with 都是空上下文，零开销。
+        prof: Optional[Dict[str, float]] = {} if _PROFILE_ENABLED else None
+        self._prof = prof
+        step_start = time.perf_counter()
+        with _timed(prof, "rollout"):
+            batch = self.rollout(prompts)
 
         # ---- 打分 ----
         refs, sources = [], []
@@ -608,7 +651,8 @@ class GRPOTrainer:
             sources.append(prompts[i]["source"])
         # `signals_raw` 是裁判的**原始**输出（缺失处为 None），只喂给监控；
         # `signals` 是补缺后的，喂给奖励（与改动前完全一致）。
-        signals_raw = self.score_semantic(batch["responses"], refs, sources)
+        with _timed(prof, "judge"):
+            signals_raw = self.score_semantic(batch["responses"], refs, sources)
         judge_results: List[Any] = []
         if signals_raw is not None:
             get_results = getattr(self.scorer, "aligned_results", None)
@@ -687,16 +731,18 @@ class GRPOTrainer:
 
         # ---- 参考策略的 logprob：只与 batch 有关，与策略参数无关 ----
         # 所以整个 μ 循环只算一次（μ=4 时省下 3 次参考前向）。
-        ref_logprobs = self._reference_logprobs(batch) if self.kl_coef > 0 else None
+        with _timed(prof, "reference_logprobs"):
+            ref_logprobs = self._reference_logprobs(batch) if self.kl_coef > 0 else None
 
         # ---- old_logprobs：必须在**任何**参数更新之前算，μ 次内层更新共用 ----
         # 它就是"采样那一刻的行为策略" π_θold，在整个内层循环里是常数 —— 也正因为
         # 如此，μ=1 时 ρ≡1（clip 不生效），μ>1 时第 2 次起 ρ≠1 才开始生效。
-        with torch.no_grad():
-            old_logprobs = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"],
-                micro_batch=self.logprob_micro_batch,
-            ).detach()
+        with _timed(prof, "old_logprobs"):
+            with torch.no_grad():
+                old_logprobs = sequence_logprob(
+                    self.model, batch["input_ids"], batch["labels"],
+                    micro_batch=self.logprob_micro_batch,
+                ).detach()
 
         # 监控用：LoRA 更新幅度（低频）。在循环之前快照、循环之后比差 ——
         # 量到的是整步漂移（μ 次更新累积），这才是"这一步把策略推了多远"。
@@ -714,7 +760,7 @@ class GRPOTrainer:
         iters = [
             self._inner_update(
                 batch, old_logprobs, advantages, ref_logprobs,
-                want_entropy=want_entropy and it == 0,
+                want_entropy=want_entropy and it == 0, prof=prof,
             )
             for it in range(self.inner_iterations)
         ]
@@ -859,6 +905,8 @@ class GRPOTrainer:
         )
         self._last_monitor_metrics = self.monitor.observe(monitor_batch)
         metrics.update(self._last_monitor_metrics)
+        if prof is not None:
+            self._log_profile(log_step, prof, batch, time.perf_counter() - step_start)
         return metrics
 
     # ------------------------------------------------------------------
@@ -884,10 +932,27 @@ class GRPOTrainer:
                 preview = ", ".join(str(s) for s in schedule[:10])
                 if len(schedule) > 10:
                     preview += " …"
+                note = ""
+                if self.monitor.cfg.eval_quantile_points >= n_steps:
+                    note = (
+                        f"（x={self.monitor.cfg.eval_quantile_points} ≥ 步数 {n_steps}，"
+                        "已退化为只在最后一步验证）"
+                    )
                 logger.info(
-                    "验证集：x=%d 个分位点 → 共 %d 次，落在第 %s 步；best.pt 由 %s 决定",
+                    "验证集：x=%d 个分位点 → 共 %d 次，落在第 %s 步%s；best.pt 由 %s 决定",
                     self.monitor.cfg.eval_quantile_points, len(schedule), preview,
+                    note,
                     key or "（save_best=false，不存 best）",
+                )
+                # 验证成本要**开跑前**就可见：它是串行贪心生成，量级 = 次数 × 条数 × token
+                logger.info(
+                    "  验证成本 ≈ %d 次 × %d 条 × 最多 %d token（ChatGLM3 逐条串行生成，"
+                    "按 30ms/token 估约 %.1f 小时）；嫌贵就降 quantile_points / max_samples / max_new_tokens",
+                    len(schedule), self.monitor.cfg.eval_max_samples,
+                    min(self.monitor.cfg.eval_max_new_tokens, self.max_new_tokens),
+                    len(schedule) * self.monitor.cfg.eval_max_samples
+                    * min(self.monitor.cfg.eval_max_new_tokens, self.max_new_tokens)
+                    * 0.03 / 3600,
                 )
             else:
                 logger.info(
@@ -924,6 +989,36 @@ class GRPOTrainer:
         if self.is_main_process:
             self.save()
         return self.state
+
+    # ------------------------------------------------------------------
+    def _log_profile(
+        self,
+        step: int,
+        prof: Dict[str, float],
+        batch: Dict[str, Any],
+        total: float,
+    ) -> None:
+        """`SFZY_PROFILE=1` 时打一张分阶段耗时表（附本步的真实形状）。
+
+        诊断"这一步为什么这么慢"靠的就是这三样：**各阶段秒数**、**序列宽度**
+        （= prompt 截断后的长度 + 本组最长生成）与**生成长度**。例如：
+
+            总耗时几乎全在 `rollout`  → 生成太长/太慢（ChatGLM3 是逐条串行生成）
+            `judge` 占大头              → 裁判 API 慢（输入是整篇原文、并发被限）
+            `inner_*` 占大头            → 序列太宽（max_length 开太大）或 μ 太大
+        """
+        gen = list(batch.get("response_token_counts") or [])
+        gen_median = sorted(gen)[len(gen) // 2] if gen else 0
+        vram = ""
+        if torch.cuda.is_available():
+            vram = f"，峰值显存 {torch.cuda.max_memory_allocated() / 1024**3:.1f}G"
+        ranked = " | ".join(f"{k} {v:.1f}s" for k, v in sorted(prof.items(), key=lambda x: -x[1]))
+        logger.info(
+            "[profile] step %d 总 %.1fs（N=%d，序列宽度 %d，生成长度 中位 %d/上限 %d%s）"
+            "\n    %s",
+            step, total, int(batch["input_ids"].shape[0]), int(batch["input_ids"].shape[1]),
+            gen_median, self.max_new_tokens, vram, ranked,
+        )
 
     # ------------------------------------------------------------------
     def _best_metric_key(self) -> Optional[str]:

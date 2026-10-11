@@ -302,6 +302,10 @@ token：`length/tokens_mean/std/p90`
   k/x 分位点各验一次（k=1..x）。x=10、n=10738 → 第 1074/2148/…/10738 步。
   最后一个点必然落在最后一步，所以"训练结束时的模型"一定会被评到。设了
   `quantile_points` 就以它为准，`every_n_steps` 被忽略。
+  **x ≥ 总步数时退化成"只在最后一步验一次"**：短 run（冒烟测试）里相邻分位点
+  只差一步、没有信息量，而每次验证都是 `max_samples` 条**串行贪心生成**，
+  逐个验会变成"每一步都跑一次完整验证"（实测一次十几分钟）。启动日志里会写明
+  调度与成本估算（次数 × 条数 × 最多 token），开跑前先看一眼。
 
 **best.pt**。每次验证后，用 `eval.best_metric`（默认 `rouge_total`，即官方口径
 `0.2*R1 + 0.4*R2 + 0.4*RL`）与历史最好分比较（越大越好）；刷新了就覆盖
@@ -312,6 +316,20 @@ best.pt**；`best.pt` 不参与 `keep_last_n_checkpoints` 的清理。
 验证的截断/生成预算必须与训练可比：`eval.max_length: null` 表示跟训练用同一个
 `rl.max_length`（给了整数则取 `min(它, rl.max_length)`），`eval.max_new_tokens`
 则取 `min(它, rl.max_new_tokens)`。
+
+### 3.13 一步到底慢在哪：`SFZY_PROFILE=1`
+
+打开这个环境变量后，每个优化步会多打一张分阶段耗时表（只读派生，不影响训练）：
+
+```
+[profile] step 1 总 96.3s（N=4，序列宽度 2480，生成长度 中位 372/上限 1023，峰值显存 26.4G）
+    rollout 61.2s | inner_backward 12.4s | old_logprobs 6.1s | inner_forward 6.0s | judge 9.8s | inner_loss 0.4s | reference_logprobs 4.4s
+```
+
+读法：`rollout` 占大头 → 生成长度/串行生成（ChatGLM3 是逐条生成，G 是线性乘数）；
+`judge` 占大头 → 裁判 API（输入是整篇原文，受 `concurrency` 与供应商限流影响）；
+`inner_*` 占大头 → 序列宽度（`rl.max_length`）或 `inner_iterations`（μ）。
+`序列宽度` = prompt 截断后的长度 + 本组最长生成，它同时决定 logits 的显存与算力。
 
 ## 4. 未记录 / 不适用
 

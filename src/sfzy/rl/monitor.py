@@ -302,9 +302,17 @@ class GRPOMonitor:
         x = self.cfg.eval_quantile_points
         if x > 0:
             total = self.total_steps
-            self._eval_steps = tuple(sorted({
-                max(1, min(total, int(round(total * k / x)))) for k in range(1, x + 1)
-            }))
+            if x >= total:
+                # 分位点比步数还多（冒烟测试/短 run）：相邻分位点只差一步，中间那些
+                # 没有信息量，而**每一次验证都是 max_samples 条串行贪心生成**
+                # （默认 100 条 × 最多几百 token）。按分位点逐个验会变成"每一步都跑
+                # 一次完整验证"—— 实测一次验证十几分钟，于是"每步 16 分钟"。
+                # 短 run 只需要最后那一个模型，所以退化成"只在最后一步验一次"。
+                self._eval_steps = (total,)
+            else:
+                self._eval_steps = tuple(sorted({
+                    max(1, min(total, int(round(total * k / x)))) for k in range(1, x + 1)
+                }))
         else:
             self._eval_steps = None
 

@@ -57,11 +57,22 @@ def test_tied_weights_keys_重复调用不报错():
 # ---------------------------------------------------------------- config 回填
 
 def test_回填_generation_属性():
+    from transformers import GenerationConfig
+
     config = FakeConfig()
     patch_pretrained_config(config)
+    # use_cache 两种版本都必须有**明确**的真值：4.x 的 generation 默认是 True，
+    # 5.x 的默认变成了 None —— 那种情况下由补丁显式给 True（留 None 会把
+    # KV cache 静默关掉，生成慢几百倍）。
     assert config.use_cache is True
-    assert config.num_beams == 1
-    assert config.temperature == 1.0
+
+    defaults = GenerationConfig().to_dict()
+    for field in ("num_beams", "temperature"):
+        if defaults.get(field) is None:
+            # 5.x：默认值就是 None → 不许把 None 抄进 config，宁可让属性缺失
+            assert not hasattr(config, field), f"{field} 不该被写成 None"
+        else:
+            assert getattr(config, field) == defaults[field]
 
 
 def test_max_length_取seq_length而不是generation默认值():
@@ -464,3 +475,91 @@ def test_补generation私有属性_两个方法都装上且幂等():
     # `_get_logits_processor` 只在特定开关下才读这个属性，但一样要补
     assert getattr(GenerationMixin._get_logits_processor, "_sfzy_patched", False)
     assert patch_generation_private_attrs() is False, "第二次调用应识别出已打过补丁"
+
+
+# ---------------------------------------------------------------------------
+# transformers 5.x：被删掉的两个生成辅助方法
+# ---------------------------------------------------------------------------
+# 背景：ChatGLM3 的远程代码（2023 年）直接调 GenerationMixin 的私有方法，
+# 5.x 删掉了其中两个 —— `_get_logits_warper` 与 `_extract_past_from_model_output`。
+# 这两个补丁在 4.40.2 上是**空操作**（方法本来就有），在 5.x 上才真正安装。
+# 我把远程代码里所有 `self._xxx(` 调用都枚举过一遍，缺的就是这两个（`_get_layer`
+# 是它自己类里的方法），所以这份清单是完备的、不是"打地鼠"。
+
+def test_补warper_幂等且采样行为与4x一致():
+    from transformers import GenerationConfig
+    from transformers.generation.logits_process import TemperatureLogitsWarper, TopPLogitsWarper
+    from transformers.generation.utils import GenerationMixin
+
+    from sfzy.models.compat import patch_logits_warper
+
+    first = patch_logits_warper()
+    assert patch_logits_warper() is False, "幂等：第二次必须识别出已处理"
+    assert hasattr(GenerationMixin, "_get_logits_warper"), "4.x 本来就有，5.x 由补丁提供"
+    assert first in (True, False)  # 取决于版本，不做硬断言
+
+    # 行为契约（与 4.x 相同）：temperature→TopK→TopP，且 self 不被使用
+    warpers = GenerationMixin._get_logits_warper(
+        object(), GenerationConfig(temperature=0.9, top_p=0.95, top_k=0)
+    )
+    kinds = {type(w) for w in warpers}
+    assert TemperatureLogitsWarper in kinds and TopPLogitsWarper in kinds
+    # temperature=1.0 / top_p=1.0 / top_k=0 时不应产生任何 warper
+    assert list(GenerationMixin._get_logits_warper(
+        object(), GenerationConfig(temperature=1.0, top_p=1.0, top_k=0)
+    )) == []
+
+
+def test_补extract_past_幂等且能取到past():
+    from transformers.generation.utils import GenerationMixin
+    from transformers.modeling_outputs import CausalLMOutputWithPast
+
+    from sfzy.models.compat import patch_extract_past_from_model_output
+
+    patch_extract_past_from_model_output()
+    assert patch_extract_past_from_model_output() is False
+
+    sentinel = "past"
+    outputs = CausalLMOutputWithPast(past_key_values=sentinel)
+    assert GenerationMixin._extract_past_from_model_output(None, outputs) == sentinel
+    # 元组形式只有我们那份 5.x shim 支持（4.40 的原实现只认 ModelOutput），
+    # 所以只在补丁真正安装过（5.x）时才断言。
+    if getattr(GenerationMixin._extract_past_from_model_output, "_sfzy_patched", False):
+        assert GenerationMixin._extract_past_from_model_output(None, (None, sentinel)) == sentinel
+
+
+def test_generation_config_默认值回填():
+    """5.x 的 GenerationConfig 不再从 model config 继承 max_length/use_cache。"""
+    from sfzy.models.compat import ensure_generation_config_defaults
+
+    class _Gen:
+        max_length = None
+        use_cache = None
+
+    class _Cfg:
+        seq_length = 8192
+        use_cache = False
+
+    class _Model:
+        config = _Cfg()
+        generation_config = _Gen()
+
+    model = _Model()
+    assert ensure_generation_config_defaults(model) is True
+    assert model.generation_config.max_length == 8192       # 取 seq_length
+    assert model.generation_config.use_cache is False        # 跟随 config
+    assert ensure_generation_config_defaults(model) is False, "已有值就不该再改"
+
+    # max_length 优先取 config.max_length（存在时）
+    class _Cfg2:
+        max_length = 4096
+        seq_length = 8192
+        use_cache = True
+
+    class _Model2:
+        config = _Cfg2()
+        generation_config = _Gen()
+
+    m2 = _Model2()
+    ensure_generation_config_defaults(m2)
+    assert m2.generation_config.max_length == 4096
