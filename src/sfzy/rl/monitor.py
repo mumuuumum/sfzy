@@ -327,7 +327,18 @@ class GRPOMonitor:
         return max(1, min(base, max(1, self.total_steps // 5)))
 
     def entropy_due(self, step: int) -> bool:
-        return self.cfg.enabled and step % self._interval(self.cfg.entropy_log_interval) == 0
+        """要不要算策略熵。
+
+        **刻意不走 `_interval` 的自适应缩短。** 熵要物化完整的 `(B, L, vocab)` fp32
+        概率（L=2400、N=8 时峰值 5~10 GB），是整条链路里最吃显存的一项；而
+        `_interval` 的规则是"短 run 至少记到几次扩展统计"，会把间隔缩到 1 ——
+        于是 2~4 步的冒烟 run 里**每一步**都算熵，直接把训练推到 OOM（实测踩过）。
+        长 run 上两者本来一致（间隔 20 就是每 20 步），所以这里只是把短 run 变安全。
+        """
+        return (
+            self.cfg.enabled
+            and step % max(1, int(self.cfg.entropy_log_interval)) == 0
+        )
 
     def lora_due(self, step: int) -> bool:
         return self.cfg.enabled and step % self._interval(self.cfg.lora_update_log_interval) == 0

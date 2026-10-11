@@ -411,3 +411,25 @@ def test_可选验证集指标只在配置开启时产生(tmp_path):
     assert "eval/delta_rouge_l" in out          # 配置给了基线
     # 没有 coverage 信号 → 不编造 coverage 指标
     assert "eval/coverage_mean" not in out
+
+
+def test_短run不会因为自适应缩短而每步都算熵():
+    """熵要物化完整 (B,L,vocab) 的 fp32 概率，是最吃显存的一项。
+
+    `_interval` 的规则是"短 run 至少记到几次扩展统计"（把间隔缩到 1）——
+    对熵来说这会把 2~4 步的冒烟 run 变成"每一步都算熵"，直接把训练推到 OOM
+    （实测踩过：27.7GB 训练 + 15.8GB vLLM 子进程，只剩 1.08GB，熵要 1.65GB）。
+    所以 entropy_due 刻意不走自适应缩短。
+    """
+    from sfzy.rl.monitor import GRPOMonitor, MonitorConfig
+
+    cfg = MonitorConfig.from_config({"entropy_log_interval": 20})
+    m = GRPOMonitor(cfg)
+
+    m.set_total_steps(2)                      # 冒烟 run：不该算熵
+    assert [s for s in (1, 2) if m.entropy_due(s)] == []
+
+    m.set_total_steps(40)                     # 正常 run：仍按 20 触发，行为不变
+    assert m.entropy_due(20) and not m.entropy_due(19)
+    # 对照组：便宜的指标仍然享受自适应缩短（total=40 时 20 → 8，所以第 8 步就触发）
+    assert m.lora_due(8) and not m.lora_due(1)
