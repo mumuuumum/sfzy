@@ -114,7 +114,9 @@ def main() -> None:
         max_model_len=int(vcfg.get("max_model_len") or min(want_len, seq_len)),
         max_loras=int(vcfg.get("max_loras", 1)),
         target_modules=lora_cfg.get("target_modules"),
-        trust_remote_code=False,
+        # 默认 True：vLLM 读 config 时需要放行本地目录里的自定义配置类
+        # （见 sfzy/rl/vllm_rollout.py 的说明），模型前向仍走 vLLM 自己的实现
+        trust_remote_code=bool(vcfg.get("trust_remote_code", True)),
         extra_llm_kwargs=vcfg.get("extra_llm_kwargs"),
     )
 
@@ -143,6 +145,10 @@ def main() -> None:
         import torch
         logger.error("vLLM rollout 冒烟失败：%s: %s", type(exc).__name__, exc)
         print("\n最可能的三个原因（按概率排序）：")
+        print("  0) trust_remote_code：本地模型目录里带 configuration_chatglm.py，"
+              "vLLM 读 config 时要放行。\n"
+              "     配置里写 rl.vllm.trust_remote_code: true（默认就是 true）—— "
+              "报错文本是 'contains custom code which must be executed'。")
         print("  1) 版本不匹配：vLLM 0.11.2 要求 torch==2.9.0、transformers<5,>=4.56。")
         print("     看 `pip show vllm torch transformers | grep -E 'Name|Version'`，")
         print("     按 requirements-vllm.txt 重装（别手动指定别的 torch）。")

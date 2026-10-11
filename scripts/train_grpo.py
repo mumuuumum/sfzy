@@ -398,8 +398,10 @@ def main() -> None:
             max_model_len=int(vcfg.get("max_model_len") or min(want_len, seq_len)),
             max_loras=int(vcfg.get("max_loras", 1)),
             target_modules=lora_cfg.get("target_modules"),
-            # vLLM 自带 ChatGLM3 的实现，不需要远程代码（也就不挑 transformers 版本）
-            trust_remote_code=False,
+            # **默认 True**：vLLM 自带 chatglm 的模型实现，但读 config 仍要放行远程代码
+            # （本地目录里有 configuration_chatglm.py + auto_map），否则报
+            # "contains custom code which must be executed ... pass trust_remote_code=True"
+            trust_remote_code=bool(vcfg.get("trust_remote_code", True)),
             extra_llm_kwargs=vcfg.get("extra_llm_kwargs"),
         )
         logger.info(

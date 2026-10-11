@@ -61,7 +61,7 @@ class VLLMRollout:
         max_model_len: Optional[int] = None,
         max_loras: int = 1,
         target_modules: Sequence[str] = CHATGLM3_TARGET_MODULES,
-        trust_remote_code: bool = False,
+        trust_remote_code: bool = True,
         extra_llm_kwargs: Optional[Dict[str, Any]] = None,
         engine: Any = None,
         lora_request_factory: Any = None,
@@ -78,6 +78,15 @@ class VLLMRollout:
         self.max_model_len = max_model_len
         self.max_loras = int(max_loras)
         self.target_modules = tuple(target_modules or CHATGLM3_TARGET_MODULES)
+        # **必须默认 True**：vLLM 自带 chatglm 的 config 类与模型实现，但配置解析那一步
+        # 仍会走 transformers 的 AutoConfig；而本地目录里有 configuration_chatglm.py +
+        # config.json 的 auto_map，`trust_remote_code=False` 时 transformers 会直接拒绝：
+        #
+        #     ValueError: The repository ... contains custom code which must be executed to
+        #     correctly load the model. ... Please pass the argument `trust_remote_code=True`
+        #
+        # 注意这只放行**配置类**的加载；模型前向仍走 vLLM 自己的 ChatGLMForCausalLM
+        # （registry 里 ChatGLMModel → chatglm 模块），不会执行远程的 modeling 代码。
         self.trust_remote_code = bool(trust_remote_code)
         self.extra_llm_kwargs = dict(extra_llm_kwargs or {})
         self._engine = engine

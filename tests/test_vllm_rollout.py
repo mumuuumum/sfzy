@@ -60,17 +60,75 @@ class FakeEngine:
         ]
 
 
-def make_backend(tmp_path, tokenizer, engine=None, **over):
+_UNSET = object()
+
+
+def make_backend(tmp_path, tokenizer, engine=_UNSET, **over):
+    """engine 默认给假引擎；显式传 engine=None 表示"留空、需要时自己建真引擎"。"""
     kwargs = dict(
         base_model="THUDM/chatglm3-6b", tokenizer=tokenizer,
         lora_alpha=32, lora_rank=16, export_root=tmp_path / "adapters",
-        engine=engine if engine is not None else FakeEngine(),
+        engine=FakeEngine() if engine is _UNSET else engine,
         lora_request_factory=FakeLoRARequest,
         sampling_params_factory=FakeSamplingParams,
         target_modules=["lm_head"],
     )
     kwargs.update(over)
     return VLLMRollout(**kwargs)
+
+
+def build_engine_kwargs(tmp_path, monkeypatch, **over):
+    """把假 vllm 模块塞进 sys.modules，捕获 LLM(**kwargs) 的实参。"""
+    import sys
+    import types
+
+    captured: dict = {}
+
+    class FakeLLM:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    fake = types.ModuleType("vllm")
+    fake.LLM = FakeLLM
+    monkeypatch.setitem(sys.modules, "vllm", fake)
+    backend = make_backend(tmp_path, h.FakeTokenizer(), engine=None, **over)
+    _ = backend.engine            # 触发 _build_engine
+    return captured
+
+
+# ---------------------------------------------------------------- 引擎参数
+
+def test_引擎参数默认放行远程代码(tmp_path, monkeypatch):
+    """回归：漏了 trust_remote_code=True 会在建引擎时直接失败 ——
+
+        ValueError: The repository <本地目录> contains custom code which must be
+        executed to correctly load the model. ... pass `trust_remote_code=True`
+
+    vLLM 自带 chatglm 的模型实现，但**读 config 仍要放行**（目录里有
+    configuration_chatglm.py）。这条是开工前必须钉死的参数。
+    """
+    got = build_engine_kwargs(
+        tmp_path, monkeypatch,
+        gpu_memory_utilization=0.3, max_model_len=8192, max_loras=2, dtype="bfloat16",
+    )
+    assert got["trust_remote_code"] is True
+    assert got["model"].endswith("chatglm3-6b")
+    assert got["enable_lora"] is True
+    assert got["max_lora_rank"] == 16              # 来自 make_backend 的 lora_rank
+    assert got["max_loras"] == 2
+    assert got["gpu_memory_utilization"] == 0.3    # 不能是默认 0.9（会挤爆训练）
+    assert got["max_model_len"] == 8192
+    assert got["dtype"] == "bfloat16"
+    assert "quantization" not in got, "没指定量化时不要把这个参数传给 vLLM"
+
+
+def test_引擎参数里的量化与远程代码开关(tmp_path, monkeypatch):
+    got = build_engine_kwargs(tmp_path, monkeypatch, quantization="awq")
+    assert got["quantization"] == "awq"
+    got2 = build_engine_kwargs(tmp_path, monkeypatch, quantization="bitsandbytes",
+                               trust_remote_code=False)
+    assert got2["quantization"] == "bitsandbytes"
+    assert got2["trust_remote_code"] is False, "显式关掉时不该被覆盖"
 
 
 # ---------------------------------------------------------------- 同步策略

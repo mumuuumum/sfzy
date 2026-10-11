@@ -126,6 +126,17 @@ SFZY_PROFILE=1 python scripts/train_grpo.py --config configs/grpo_fact_coverage_
 
 ## 6. 已知差异与坑
 
+- **`trust_remote_code` 必须为 true**（`rl.vllm.trust_remote_code`，默认已是 true）。
+  vLLM 自带 chatglm 的**模型实现**（registry 里 `ChatGLMModel → chatglm`），但**读
+  config** 那一步仍走 transformers 的 `AutoConfig`；本地目录里有
+  `configuration_chatglm.py` + `config.json` 的 `auto_map`，关闭时直接报：
+
+  ```
+  ValueError: The repository /path/to/chatglm3-6b contains custom code which must be
+  executed to correctly load the model. ... Please pass the argument `trust_remote_code=True`
+  ```
+
+  放行的只是配置类；前向仍由 vLLM 自己的实现算（不会执行远程 modeling 代码）。
 - **采样不跟随 torch 全局种子**：HF 路径受 `set_seed` 影响，vLLM 有自己的采样器。
   训练仍然可复现到"分布"，但具体样本不同。
 - **LoRA × chunked prefill 互斥**（vLLM 源码里是硬报错）；不要手动去开 chunked prefill。
