@@ -1,0 +1,41 @@
+# 用 vLLM 做 rollout 的环境（单环境：训练 + 推理在同一份依赖里）
+# =====================================================================
+# 版本组合不是拍脑袋的，是从 vLLM 0.11.2 wheel 自己的 METADATA 里读出来的：
+#
+#     torch==2.9.0        （vLLM 硬 pin，不要自己换）
+#     transformers<5,>=4.56.0
+#     xformers==0.0.33.post1 / flashinfer-python==0.5.2 / ray[cgraph]>=2.48
+#
+# 三条重要结论（都验证过，别再走回头路）：
+#   1) ChatGLM3 **没有**版本障碍了：仓库的 compat 层在 transformers 5.19 上
+#      实测能跑通完整一步；但 vLLM 0.11.2 自己把上限定在 <5，所以这里用 4.56.x。
+#   2) vLLM 的 LoRA 只对 **AWQ / GPTQ** 做过测试（源码里的白名单），
+#      bitsandbytes 底座 + LoRA 是未测试组合 → 底座用 **bf16**（最省心）。
+#   3) vLLM 0.11.2 pin 了 torch==2.9.0：AutoDL 镜像自带的 torch 若不是 2.9，
+#      要么换镜像，要么让 pip 装它（别手动指定别的 torch，会装出 CUDA 不匹配的 wheel）。
+#
+# 安装：
+#     pip install -r requirements-vllm.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 冒烟（先跑这个，1~2 分钟）：
+#     python tools/check_vllm_rollout.py --config configs/grpo_fact_coverage_vGPU48.yaml
+# =====================================================================
+
+# ---- 训练侧（照旧）----
+transformers>=4.56.0,<5
+sentencepiece>=0.2.0        # ChatGLM3 的 tokenizer 依赖它
+accelerate>=1.10.0
+peft>=0.17.0                # 0.13 配 transformers 4.56 会缺接口
+bitsandbytes>=0.48.0        # 0.46 配 torch 2.9 有兼容问题
+datasets>=3.0
+jieba>=0.42
+pyyaml>=6.0
+pytest>=8.0
+swanlab>=0.9
+
+# ---- rollout 引擎 ----
+vllm==0.11.2
+
+# ---- 可选：显存不够、要把底座转成 AWQ 时才装（见 docs/vllm_rollout.md 第 3 节）----
+# 注意 autoawq 对新版 torch 的跟进较慢；装不上就改用社区已量化好的 AWQ/GPTQ 底座，
+# 或按文档用 gptqmodel / llm-compressor。
+# autoawq>=0.2.7

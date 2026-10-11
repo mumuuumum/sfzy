@@ -65,6 +65,21 @@ rl:
   log_every_n_steps: 1
   resume_from: null
 
+  # ---- rollout 后端 ----
+  # hf  : 训练进程内的模型逐条生成（ChatGLM3 不支持批输入，最慢）
+  # vllm: 交给 vLLM 连续批处理，每步把当前 LoRA 热交换过去（推荐）
+  # 先用 python tools/check_vllm_rollout.py --config <本文件> 冒烟；起不来就改回 hf。
+  # 完整准备步骤、版本组合与显存取舍见 docs/vllm_rollout.md。
+  rollout_backend: vllm
+  vllm:
+    dtype: bfloat16            # 底座精度。bf16 最省心（约 12.4GB）；
+                               # 显存不够就按文档转 AWQ 并把下面这行打开：
+    # quantization: awq
+    gpu_memory_utilization: 0.30   # ★ 与训练同卡时必须压住：默认 0.9 会把训练挤爆
+    max_loras: 1               # 每步换一个 int_id，旧的按 LRU 淘汰
+    # max_model_len: null      # 默认 = rl.max_length + rl.max_new_tokens + 8，且不超模型 seq_length
+    # extra_llm_kwargs: {}     # 透传给 vllm.LLM（如 enforce_eager: true 省显存、换更稳的启动）
+
   # ---- 固定验证集：按分位点验证 + 用综合 ROUGE 选最好模型 ----
   # 每次验证：贪心解码（可复现）跑 val 的前 max_samples 条 → 算 ROUGE-1/2/L 与
   # 综合分，以及各裁判信号；`best.pt` 只在综合分刷新时被覆盖。

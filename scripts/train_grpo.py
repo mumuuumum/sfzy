@@ -370,6 +370,48 @@ def main() -> None:
         {k: round(v, 4) for k, v in reward_spec.normalized_weights().items()},
     )
 
+    # ---------------- rollout 后端 ----------------
+    # hf（默认）：用训练进程里的模型逐条生成 —— ChatGLM3 的 stream_generate 不支持
+    #            带 padding 的批输入，所以只能串行。
+    # vllm     ：交给 vLLM（连续批处理 + PagedAttention），每步把当前 LoRA 热交换
+    #            过去；生成只产文本，logprob 仍由训练侧模型重算（不改变 μ/clip/KL 语义）。
+    #            准备步骤、版本组合与显存取舍见 docs/vllm_rollout.md。
+    rollout_backend = None
+    rollout_backend_name = str(rl_cfg.get("rollout_backend", "hf") or "hf").lower()
+    if rollout_backend_name in ("vllm", "vllm_rollout"):
+        from sfzy.rl.vllm_rollout import VLLMRollout  # 延迟 import：没装 vllm 也能跑 hf
+
+        vcfg = dict(rl_cfg.get("vllm") or {})
+        # vLLM 要求 prompt+生成 ≤ max_model_len；同时不能超过模型自身的 seq_length
+        # （ChatGLM3 的 RoPE 缓存就是按 8192 建的，超了会崩在 forward 里）。
+        want_len = int(rl_cfg.get("max_length", 2048)) + int(rl_cfg.get("max_new_tokens", 384)) + 8
+        seq_len = int(getattr(getattr(model, "config", None), "seq_length", 0) or 8192)
+        rollout_backend = VLLMRollout(
+            base_model=model_cfg.get("model_name_or_path"),
+            tokenizer=tokenizer,
+            lora_alpha=int(lora_cfg.get("alpha", 16)),
+            lora_rank=int(lora_cfg.get("r", 8)),
+            export_root=resolve(rl_cfg.get("output_dir", "outputs/grpo")) / "vllm_adapters",
+            dtype=str(vcfg.get("dtype", "bfloat16")),
+            quantization=vcfg.get("quantization") or None,
+            gpu_memory_utilization=float(vcfg.get("gpu_memory_utilization", 0.30)),
+            max_model_len=int(vcfg.get("max_model_len") or min(want_len, seq_len)),
+            max_loras=int(vcfg.get("max_loras", 1)),
+            target_modules=lora_cfg.get("target_modules"),
+            # vLLM 自带 ChatGLM3 的实现，不需要远程代码（也就不挑 transformers 版本）
+            trust_remote_code=False,
+            extra_llm_kwargs=vcfg.get("extra_llm_kwargs"),
+        )
+        logger.info(
+            "rollout 后端: vLLM（每步热交换 LoRA；base=%s dtype=%s quant=%s gpu_mem=%.2f max_model_len=%d）",
+            model_cfg.get("model_name_or_path"), vcfg.get("dtype", "bfloat16"),
+            vcfg.get("quantization") or "（无）",
+            float(vcfg.get("gpu_memory_utilization", 0.30)),
+            int(vcfg.get("max_model_len") or min(want_len, seq_len)),
+        )
+    else:
+        logger.info("rollout 后端: hf（训练进程内逐条生成）")
+
     # ---------------- tracker ----------------
     # 续训时要接回 swanlab 上原来那条 run，否则一次 11 小时的训练被掐断后
     # 重启，面板上会多出一条断掉的曲线，而你会以为训练从零开始了。
@@ -408,6 +450,7 @@ def main() -> None:
         output_dir=str(resolve(rl_cfg.get("output_dir", "outputs/grpo"))),
         tracker=tracker, is_main_process=is_main_process(), scorer=scorer,
         reference_lora=reference_lora,
+        rollout_backend=rollout_backend,
     )
     trainer.resume(resume_from)
     state = trainer.train(prompts)

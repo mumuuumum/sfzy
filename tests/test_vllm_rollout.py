@@ -1,0 +1,194 @@
+"""vLLM rollout 后端 + trainer 接线的测试（**不需要装 vllm**）。
+
+引擎、LoRARequest、SamplingParams 三者都允许注入：
+  * 引擎：假的 `generate()` 记录调用参数、按 n 返回固定条数；
+  * LoRARequest：假的工厂，只记录 (name, int_id, path)；
+  * SamplingParams：假类，只记录 kwargs。
+
+这样在 CPU 上就能把"每步热交换 + prompt 编码一致 + 条数/顺序 + trainer 接线"
+全部钉住；真引擎的差异留给 `tools/check_vllm_rollout.py` 在 GPU 上冒烟。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+import torch
+
+import test_kl_reference as h
+from sfzy.models.chat_template import encode_prompt
+from sfzy.data.prompts import build_messages
+from sfzy.rl.vllm_rollout import VLLMRollout
+
+
+# ---------------------------------------------------------------- 假件
+
+class FakeSamplingParams:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
+class FakeLoRARequest:
+    def __init__(self, lora_name, lora_int_id, lora_path=""):
+        self.lora_name = lora_name
+        self.lora_int_id = lora_int_id
+        self.lora_path = lora_path
+
+
+class _Out:
+    def __init__(self, texts):
+        self.outputs = [type("O", (), {"text": t})() for t in texts]
+
+
+class FakeEngine:
+    """记录每次 generate 的入参，并按 n 返回固定文本。"""
+
+    def __init__(self):
+        self.calls = []
+
+    def generate(self, prompts, sampling_params, lora_request=None):
+        self.calls.append({
+            "prompts": prompts,
+            "sampling": sampling_params.kwargs,
+            "lora": lora_request,
+        })
+        n = int(sampling_params.kwargs["n"])
+        return [
+            _Out([f"prompt{i}-cand{j}" for j in range(n)])
+            for i in range(len(prompts))
+        ]
+
+
+def make_backend(tmp_path, tokenizer, engine=None, **over):
+    kwargs = dict(
+        base_model="THUDM/chatglm3-6b", tokenizer=tokenizer,
+        lora_alpha=32, lora_rank=16, export_root=tmp_path / "adapters",
+        engine=engine if engine is not None else FakeEngine(),
+        lora_request_factory=FakeLoRARequest,
+        sampling_params_factory=FakeSamplingParams,
+        target_modules=["lm_head"],
+    )
+    kwargs.update(over)
+    return VLLMRollout(**kwargs)
+
+
+# ---------------------------------------------------------------- 同步策略
+
+def test_每步导出adapter并换新的int_id(tmp_path):
+    model = h.lora_model()
+    backend = make_backend(tmp_path, h.FakeTokenizer())
+
+    lora0 = backend.sync_policy(model, 0)
+    assert lora0.lora_int_id == 1 and lora0.lora_name == "policy-0"   # int_id 必须 ≥1
+    assert (tmp_path / "adapters" / "step0" / "adapter_config.json").exists()
+
+    lora1 = backend.sync_policy(model, 1)
+    assert lora1.lora_int_id == 2
+    assert (tmp_path / "adapters" / "step1" / "adapter_config.json").exists()
+    # 目录交替复用：磁盘上恒定只有两份
+    assert sorted(p.name for p in (tmp_path / "adapters").iterdir()) == ["step0", "step1"]
+
+    lora2 = backend.sync_policy(model, 2)
+    assert lora2.lora_int_id == 3, "int_id 每步都要变（vLLM 按它缓存 adapter）"
+
+
+def test_没同步就生成要报错(tmp_path):
+    backend = make_backend(tmp_path, h.FakeTokenizer())
+    with pytest.raises(RuntimeError, match="还没来得及|还没给 vLLM 同步策略"):
+        backend.generate([[{"role": "user", "content": "x"}]], num_return_sequences=1,
+                         max_new_tokens=4, max_length=64)
+
+
+# ---------------------------------------------------------------- 生成
+
+def test_prompt编码与截断必须和hf路径一致(tmp_path):
+    tok = h.FakeTokenizer()
+    backend = make_backend(tmp_path, tok)
+    backend.sync_policy(h.lora_model(), 0)
+    messages = build_messages("判决如下：被告支付48000元。", "structured")
+
+    backend.generate([messages], num_return_sequences=2, max_new_tokens=8, max_length=32)
+    got = backend.engine.calls[-1]["prompts"][0]
+    expected = encode_prompt(tok, messages, add_generation_prompt=True)[-32:]   # 保留尾部
+    assert got == expected
+
+
+def test_采样参数与条数顺序(tmp_path):
+    backend = make_backend(tmp_path, h.FakeTokenizer())
+    backend.sync_policy(h.lora_model(), 0)
+    msgs = [[{"role": "user", "content": "a"}], [{"role": "user", "content": "b"}]]
+
+    texts = backend.generate(msgs, num_return_sequences=3, max_new_tokens=16,
+                             max_length=64, temperature=0.9, top_p=0.95)
+    call = backend.engine.calls[-1]
+    assert call["sampling"] == {"n": 3, "temperature": 0.9, "top_p": 0.95, "max_tokens": 16}
+    assert call["lora"] is not None
+    # prompt 优先、组内连续 —— rollout() 按 responses[i*G + j] 取用
+    assert texts == ["prompt0-cand0", "prompt0-cand1", "prompt0-cand2",
+                     "prompt1-cand0", "prompt1-cand1", "prompt1-cand2"]
+
+
+def test_返回条数不对时直接报错(tmp_path):
+    class ShortEngine(FakeEngine):
+        def generate(self, prompts, sampling_params, lora_request=None):
+            return [_Out(["只有一条"]) for _ in prompts]      # 少给了
+
+    backend = make_backend(tmp_path, h.FakeTokenizer(), engine=ShortEngine())
+    backend.sync_policy(h.lora_model(), 0)
+    with pytest.raises(ValueError, match="数量对不上"):
+        backend.generate([[{"role": "user", "content": "a"}]], num_return_sequences=3,
+                         max_new_tokens=8, max_length=32)
+
+
+# ---------------------------------------------------------------- trainer 接线
+
+def test_trainer用vllm后端生成且批次结构与hf一致(tmp_path, monkeypatch):
+    """给定**同一批文本**，两条 rollout 路径产出的 input_ids / labels 必须逐位相同。
+
+    这才是要钉的东西：vLLM 只换"谁来写这段文本"，tokenization、prompt 段 mask、
+    组内顺序都不该有任何差别。所以这里把 HF 路径的 generate_batch 换成返回同样文本。
+    """
+    import sfzy.rl.trainer as trainer_mod
+
+    tok = h.FakeTokenizer()
+    prompts = h.make_prompts(2)
+    fixed = ["prompt0-cand0", "prompt0-cand1", "prompt1-cand0", "prompt1-cand1"]
+
+    def run_with(backend, texts=None):
+        torch.manual_seed(0)
+        trainer = h.GRPOTrainer(
+            model=h.lora_model(), tokenizer=tok,
+            cfg=h.make_cfg(kl_coef=0.0, group_size=2, prompts_per_step=2),
+            output_dir=str(tmp_path / ("vllm" if backend else "hf")),
+            scorer=h.FactStubScorer(), rollout_backend=backend,
+        )
+        if backend is None:
+            monkeypatch.setattr(trainer_mod, "generate_batch", lambda *a, **k: list(texts))
+        return trainer.rollout(prompts)
+
+    backend = make_backend(tmp_path, tok)
+    got = run_with(backend)
+    ref = run_with(None, fixed)
+
+    assert got["input_ids"].shape == ref["input_ids"].shape
+    assert torch.equal(got["input_ids"], ref["input_ids"])
+    assert torch.equal(got["labels"], ref["labels"])
+    assert got["responses"] == ref["responses"]
+    assert backend.engine.calls, "vLLM 后端必须真的被调用"
+    assert backend.engine.calls[-1]["sampling"]["n"] == 2
+
+
+def test_一步训练能走vllm后端并收尾(tmp_path):
+    backend = make_backend(tmp_path, h.FakeTokenizer())
+    torch.manual_seed(0)
+    trainer = h.GRPOTrainer(
+        model=h.lora_model(), tokenizer=h.FakeTokenizer(),
+        cfg=h.make_cfg(kl_coef=0.0, group_size=2, prompts_per_step=2,
+                       save_every_n_steps=1000),
+        output_dir=str(tmp_path), scorer=h.FactStubScorer(), rollout_backend=backend,
+    )
+    metrics = trainer.step(h.make_prompts(2))
+    assert "loss" in metrics and metrics["loss"] == metrics["loss"]
+    trainer.train(h.make_prompts(2))
+    assert backend.stats["sync_calls"] >= 2, "每步都要同步策略"

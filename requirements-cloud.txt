@@ -18,9 +18,11 @@
 #     pip install -r requirements-cloud.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
 # =====================================================================
 
-# 上限 <5.0 是硬约束：ChatGLM3 的远程代码是 2023 年写的，
-# transformers 5.x 的接口变更让它大概率加载不了。
-# 具体哪个版本能跑，以 scripts/check_model.py 的验证结果为准。
+# ChatGLM3 的远程代码是 2023 年写的，但**版本障碍已经解除**：
+# `models/compat.py` 补齐了 5.x 删掉的生成辅助方法与 generation_config 默认值，
+# 实测 transformers 5.19.0 上 GRPOTrainer.step()/train() 都能跑通、全量测试 565 passed。
+# 这一版仍锁 4.40.2 只是为了不动现有基线；要用 vLLM 做 rollout 请用
+# requirements-vllm.txt（transformers 4.56.x + vllm 0.11.2），见 docs/vllm_rollout.md。
 transformers==4.40.2
 bitsandbytes>=0.46.1
 accelerate==1.0.1

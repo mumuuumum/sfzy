@@ -172,104 +172,25 @@ def resolve_split_file(data_cfg: Any, split: str, data_dir: Optional[str] = None
 # ---------------------------------------------------------------------------
 # LoRA：自定义 checkpoint → PEFT 目录
 # ---------------------------------------------------------------------------
-def _extract_lora_state(payload: Any) -> Dict[str, Any]:
-    """从 checkpoint 里取出 LoRA 权重。
-
-    ``save_checkpoint`` 存的是 ``{"model": {...}, "only_trainable": ...}``；
-    而 ``save_lora`` 直接存 ``{键: 张量}``。两种都要认，否则导出的 adapter
-    会是空的 —— 而且 vLLM 不会报"空的"，它会安静地按零 LoRA 生成。
-    """
-    if isinstance(payload, dict) and isinstance(payload.get("model"), dict):
-        return payload["model"]
-    return payload
+# 实现已搬到 ``src/sfzy/models/lora_export.py``：GRPO 训练每步都要把当前 LoRA 导
+# 出去做热交换，必须和这里共用同一份实现，否则两边会各自漂移（键名前缀、rank 推断、
+# 目标层白名单这几处最容易分叉）。
+from sfzy.models.lora_export import (  # noqa: E402
+    CHATGLM3_TARGET_MODULES as _CHATGLM3_TARGET_MODULES,
+    convert_checkpoint_to_peft as _convert_checkpoint_to_peft,
+    extract_lora_state as _extract_lora_state,
+)
 
 
-def convert_checkpoint_to_peft(
-    adapter_path: Path,
-    out_dir: Path,
-    *,
-    r: int,
-    alpha: int,
-    dropout: float,
-    target_modules: List[str],
-    base_model: str,
-) -> Path:
-    """把项目的 ``.pt`` LoRA 导出成 vLLM 认的 PEFT 目录。
-
-    PEFT 的命名规则：``base_model.model.<HF 模块路径>.lora_A.weight``。
-    vLLM 0.5.x 的 ``parse_fine_tuned_lora_name`` 只认这个前缀，所以：
-
-        DDP 存盘        module.transformer.encoder.layers.0....lora_A.weight
-        去掉 module.    transformer.encoder.layers.0....lora_A.weight
-        补 PEFT 前缀    base_model.model.transformer.encoder.layers.0....lora_A.weight
-
-    注意 LoRA 的 A/B 在项目里固定是 fp32（见 models/lora.py 的说明），导出时
-    保持 fp32 即可；vLLM 会在加载时按它的 dtype 转换。
-    """
-    import torch
-    from safetensors.torch import save_file
-
-    state = _extract_lora_state(torch.load(adapter_path, map_location="cpu", weights_only=False))
-
-    converted: Dict[str, Any] = {}
-    ranks = set()
-    for key, tensor in state.items():
-        if "lora_A" not in key and "lora_B" not in key:
-            continue
-        name = key
-        if name.startswith("module."):
-            name = name[len("module."):]
-        if not name.startswith("base_model.model."):
-            name = "base_model.model." + name
-        converted[name] = tensor.detach().to(torch.float32).contiguous()
-        # lora_A 形状是 (r, in_features)，这是唯一可靠的 rank 来源
-        if name.endswith("lora_A.weight"):
-            ranks.add(int(tensor.shape[0]))
-
-    if not converted:
-        raise ValueError(f"{adapter_path} 里没有任何 lora_A/lora_B 权重，导出会是空 adapter")
-
-    if len(ranks) != 1:
-        raise ValueError(f"{adapter_path} 里的 LoRA rank 不一致：{sorted(ranks)}")
-    actual_r = ranks.pop()
-    if actual_r != int(r):
-        logger.warning(
-            "checkpoint 实际 rank=%d，配置里写的是 r=%d。会按实际 rank 导出，"
-            "但请确认 alpha 也是存档时那一版的（scaling=alpha/r 配错会静默改变 LoRA 强度）",
-            actual_r, r,
-        )
-        r = actual_r
-
-    # 目标层名必须能被 vLLM 的 supported_lora_modules 接受。这里按后缀校验，
-    # 提前把"导出了模型根本不支持的层"这类问题暴露在导出阶段，而不是等
-    # vLLM 加载到一半才报错。
-    for name in converted:
-        module_name = name[len("base_model.model."):]
-        part = module_name.split(".")[-3]  # ...<module>.lora_A.weight
-        if part not in target_modules:
-            logger.warning("导出里出现了 target_modules 之外的层：%s", part)
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    save_file(converted, str(out_dir / "adapter_model.safetensors"))
-    config = {
-        "peft_type": "LORA",
-        "task_type": "CAUSAL_LM",
-        "inference_mode": True,
-        "r": int(r),
-        "lora_alpha": int(alpha),
-        "lora_dropout": float(dropout),
-        "fan_in_fan_out": False,
-        "bias": "none",
-        "target_modules": list(target_modules),
-        "base_model_name_or_path": str(base_model),
-        "init_lora_weights": True,
-        "use_rslora": False,
-    }
-    (out_dir / "adapter_config.json").write_text(
-        json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8"
+def convert_checkpoint_to_peft(adapter_path, out_dir, *, r: int, alpha: int,
+                               dropout: float, target_modules, base_model) -> Path:
+    """兼容旧签名（`r=`）的转发 —— 实现在 `sfzy.models.lora_export`。"""
+    return _convert_checkpoint_to_peft(
+        adapter_path, out_dir, alpha=alpha, dropout=dropout,
+        target_modules=target_modules or _CHATGLM3_TARGET_MODULES,
+        base_model=base_model, rank=r,
     )
-    logger.info("LoRA 已导出：%s（%d 个张量，r=%d）", out_dir, len(converted), r)
-    return out_dir
+
 
 
 def ensure_peft_adapter(args: argparse.Namespace, cfg: Any, base_model: str) -> Optional[Path]:

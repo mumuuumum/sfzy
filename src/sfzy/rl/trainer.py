@@ -147,6 +147,7 @@ class GRPOTrainer:
         tracker: Any = None,
         is_main_process: bool = True,
         scorer: Any = None,
+        rollout_backend: Any = None,
     ) -> None:
         """KL 的参考策略有两种给法，二选一即可，都不需要第二份 6B 权重：
 
@@ -162,6 +163,11 @@ class GRPOTrainer:
         `scorer` 是裁判（`sfzy.judge.scorer.SixElementScorer`）。奖励由
         `rl.reward.terms` 决定开哪些项；只要有 judge 项而没裁判，直接报错 ——
         配置说要接裁判却没有裁判，静默降级是最坏的结果。
+
+        `rollout_backend` 是**可选的 rollout 后端对象**（目前只有
+        `sfzy.rl.vllm_rollout.VLLMRollout`）：不传就用原来的 HF 逐条生成。
+        对象由装配层（`scripts/train_grpo.py`）构造 —— 这样 trainer 完全不认识
+        vLLM，没装 vllm 的环境也照常跑 `hf` 后端。
         """
         self.model = model
         self.tokenizer = tokenizer
@@ -171,6 +177,7 @@ class GRPOTrainer:
         self.tracker = tracker
         self.is_main_process = is_main_process
         self.scorer = scorer
+        self.rollout_backend = rollout_backend
 
         rl = cfg.rl
         self.group_size = rl.get("group_size", 8)
@@ -585,18 +592,29 @@ class GRPOTrainer:
         # **为什么生成完要切回来。** 见 `step()` 里那段说明：训练前向必须是
         # train，否则梯度检查点不生效。两个模式各司其职，谁都不能省。
         was_training = self.model.training
-        self.model.eval()
-        try:
-            # generate_batch 的 num_return_sequences 会为每个 prompt 连续产出 G 条
-            responses = generate_batch(
-                self.model, self.tokenizer, messages_list,
-                max_new_tokens=self.max_new_tokens, max_length=self.max_length,
-                do_sample=True, temperature=self.temperature, top_p=self.top_p,
+        if self.rollout_backend is not None:
+            # vLLM 后端：先把当前策略的 LoRA 同步过去（热交换），再让它生成。
+            # 这一步不占用训练模型的前向，所以不需要切 eval/train。
+            self.rollout_backend.sync_policy(self.model, self.state.step)
+            responses = self.rollout_backend.generate(
+                messages_list,
                 num_return_sequences=self.group_size,
+                max_new_tokens=self.max_new_tokens, max_length=self.max_length,
+                temperature=self.temperature, top_p=self.top_p,
             )
-        finally:
-            if was_training:
-                self.model.train()
+        else:
+            self.model.eval()
+            try:
+                # generate_batch 的 num_return_sequences 会为每个 prompt 连续产出 G 条
+                responses = generate_batch(
+                    self.model, self.tokenizer, messages_list,
+                    max_new_tokens=self.max_new_tokens, max_length=self.max_length,
+                    do_sample=True, temperature=self.temperature, top_p=self.top_p,
+                    num_return_sequences=self.group_size,
+                )
+            finally:
+                if was_training:
+                    self.model.train()
 
         pad_id = self.tokenizer.pad_token_id
         sequences = []
@@ -988,6 +1006,9 @@ class GRPOTrainer:
 
         if self.is_main_process:
             self.save()
+        # 收尾：vLLM 引擎的显存不回收会一直占着（下次同卡启动会 OOM）
+        if self.rollout_backend is not None:
+            self.rollout_backend.close()
         return self.state
 
     # ------------------------------------------------------------------
