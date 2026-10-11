@@ -16,7 +16,12 @@ import json
 
 import pytest
 
-from sfzy.judge.judge import FactConsistencyJudge, parse_inp, parse_six_scores
+from sfzy.judge.judge import (
+    FactConsistencyJudge,
+    parse_fact,
+    parse_inp,
+    parse_six_scores,
+)
 from sfzy.judge.schema import (
     DEFAULT_WEIGHTS,
     ELEMENTS,
@@ -93,13 +98,17 @@ def test_聚合_记录来源():
 # ---------------------------------------------------------------- 日志统计
 
 def test_统计_给出各档比例且加起来是一():
-    results = [aggregate({n: i % 5 for n in ELEMENTS}) for i in range(5)]
+    from sfzy.judge.schema import JudgeResult, summarize_scores
+
+    results = [JudgeResult(weighted_reward=i / 4.0, fact_score=i,
+                           has_factual_error=1 if i == 0 else 0)
+               for i in range(5)]
     stats = summarize_scores(results)
     total = sum(stats[f"ratio_score_{lv}"] for lv in range(MAX_SCORE + 1))
     assert total == pytest.approx(1.0)
     assert "mean_fact_reward" in stats
-    for name in ELEMENTS:
-        assert f"mean_{name}_score" in stats
+    assert stats["mean_fact_score"] == pytest.approx(0.5)
+    assert stats["fact_error_rate"] == pytest.approx(0.2)
 
 
 def test_统计_空输入不报错():
@@ -132,6 +141,7 @@ def test_覆盖率没有要素参与时返回None():
 # ---------------------------------------------------------------- 分数解析
 
 def test_解析_一次性六要素分数():
+    """``parse_six_scores`` 现在只服务覆盖率（它仍然是六要素）。"""
     assert parse_six_scores('{"case_type": 3, "court_facts": 0}') == {
         "case_type": 3, "court_facts": 0,
     }
@@ -139,6 +149,39 @@ def test_解析_一次性六要素分数():
     # 前后有解释、键引号不规整时也要能救回来
     assert parse_six_scores('好的：\n{"judgment_result": 2}\n以上') == {"judgment_result": 2}
     assert parse_six_scores("我无法完成") == {}
+
+
+def test_解析_事实一致性三件套():
+    assert parse_fact('{"has_factual_error": 0, "fact_consistency_score": 4, "error_reason": ""}') == {
+        "has_factual_error": 0, "fact_consistency_score": 4,
+        "error_reason": "", "parse": "ok",
+    }
+    err = parse_fact('{"has_factual_error": 1, "fact_consistency_score": 0, '
+                     '"error_reason": "金额写错"}')
+    assert err["has_factual_error"] == 1 and err["fact_consistency_score"] == 0
+    assert err["error_reason"] == "金额写错"
+    # 围栏 / 前后解释
+    assert parse_fact('```json\n{"fact_consistency_score": "3", '
+                      '"has_factual_error": 0}\n```')["fact_consistency_score"] == 3
+    assert parse_fact('好的：\n{"has_factual_error": 0, "fact_consistency_score": 2}\n以上')[
+        "fact_consistency_score"] == 2
+    # 解析失败 → 中性兜底，不触发门控
+    fb = parse_fact("我无法完成")
+    assert fb["parse"] == "fallback" and fb["has_factual_error"] == 0
+
+
+def test_解析_事实一致性一致性归一():
+    """prompt 约束：has=1 ⇔ 分数 0。模型给矛盾组合时以"是否报错"为准。"""
+    # 说没错误却给 0 分 → 按报错处理
+    a = parse_fact('{"has_factual_error": 0, "fact_consistency_score": 0}')
+    assert a["has_factual_error"] == 1 and a["fact_consistency_score"] == 0
+    # 说有错误却给 3 分 → 分数归 0
+    b = parse_fact('{"has_factual_error": 1, "fact_consistency_score": 3, '
+                   '"error_reason": "主体颠倒"}')
+    assert b["has_factual_error"] == 1 and b["fact_consistency_score"] == 0
+    # 没报错时分数不能是 0
+    c = parse_fact('{"fact_consistency_score": 1}')
+    assert c["has_factual_error"] == 0 and c["fact_consistency_score"] == 1
 
 
 def test_INP解析与重复分组():
@@ -158,14 +201,15 @@ def test_INP解析与重复分组():
 # ---------------------------------------------------------------- Prompt
 
 def test_一次性事实判定_prompt():
-    from sfzy.judge.prompts import JUDGE_SYSTEM, build_fact_six_messages
+    from sfzy.judge.prompts import JUDGE_SYSTEM, build_fact_messages
 
-    msgs = build_fact_six_messages("这是原文全文……", "这是摘要全文……")
+    msgs = build_fact_messages("这是原文全文……", "这是摘要全文……")
     assert msgs[0]["content"] == JUDGE_SYSTEM
     user = msgs[1]["content"]
     assert "【裁判文书原文】" in user and "这是原文全文" in user
     assert "【待评价摘要】" in user and "这是摘要全文" in user
-    assert "court_facts" in user and "judgment_result" in user
+    assert "has_factual_error" in user and "fact_consistency_score" in user
+    assert "error_reason" in user
 
 
 def test_一次性覆盖率判定_prompt():
@@ -271,7 +315,10 @@ class _FakeRT:
     """不加载模型：按 prompt 里的评价器身份选择要返回的 JSON。"""
 
     def __init__(self, fact=None, coverage=None, inp=None, ee=None):
-        self.fact = fact if fact is not None else {n: 4 for n in ELEMENTS}
+        # 事实一致性现在返回 (has_factual_error, 整体分, error_reason)
+        self.fact = fact if fact is not None else {
+            "has_factual_error": 0, "fact_consistency_score": 4, "error_reason": "",
+        }
         self.coverage = coverage if coverage is not None else {n: 3 for n in ELEMENTS}
         self.inp = inp if inp is not None else {
             "propositions": [{"text": "甲向乙借款", "necessity": 4, "group": 1}]
@@ -303,13 +350,25 @@ class _FakeRT:
         return out
 
 
-def test_一次性事实判定_六个分聚合成奖励():
-    rt = _FakeRT(fact={**{n: 4 for n in ELEMENTS}, "judgment_result": 0})
+def test_一次性事实判定_整体分与门控信号():
+    rt = _FakeRT(fact={"has_factual_error": 1, "fact_consistency_score": 0,
+                       "error_reason": "金额写错"})
     j = FactConsistencyJudge(runtime=rt)
     res = j.judge_candidates("原文", ["候选"])[0]
-    assert res.signals["fact_consistency"] == pytest.approx(0.70)
-    # 事实硬门控要读的最小原始分
-    assert res.signals["fact_consistency_min_raw"] == 0.0
+    assert res.signals["fact_consistency"] == 0.0
+    # 事实硬门控要读的信号
+    assert res.signals["fact_has_error"] == 1.0
+    assert res.fact_score == 0 and res.has_factual_error == 1
+    assert res.error_reason == "金额写错"
+
+
+def test_一次性事实判定_无错误时按整体分归一():
+    rt = _FakeRT(fact={"has_factual_error": 0, "fact_consistency_score": 3,
+                       "error_reason": ""})
+    j = FactConsistencyJudge(runtime=rt)
+    res = j.judge_candidates("原文", ["候选"])[0]
+    assert res.signals["fact_consistency"] == pytest.approx(0.75)
+    assert res.signals["fact_has_error"] == 0.0
 
 
 def test_覆盖率与INP_人工摘要自评短路():
@@ -395,7 +454,7 @@ def test_长原文判定时按头尾截断():
 
     rt = _RT()
     j = FactConsistencyJudge(runtime=rt, max_input_tokens=2000)
-    j.judge_fact_six_batch([("文" * 5000, "摘要")])
+    j.judge_fact_batch([("文" * 5000, "摘要")])
     assert rt.seen, "长输入没有被截断"
     budget = rt.seen[0][1]
     assert 0 < budget < 2000

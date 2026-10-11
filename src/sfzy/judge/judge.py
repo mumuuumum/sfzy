@@ -2,7 +2,8 @@
 
 当前方案不再抽取六要素，也不再逐要素判定。每一步都换成"一次性判定"：
 
-  * 事实一致性：``judge_fact_six_batch([(原文全文, 摘要全文)])``
+  * 事实一致性：``judge_fact_batch([(原文全文, 摘要全文)])``
+      → ``has_factual_error``（事实硬门控）+ ``fact_consistency_score``（整体 0~4）
   * 关键要素覆盖率：``judge_coverage_six_batch([(人工摘要, 候选摘要)])``
   * 信息必要性精确率：``judge_inp_batch([(原文, 人工摘要, 候选摘要)])``
   * 表达效率：``judge_ee_batch([(原文, 人工摘要, 候选摘要)])``
@@ -24,7 +25,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 from sfzy.judge.prompts import (
     build_coverage_six_messages,
     build_ee_messages,
-    build_fact_six_messages,
+    build_fact_messages,
     build_inp_messages,
 )
 from sfzy.judge.runtime import (
@@ -39,7 +40,6 @@ from sfzy.judge.schema import (
     ELEMENTS,
     MAX_SCORE,
     JudgeResult,
-    aggregate,
     aggregate_coverage,
     expression_efficiency_score,
     summarize_scores,
@@ -113,6 +113,93 @@ def _clamp_score(value: Any) -> Optional[int]:
         return max(0, min(MAX_SCORE, int(value)))
     except (TypeError, ValueError):
         return None
+
+
+# 解析失败时的中性兜底：不触发事实门控、给中间分（不奖励也不惩罚）
+_FACT_FALLBACK = {"has_factual_error": 0, "fact_consistency_score": 2,
+                  "error_reason": "", "parse": "fallback"}
+
+
+def parse_fact(text: str) -> Dict[str, Any]:
+    """解析事实一致性判定 → ``{"has_factual_error", "fact_consistency_score",
+    "error_reason", "parse"}``。
+
+    约定模型输出（见 prompts.JUDGE_SYSTEM）::
+
+        {"has_factual_error": 0, "fact_consistency_score": 4, "error_reason": ""}
+
+    容错到"别让一条样本因为格式失败"：掐 ``` 围栏 → 截 ``{}`` → 正则兜底。
+    解析不出来时返回中性兜底（``parse="fallback"``），不伪造事实错误。
+
+    **一致性归一**（prompt 里写死、这里兜底）：``has_factual_error=1`` ⇒ 分数 0；
+    ``has_factual_error=0`` ⇒ 分数只能 1~4。模型给出矛盾组合时，以"是否报错"
+    为准——分数 0 视为报了错，分数非 0 视为没报错。
+    """
+    raw = (text or "").strip()
+    fence = _FENCE_RE.search(raw)
+    if fence:
+        raw = fence.group(1).strip()
+
+    data: Optional[Dict[str, Any]] = None
+    for candidate in ([raw] + ([raw[raw.find("{"): raw.rfind("}") + 1]]
+                               if "{" in raw and "}" in raw else [])):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(parsed, dict):
+            data = parsed
+            break
+
+    has_raw: Optional[int] = None
+    score_raw: Optional[int] = None
+    reason = ""
+    if data is not None:
+        has_val = data.get("has_factual_error")
+        if has_val is not None:
+            marker = str(has_val).strip().lower()
+            if marker in ("1", "true", "yes"):
+                has_raw = 1
+            elif marker in ("0", "false", "no", ""):
+                has_raw = 0
+            else:
+                has_raw = 1 if _clamp_score(has_val) == 1 else 0
+        score_raw = _clamp_score(data.get("fact_consistency_score",
+                                          data.get("fact_consistency", data.get("score"))))
+        reason = str(data.get("error_reason") or "").strip()
+    else:
+        # 正则兜底：只认这两个键，避免把别处的数字当成分数
+        fixed = raw.replace("“", '"').replace("”", '"')
+        m = re.search(r'"?has_factual_error"?\s*[:：]\s*"?([01])', fixed)
+        if m:
+            has_raw = int(m.group(1))
+        m = re.search(r'"?fact_consistency_score"?\s*[:：]\s*"?([0-4])', fixed)
+        if m:
+            score_raw = int(m.group(1))
+        m = re.search(r'"?error_reason"?\s*[:：]\s*"(.*?)"', fixed, re.S)
+        if m:
+            reason = m.group(1).strip()
+
+    if has_raw is None and score_raw is None:
+        return dict(_FACT_FALLBACK)
+
+    # ---- 一致性归一 ----
+    # prompt 里写死了：has=1 ⇒ 分数 0；has=0 ⇒ 分数 1~4。模型给出矛盾组合时，
+    # 以"是否报错"为准——显式 has=1 或分数为 0 都算报了错（分数 0 的语义就是
+    # "存在明确事实错误或编造"）。
+    has = 1 if (has_raw == 1 or score_raw == 0) else 0
+    if has == 1:
+        score = 0
+    else:
+        score = score_raw if score_raw in (1, 2, 3, 4) else 2
+    if has == 0:
+        reason = ""
+    elif not reason:
+        reason = "（模型未给出 error_reason）"
+    return {"has_factual_error": has, "fact_consistency_score": score,
+            "error_reason": reason, "parse": "ok"}
 
 
 def parse_inp(text: str) -> Dict[str, Any]:
@@ -330,7 +417,7 @@ class FactConsistencyJudge:
             return document
         try:
             system_tokens = runtime.count_tokens(
-                runtime.render(build_fact_six_messages("", "")[:1])
+                runtime.render(build_fact_messages("", "")[:1])
             )
         except Exception:  # noqa: BLE001
             system_tokens = 1024
@@ -379,22 +466,19 @@ class FactConsistencyJudge:
         return list(raws)
 
     # ---------------------------------------------------------------- 三路判定
-    def judge_fact_six_batch(
+    def judge_fact_batch(
         self, items: Sequence[Tuple[str, str]]
-    ) -> List[Dict[str, int]]:
-        """事实一致性：`[(原文全文, 摘要全文)]` → `[{要素: 0-4}]`（顺序一致）。"""
+    ) -> List[Dict[str, Any]]:
+        """事实一致性：`[(原文全文, 摘要全文)]` → 每条的
+        `{has_factual_error, fact_consistency_score, error_reason}`（顺序一致）。"""
         if not items:
             return []
         conversations = [
-            build_fact_six_messages(self._fit_document_for_judge(doc), cand)
+            build_fact_messages(self._fit_document_for_judge(doc), cand)
             for doc, cand in items
         ]
         raws = self._generate(conversations, "[Judge:fact_consistency]")
-        results: List[Dict[str, int]] = []
-        for raw in raws:
-            parsed = parse_six_scores(raw)
-            results.append({name: parsed.get(name, 2) for name in ELEMENTS})
-        return results
+        return [parse_fact(raw) for raw in raws]
 
     def judge_coverage_six_batch(
         self, items: Sequence[Tuple[str, str]]
@@ -473,9 +557,9 @@ class FactConsistencyJudge:
             else [str(i) for i in range(len(candidates))]
         )
 
-        fact_raw: List[Dict[str, int]] = []
+        fact_rows: List[Dict[str, Any]] = []
         if "fact_consistency" in self.tasks:
-            fact_raw = self.judge_fact_six_batch(
+            fact_rows = self.judge_fact_batch(
                 [(document, text) for text in candidates]
             )
 
@@ -542,18 +626,23 @@ class FactConsistencyJudge:
             result = JudgeResult(candidate_id=ids[ci])
 
             if "fact_consistency" in self.tasks:
-                result = aggregate(
-                    dict(fact_raw[ci]),
-                    weights=self.weights,
-                    sources={name: "judge" for name in ELEMENTS},
+                row = fact_rows[ci]
+                score = int(row["fact_consistency_score"])
+                has_error = int(row["has_factual_error"])
+                result = JudgeResult(
                     candidate_id=ids[ci],
+                    weighted_reward=score / float(MAX_SCORE),
+                    scores={"fact_consistency": score / float(MAX_SCORE)},
+                    raw_scores={"fact_consistency": score},
+                    sources={"fact_consistency": "judge"},
+                    fact_score=score,
+                    has_factual_error=has_error,
+                    error_reason=str(row.get("error_reason") or ""),
                 )
                 signals["fact_consistency"] = result.weighted_reward
-                # 事实一致性硬门控要读的六要素原始分最小值。
+                # 事实硬门控信号：1 = 裁判判定"存在明确事实错误"。
                 # 名字必须与 sfzy/rl/reward_spec.py 的 FACT_GATE_SIGNAL 一致。
-                signals["fact_consistency_min_raw"] = float(
-                    min(result.raw_scores.values())
-                )
+                signals["fact_has_error"] = float(has_error)
 
             if "element_coverage" in self.tasks:
                 if ci in cov_pos:

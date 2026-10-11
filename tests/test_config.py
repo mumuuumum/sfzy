@@ -154,7 +154,7 @@ GRPO_CONFIGS = (
     "grpo_fact_only_t4.yaml",
     "grpo_fact_only_a100.yaml",
     "grpo_fact_coverage_inp_t4.yaml",
-    "grpo_fact_coverage_a100.yaml",
+    "grpo_fact_coverage_vGPU48.yaml",
     "grpo_smoke_fact_judge.yaml",
     "grpo_cloud_qwen.yaml",
 )
@@ -186,8 +186,8 @@ def test_渲染出来的是展开后的值():
         "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
     ]
     assert data["rl"]["learning_rate"] == pytest.approx(1e-5)
-    weights = data["rl"]["reward"]["terms"]["fact_consistency"]["element_weights"]
-    assert weights["judgment_result"] == pytest.approx(0.30)
+    # 新的事实一致性只有 enabled / weight（整体分 + 事实错误门控）
+    assert data["rl"]["reward"]["terms"]["fact_consistency"]["weight"] == pytest.approx(1.0)
     assert data["rl"]["reward"]["terms"]["rouge_l"]["enabled"] is False
     assert data["rl"]["max_length"] == 1536
     assert data["semantic"]["dtype"] == "float16"

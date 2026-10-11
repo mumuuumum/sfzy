@@ -1,0 +1,3822 @@
+{
+  "meta": {
+    "config_path": "/home/yukino/projects/sfzy/configs/grpo_fact_cov_ee_t4.yaml",
+    "tasks": [
+      "fact_consistency",
+      "element_coverage",
+      "expression_efficiency"
+    ],
+    "metric_weights": {
+      "fact_consistency": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.15,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.5,
+        "legal_basis": 0.1,
+        "judgment_result": 0.05
+      },
+      "element_coverage": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.15,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.5,
+        "legal_basis": 0.1,
+        "judgment_result": 0.05
+      },
+      "expression_efficiency": {
+        "semantic_redundancy": 0.2,
+        "verbal_redundancy": 0.2,
+        "abstraction_adequacy": 0.6
+      }
+    },
+    "judge_api": {
+      "base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+      "api_key_env": "SFZY_JUDGE_API_KEY",
+      "model": "qwen3.7-flash",
+      "extra_body": {
+        "enable_thinking": false
+      },
+      "concurrency": 16,
+      "max_retries": 3,
+      "timeout_s": 60,
+      "max_logprobs": 20
+    },
+    "six_max_new_tokens": 512,
+    "max_input_tokens": 11288,
+    "enabled_terms": [
+      "fact_consistency",
+      "element_coverage",
+      "expression_efficiency"
+    ],
+    "normalized_term_weights": {
+      "fact_consistency": 0.1,
+      "element_coverage": 0.45,
+      "expression_efficiency": 0.45
+    },
+    "reward_plan": {
+      "enabled_terms": [
+        "fact_consistency",
+        "element_coverage",
+        "expression_efficiency"
+      ],
+      "active_terms": [
+        "fact_consistency",
+        "element_coverage",
+        "expression_efficiency"
+      ],
+      "consumed_terms": [],
+      "normalized_weights": {
+        "fact_consistency": 0.1,
+        "element_coverage": 0.45,
+        "expression_efficiency": 0.45
+      },
+      "needed_signals": [
+        "element_coverage",
+        "expression_efficiency",
+        "fact_consistency"
+      ],
+      "missing_signals": [],
+      "gate_enabled": true,
+      "gate_cfg": {
+        "min_chars": 60,
+        "length_ratio_range": [
+          0.5,
+          1.5
+        ],
+        "forbidden_prefixes": [
+          "以下是",
+          "摘要：",
+          "摘要:",
+          "本摘要",
+          "这是"
+        ],
+        "require_result_marker": true,
+        "fact_consistency_min_raw": 0
+      },
+      "fact_consistency_enabled": true,
+      "fact_element_min_raw": 0,
+      "fact_element_gate_enabled": false,
+      "fc_strict_threshold": 1,
+      "rouge_mode": "jieba"
+    },
+    "input_path": "/home/yukino/projects/sfzy/data/triples/sft_val_100_n4.jsonl",
+    "reward_fields_reconstructed": 400,
+    "input_groups": 100,
+    "scored_groups": 100,
+    "n_candidates": 400,
+    "candidates_per_group": [
+      4
+    ],
+    "created_at": "2026-10-10T13:40:24"
+  },
+  "metrics": {
+    "fact_consistency": {
+      "label": "事实一致性",
+      "weight_field": "element_weights",
+      "weights": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.15,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.5,
+        "legal_basis": 0.1,
+        "judgment_result": 0.05
+      },
+      "global": {
+        "label": "事实一致性",
+        "n": 400,
+        "reward": {
+          "describe": {
+            "n": 400,
+            "mean": 0.7229062499999999,
+            "std": 0.21193051501358245,
+            "median": 0.725,
+            "min": 0.125,
+            "max": 1.0,
+            "p10": 0.42375000000000007,
+            "p25": 0.5625,
+            "p75": 0.878125,
+            "p90": 0.9625
+          },
+          "hist_counts": [
+            0,
+            0,
+            1,
+            1,
+            1,
+            11,
+            20,
+            4,
+            12,
+            29,
+            13,
+            19,
+            5,
+            32,
+            56,
+            7,
+            48,
+            43,
+            32,
+            66
+          ],
+          "hist_edges": [
+            0.0,
+            0.05,
+            0.1,
+            0.15,
+            0.2,
+            0.25,
+            0.3,
+            0.35,
+            0.4,
+            0.45,
+            0.5,
+            0.55,
+            0.6,
+            0.65,
+            0.7,
+            0.75,
+            0.8,
+            0.85,
+            0.9,
+            0.95,
+            1.0
+          ],
+          "full_ratio": 0.03,
+          "high_ratio_ge075": 0.49,
+          "low_ratio_le05": 0.2175,
+          "zero_ratio": 0.0
+        },
+        "subs": {
+          "case_type": {
+            "label": "案件类型",
+            "describe": {
+              "n": 400,
+              "mean": 3.89,
+              "std": 0.6315831244640483,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 4.0,
+              "p25": 4.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 10,
+              "1": 0,
+              "2": 0,
+              "3": 4,
+              "4": 386
+            },
+            "raw_ratio": {
+              "0": 0.025,
+              "1": 0.0,
+              "2": 0.0,
+              "3": 0.01,
+              "4": 0.965
+            },
+            "full_ratio": 0.965,
+            "low_ratio_le2": 0.025,
+            "entropy": 0.17265391463837018
+          },
+          "plaintiff_claims": {
+            "label": "原告诉讼请求",
+            "describe": {
+              "n": 400,
+              "mean": 3.4925,
+              "std": 0.7851655636908786,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 3.0,
+              "p25": 3.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 12,
+              "1": 0,
+              "2": 1,
+              "3": 153,
+              "4": 234
+            },
+            "raw_ratio": {
+              "0": 0.03,
+              "1": 0.0,
+              "2": 0.0025,
+              "3": 0.3825,
+              "4": 0.585
+            },
+            "full_ratio": 0.585,
+            "low_ratio_le2": 0.0325,
+            "entropy": 0.8014119901974802
+          },
+          "defendant_defenses": {
+            "label": "被告辩称",
+            "describe": {
+              "n": 400,
+              "mean": 2.4725,
+              "std": 1.7950764604180143,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 129,
+              "1": 3,
+              "2": 21,
+              "3": 44,
+              "4": 203
+            },
+            "raw_ratio": {
+              "0": 0.3225,
+              "1": 0.0075,
+              "2": 0.0525,
+              "3": 0.11,
+              "4": 0.5075
+            },
+            "full_ratio": 0.5075,
+            "low_ratio_le2": 0.3825,
+            "entropy": 1.1433851324611364
+          },
+          "court_facts": {
+            "label": "法院查明事实与说理",
+            "describe": {
+              "n": 400,
+              "mean": 2.55,
+              "std": 1.4757861844303153,
+              "median": 3.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 2.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 80,
+              "1": 11,
+              "2": 52,
+              "3": 123,
+              "4": 134
+            },
+            "raw_ratio": {
+              "0": 0.2,
+              "1": 0.0275,
+              "2": 0.13,
+              "3": 0.3075,
+              "4": 0.335
+            },
+            "full_ratio": 0.335,
+            "low_ratio_le2": 0.3575,
+            "entropy": 1.4149323944950913
+          },
+          "legal_basis": {
+            "label": "法律依据",
+            "describe": {
+              "n": 400,
+              "mean": 3.7225,
+              "std": 0.7595630916688645,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 3.0,
+              "p25": 4.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 10,
+              "1": 1,
+              "2": 12,
+              "3": 44,
+              "4": 333
+            },
+            "raw_ratio": {
+              "0": 0.025,
+              "1": 0.0025,
+              "2": 0.03,
+              "3": 0.11,
+              "4": 0.8325
+            },
+            "full_ratio": 0.8325,
+            "low_ratio_le2": 0.0575,
+            "entropy": 0.6078132376497626
+          },
+          "judgment_result": {
+            "label": "裁判结果",
+            "describe": {
+              "n": 400,
+              "mean": 3.1025,
+              "std": 1.5058761261365992,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 3.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 65,
+              "1": 9,
+              "2": 17,
+              "3": 38,
+              "4": 271
+            },
+            "raw_ratio": {
+              "0": 0.1625,
+              "1": 0.0225,
+              "2": 0.0425,
+              "3": 0.095,
+              "4": 0.6775
+            },
+            "full_ratio": 0.6775,
+            "low_ratio_le2": 0.2275,
+            "entropy": 1.0022713093174829
+          }
+        }
+      },
+      "group": {
+        "n_groups": 100,
+        "reward": {
+          "std": {
+            "n": 100,
+            "mean": 0.1643081052562597,
+            "std": 0.07921720665614192,
+            "median": 0.16946679174344162,
+            "min": 0.0,
+            "max": 0.3273154696415473,
+            "p10": 0.05336332192631022,
+            "p25": 0.10653238359322979,
+            "p75": 0.23126306968027927,
+            "p90": 0.2587704809630427
+          },
+          "zero_var_groups": 2,
+          "zero_var_ratio": 0.02,
+          "nonzero_var_ratio": 0.98,
+          "range": {
+            "n": 100,
+            "mean": 0.35687499999999994,
+            "std": 0.17171681196115018,
+            "median": 0.375,
+            "min": 0.0,
+            "max": 0.6875,
+            "p10": 0.125,
+            "p25": 0.23437500000000003,
+            "p75": 0.5,
+            "p90": 0.5637500000000001
+          },
+          "range_hist": {
+            "0.0": 2,
+            "0.0375": 1,
+            "0.05": 1,
+            "0.075": 2,
+            "0.0875": 2,
+            "0.125": 4,
+            "0.1375": 1,
+            "0.15": 3,
+            "0.1625": 2,
+            "0.175": 1,
+            "0.2": 4,
+            "0.2125": 1,
+            "0.225": 1,
+            "0.2375": 3,
+            "0.25": 4,
+            "0.2625": 2,
+            "0.275": 4,
+            "0.2875": 4,
+            "0.3": 1,
+            "0.325": 1,
+            "0.3375": 2,
+            "0.35": 1,
+            "0.3625": 1,
+            "0.375": 3,
+            "0.3875": 1,
+            "0.4": 6,
+            "0.4125": 2,
+            "0.425": 1,
+            "0.4375": 1,
+            "0.45": 1,
+            "0.4625": 3,
+            "0.475": 2,
+            "0.4875": 6,
+            "0.5": 4,
+            "0.5125": 1,
+            "0.525": 3,
+            "0.5375": 3,
+            "0.55": 2,
+            "0.5625": 3,
+            "0.575": 2,
+            "0.6": 3,
+            "0.6125": 1,
+            "0.625": 2,
+            "0.65": 1,
+            "0.6875": 1
+          },
+          "n_distinct_dist": {
+            "1": 2,
+            "2": 12,
+            "3": 31,
+            "4": 55
+          },
+          "pairwise_mean": 0.875,
+          "max_tie_dist": {
+            "1": 76,
+            "2": 17,
+            "3": 5,
+            "4": 2
+          }
+        },
+        "subs": {
+          "case_type": {
+            "std": {
+              "n": 100,
+              "mean": 0.12309401076758503,
+              "std": 0.4585673758879612,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 2.309401076758503,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.0,
+              "p90": 0.0
+            },
+            "zero_var_groups": 91,
+            "zero_var_ratio": 0.91,
+            "nonzero_var_ratio": 0.08999999999999997,
+            "range": {
+              "n": 100,
+              "mean": 0.24,
+              "std": 0.8889898932513408,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.0,
+              "p90": 0.0
+            },
+            "range_hist": {
+              "0.0": 91,
+              "1.0": 4,
+              "4.0": 5
+            },
+            "n_distinct_dist": {
+              "1": 91,
+              "2": 9,
+              "3": 0,
+              "4": 0
+            },
+            "pairwise_mean": 0.04666666666666666,
+            "max_tie_dist": {
+              "1": 0,
+              "2": 1,
+              "3": 8,
+              "4": 91
+            }
+          },
+          "plaintiff_claims": {
+            "std": {
+              "n": 100,
+              "mean": 0.45484762150399805,
+              "std": 0.504805500977349,
+              "median": 0.5,
+              "min": 0.0,
+              "max": 2.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.5773502691896257,
+              "p90": 0.6610365985079798
+            },
+            "zero_var_groups": 38,
+            "zero_var_ratio": 0.38,
+            "nonzero_var_ratio": 0.62,
+            "range": {
+              "n": 100,
+              "mean": 0.87,
+              "std": 1.011599393699568,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 1.0,
+              "p90": 1.200000000000017
+            },
+            "range_hist": {
+              "0.0": 38,
+              "1.0": 52,
+              "3.0": 5,
+              "4.0": 5
+            },
+            "n_distinct_dist": {
+              "1": 38,
+              "2": 58,
+              "3": 4,
+              "4": 0
+            },
+            "pairwise_mean": 0.37166666666666665,
+            "max_tie_dist": {
+              "1": 6,
+              "2": 32,
+              "3": 24,
+              "4": 38
+            }
+          },
+          "defendant_defenses": {
+            "std": {
+              "n": 100,
+              "mean": 1.352755025924472,
+              "std": 0.8473888432628071,
+              "median": 1.8929694486000912,
+              "min": 0.0,
+              "max": 2.309401076758503,
+              "p10": 0.0,
+              "p25": 0.5,
+              "p75": 2.0,
+              "p90": 2.0615528128088303
+            },
+            "zero_var_groups": 21,
+            "zero_var_ratio": 0.21,
+            "nonzero_var_ratio": 0.79,
+            "range": {
+              "n": 100,
+              "mean": 2.72,
+              "std": 1.6941968688151416,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 1.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "range_hist": {
+              "0.0": 21,
+              "1.0": 10,
+              "2.0": 4,
+              "3.0": 6,
+              "4.0": 59
+            },
+            "n_distinct_dist": {
+              "1": 21,
+              "2": 49,
+              "3": 26,
+              "4": 4
+            },
+            "pairwise_mean": 0.52,
+            "max_tie_dist": {
+              "1": 30,
+              "2": 24,
+              "3": 25,
+              "4": 21
+            }
+          },
+          "court_facts": {
+            "std": {
+              "n": 100,
+              "mean": 1.106247459352748,
+              "std": 0.6272836195876257,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 2.0615528128088303,
+              "p10": 0.4500000000000002,
+              "p25": 0.5,
+              "p75": 1.632993161855452,
+              "p90": 1.89515792529135
+            },
+            "zero_var_groups": 10,
+            "zero_var_ratio": 0.1,
+            "nonzero_var_ratio": 0.9,
+            "range": {
+              "n": 100,
+              "mean": 2.3,
+              "std": 1.3295400586957762,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.9000000000000004,
+              "p25": 1.0,
+              "p75": 3.25,
+              "p90": 4.0
+            },
+            "range_hist": {
+              "0.0": 10,
+              "1.0": 22,
+              "2.0": 21,
+              "3.0": 22,
+              "4.0": 25
+            },
+            "n_distinct_dist": {
+              "1": 10,
+              "2": 40,
+              "3": 48,
+              "4": 2
+            },
+            "pairwise_mean": 0.6316666666666667,
+            "max_tie_dist": {
+              "1": 42,
+              "2": 26,
+              "3": 22,
+              "4": 10
+            }
+          },
+          "legal_basis": {
+            "std": {
+              "n": 100,
+              "mean": 0.4152050228010936,
+              "std": 0.6114272002890254,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 2.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.5773502691896257,
+              "p90": 1.520782512765995
+            },
+            "zero_var_groups": 57,
+            "zero_var_ratio": 0.57,
+            "nonzero_var_ratio": 0.43000000000000005,
+            "range": {
+              "n": 100,
+              "mean": 0.84,
+              "std": 1.2610721748984197,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 1.0,
+              "p90": 3.1000000000000085
+            },
+            "range_hist": {
+              "0.0": 57,
+              "1.0": 23,
+              "2.0": 9,
+              "3.0": 1,
+              "4.0": 10
+            },
+            "n_distinct_dist": {
+              "1": 57,
+              "2": 36,
+              "3": 6,
+              "4": 1
+            },
+            "pairwise_mean": 0.25166666666666665,
+            "max_tie_dist": {
+              "1": 5,
+              "2": 11,
+              "3": 27,
+              "4": 57
+            }
+          },
+          "judgment_result": {
+            "std": {
+              "n": 100,
+              "mean": 0.952913921983196,
+              "std": 0.919003480916496,
+              "median": 0.6969234250586759,
+              "min": 0.0,
+              "max": 2.309401076758503,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 1.9148542155126762,
+              "p90": 2.0615528128088303
+            },
+            "zero_var_groups": 41,
+            "zero_var_ratio": 0.41,
+            "nonzero_var_ratio": 0.5900000000000001,
+            "range": {
+              "n": 100,
+              "mean": 1.9,
+              "std": 1.8118576883486968,
+              "median": 1.5,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "range_hist": {
+              "0.0": 41,
+              "1.0": 9,
+              "2.0": 5,
+              "3.0": 9,
+              "4.0": 36
+            },
+            "n_distinct_dist": {
+              "1": 41,
+              "2": 35,
+              "3": 21,
+              "4": 3
+            },
+            "pairwise_mean": 0.3983333333333334,
+            "max_tie_dist": {
+              "1": 17,
+              "2": 23,
+              "3": 19,
+              "4": 41
+            }
+          }
+        },
+        "discriminability": {
+          "tied_groups_per_sub": {
+            "case_type": 91,
+            "plaintiff_claims": 38,
+            "defendant_defenses": 21,
+            "court_facts": 10,
+            "legal_basis": 57,
+            "judgment_result": 41
+          },
+          "all_subs_tied_groups": 1,
+          "combination_counts": {
+            "plaintiff_claims+defendant_defenses+court_facts+legal_basis+judgment_result": 10,
+            "defendant_defenses+court_facts+legal_basis": 7,
+            "defendant_defenses+court_facts+judgment_result": 5,
+            "plaintiff_claims+defendant_defenses+court_facts+judgment_result": 16,
+            "case_type+plaintiff_claims+defendant_defenses+court_facts+judgment_result": 4,
+            "plaintiff_claims+defendant_defenses+court_facts": 9,
+            "defendant_defenses+court_facts": 5,
+            "case_type+defendant_defenses+court_facts+legal_basis": 3,
+            "case_type+plaintiff_claims+defendant_defenses+court_facts": 1,
+            "plaintiff_claims+defendant_defenses+court_facts+legal_basis": 6,
+            "defendant_defenses+court_facts+legal_basis+judgment_result": 7,
+            "plaintiff_claims+defendant_defenses": 2,
+            "court_facts+judgment_result": 2,
+            "plaintiff_claims+court_facts+legal_basis+judgment_result": 4,
+            "plaintiff_claims+court_facts": 3,
+            "plaintiff_claims+defendant_defenses+legal_basis+judgment_result": 1,
+            "judgment_result": 2,
+            "court_facts+legal_basis+judgment_result": 2,
+            "plaintiff_claims+court_facts+legal_basis": 1,
+            "defendant_defenses": 2,
+            "plaintiff_claims+court_facts+judgment_result": 3,
+            "case_type+court_facts+legal_basis+judgment_result": 1,
+            "court_facts": 1,
+            "(none)": 1,
+            "plaintiff_claims+defendant_defenses+judgment_result": 1,
+            "plaintiff_claims+legal_basis+judgment_result": 1
+          }
+        }
+      },
+      "length_bias": {
+        "global": {
+          "reward~candidate_chars": {
+            "pearson_r": -0.10332719567801582,
+            "pearson_p": 0.03886546545520939,
+            "spearman_r": -0.08457943469992539,
+            "spearman_p": 0.09115753987905381
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": -0.030270928819315465,
+            "pearson_p": 0.5460682029906017,
+            "spearman_r": -0.010836236321895308,
+            "spearman_p": 0.828946567837136
+          },
+          "reward~len_diff_to_ref": {
+            "pearson_r": -0.03309461607880789,
+            "pearson_p": 0.5092527127292464,
+            "spearman_r": -0.012423867825817832,
+            "spearman_p": 0.8043593305081593
+          }
+        },
+        "within_group": {
+          "reward~candidate_chars": {
+            "pearson_r": 0.05519267653412103,
+            "pearson_p": 0.2707928277885633,
+            "spearman_r": 0.04045969859162982,
+            "spearman_p": 0.41967104486114776
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": 0.04596991826545353,
+            "pearson_p": 0.35913951329359867,
+            "spearman_r": 0.035329878505739126,
+            "spearman_p": 0.48105529612388565
+          }
+        },
+        "shortest_highest": {
+          "groups_usable": 100,
+          "count": 37,
+          "ratio": 0.37
+        },
+        "longest_highest": {
+          "count": 36,
+          "ratio": 0.36
+        },
+        "shortest_lowest": {
+          "count": 24,
+          "ratio": 0.24
+        }
+      },
+      "contribution": {
+        "terms": {
+          "case_type": {
+            "label": "案件类型",
+            "weight": 0.05,
+            "mean_contribution": 0.048625,
+            "share_of_reward_mean": 0.06726321704923703
+          },
+          "plaintiff_claims": {
+            "label": "原告诉讼请求",
+            "weight": 0.15,
+            "mean_contribution": 0.13096874999999997,
+            "share_of_reward_mean": 0.18116975748930098
+          },
+          "defendant_defenses": {
+            "label": "被告辩称",
+            "weight": 0.15,
+            "mean_contribution": 0.09271874999999997,
+            "share_of_reward_mean": 0.12825833225262612
+          },
+          "court_facts": {
+            "label": "法院查明事实与说理",
+            "weight": 0.5,
+            "mean_contribution": 0.31875,
+            "share_of_reward_mean": 0.4409285436389574
+          },
+          "legal_basis": {
+            "label": "法律依据",
+            "weight": 0.1,
+            "mean_contribution": 0.0930625,
+            "share_of_reward_mean": 0.12873384342713876
+          },
+          "judgment_result": {
+            "label": "裁判结果",
+            "weight": 0.05,
+            "mean_contribution": 0.038781249999999996,
+            "share_of_reward_mean": 0.05364630614273981
+          }
+        },
+        "within_group_var_reward_mean": 0.033209765625,
+        "within_group_variance_share": {
+          "case_type": 0.0010507702381092412,
+          "plaintiff_claims": 0.019443170189491515,
+          "defendant_defenses": 0.10759024665655104,
+          "court_facts": 0.7590638734998097,
+          "legal_basis": 0.01020972276133009,
+          "judgment_result": 0.00820620189687553,
+          "case_type~plaintiff_claims": -0.0004940188432901654,
+          "case_type~defendant_defenses": -0.0019055012526906388,
+          "case_type~court_facts": -0.004312862917612556,
+          "case_type~legal_basis": -0.0010664533759914686,
+          "case_type~judgment_result": -0.0005097019811723931,
+          "plaintiff_claims~defendant_defenses": -0.0007763153251702603,
+          "plaintiff_claims~court_facts": 0.0030582118870343565,
+          "plaintiff_claims~legal_basis": -0.001881976545867297,
+          "plaintiff_claims~judgment_result": 0.0009645129797569897,
+          "defendant_defenses~court_facts": 0.05857651999011961,
+          "defendant_defenses~legal_basis": 0.004281496641848101,
+          "defendant_defenses~judgment_result": -0.00442264488278815,
+          "court_facts~legal_basis": 0.022583718550407566,
+          "court_facts~judgment_result": 0.017957192875150466,
+          "legal_basis~judgment_result": 0.0023838369580985773
+        }
+      },
+      "ranking": {
+        "top1_tie_dist": {
+          "1": 76,
+          "2": 17,
+          "3": 5,
+          "4": 2
+        },
+        "mean_within_group_spearman_reward_vs_sub": {
+          "plaintiff_claims": 0.11692986538603566,
+          "defendant_defenses": 0.4105822985882837,
+          "court_facts": 0.8793899790768458,
+          "legal_basis": 0.393699922905996,
+          "judgment_result": 0.24631625437048008,
+          "case_type": -0.11684716452761573
+        }
+      }
+    },
+    "element_coverage": {
+      "label": "关键要素覆盖率",
+      "weight_field": "element_weights",
+      "weights": {
+        "case_type": 0.05,
+        "plaintiff_claims": 0.15,
+        "defendant_defenses": 0.15,
+        "court_facts": 0.5,
+        "legal_basis": 0.1,
+        "judgment_result": 0.05
+      },
+      "global": {
+        "label": "关键要素覆盖率",
+        "n": 400,
+        "reward": {
+          "describe": {
+            "n": 400,
+            "mean": 0.66328125,
+            "std": 0.135226183022648,
+            "median": 0.675,
+            "min": 0.25,
+            "max": 1.0,
+            "p10": 0.51125,
+            "p25": 0.5625,
+            "p75": 0.75,
+            "p90": 0.8375
+          },
+          "hist_counts": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            2,
+            0,
+            7,
+            8,
+            16,
+            47,
+            71,
+            34,
+            63,
+            42,
+            37,
+            37,
+            23,
+            2,
+            11
+          ],
+          "hist_edges": [
+            0.0,
+            0.05,
+            0.1,
+            0.15,
+            0.2,
+            0.25,
+            0.3,
+            0.35,
+            0.4,
+            0.45,
+            0.5,
+            0.55,
+            0.6,
+            0.65,
+            0.7,
+            0.75,
+            0.8,
+            0.85,
+            0.9,
+            0.95,
+            1.0
+          ],
+          "full_ratio": 0.0175,
+          "high_ratio_ge075": 0.275,
+          "low_ratio_le05": 0.1,
+          "zero_ratio": 0.0
+        },
+        "subs": {
+          "case_type": {
+            "label": "案件类型",
+            "describe": {
+              "n": 400,
+              "mean": 4.0,
+              "std": 0.0,
+              "median": 4.0,
+              "min": 4.0,
+              "max": 4.0,
+              "p10": 4.0,
+              "p25": 4.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 0,
+              "1": 0,
+              "2": 0,
+              "3": 0,
+              "4": 400
+            },
+            "raw_ratio": {
+              "0": 0.0,
+              "1": 0.0,
+              "2": 0.0,
+              "3": 0.0,
+              "4": 1.0
+            },
+            "full_ratio": 1.0,
+            "low_ratio_le2": 0.0,
+            "entropy": -0.0
+          },
+          "plaintiff_claims": {
+            "label": "原告诉讼请求",
+            "describe": {
+              "n": 400,
+              "mean": 3.2275,
+              "std": 0.7464158301367254,
+              "median": 3.0,
+              "min": 1.0,
+              "max": 4.0,
+              "p10": 2.0,
+              "p25": 3.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 0,
+              "1": 4,
+              "2": 64,
+              "3": 169,
+              "4": 163
+            },
+            "raw_ratio": {
+              "0": 0.0,
+              "1": 0.01,
+              "2": 0.16,
+              "3": 0.4225,
+              "4": 0.4075
+            },
+            "full_ratio": 0.4075,
+            "low_ratio_le2": 0.17,
+            "entropy": 1.0690948962754814
+          },
+          "defendant_defenses": {
+            "label": "被告辩称",
+            "describe": {
+              "n": 400,
+              "mean": 2.2,
+              "std": 1.5332570537853254,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 1.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 90,
+              "1": 47,
+              "2": 76,
+              "3": 67,
+              "4": 120
+            },
+            "raw_ratio": {
+              "0": 0.225,
+              "1": 0.1175,
+              "2": 0.19,
+              "3": 0.1675,
+              "4": 0.3
+            },
+            "full_ratio": 0.3,
+            "low_ratio_le2": 0.5325,
+            "entropy": 1.5632421568457369
+          },
+          "court_facts": {
+            "label": "法院查明事实与说理",
+            "describe": {
+              "n": 400,
+              "mean": 2.2175,
+              "std": 0.7853251485674142,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 1.0,
+              "p25": 2.0,
+              "p75": 3.0,
+              "p90": 3.0
+            },
+            "raw_counts": {
+              "0": 3,
+              "1": 66,
+              "2": 186,
+              "3": 131,
+              "4": 14
+            },
+            "raw_ratio": {
+              "0": 0.0075,
+              "1": 0.165,
+              "2": 0.465,
+              "3": 0.3275,
+              "4": 0.035
+            },
+            "full_ratio": 0.035,
+            "low_ratio_le2": 0.6375,
+            "entropy": 1.1729655893470612
+          },
+          "legal_basis": {
+            "label": "法律依据",
+            "describe": {
+              "n": 400,
+              "mean": 3.6875,
+              "std": 0.7722270303907818,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 3.0,
+              "p25": 4.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 10,
+              "1": 2,
+              "2": 10,
+              "3": 59,
+              "4": 319
+            },
+            "raw_ratio": {
+              "0": 0.025,
+              "1": 0.005,
+              "2": 0.025,
+              "3": 0.1475,
+              "4": 0.7975
+            },
+            "full_ratio": 0.7975,
+            "low_ratio_le2": 0.055,
+            "entropy": 0.6736928791084729
+          },
+          "judgment_result": {
+            "label": "裁判结果",
+            "describe": {
+              "n": 400,
+              "mean": 3.23,
+              "std": 1.027003817960412,
+              "median": 4.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 2.0,
+              "p25": 3.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 7,
+              "1": 26,
+              "2": 55,
+              "3": 92,
+              "4": 220
+            },
+            "raw_ratio": {
+              "0": 0.0175,
+              "1": 0.065,
+              "2": 0.1375,
+              "3": 0.23,
+              "4": 0.55
+            },
+            "full_ratio": 0.55,
+            "low_ratio_le2": 0.22,
+            "entropy": 1.1881200083435748
+          }
+        }
+      },
+      "group": {
+        "n_groups": 100,
+        "reward": {
+          "std": {
+            "n": 100,
+            "mean": 0.09293733487336565,
+            "std": 0.0471797274093449,
+            "median": 0.08831022893117693,
+            "min": 0.0,
+            "max": 0.21323402636539976,
+            "p10": 0.036346589370568956,
+            "p25": 0.061103768390031975,
+            "p75": 0.11741693405638522,
+            "p90": 0.15879444832895825
+          },
+          "zero_var_groups": 2,
+          "zero_var_ratio": 0.02,
+          "nonzero_var_ratio": 0.98,
+          "range": {
+            "n": 100,
+            "mean": 0.20325,
+            "std": 0.10680182015246176,
+            "median": 0.18750000000000003,
+            "min": 0.0,
+            "max": 0.45000000000000007,
+            "p10": 0.07500000000000001,
+            "p25": 0.125,
+            "p75": 0.2625,
+            "p90": 0.3637500000000001
+          },
+          "range_hist": {
+            "0.0": 2,
+            "0.025": 1,
+            "0.0375": 1,
+            "0.05": 2,
+            "0.0625": 2,
+            "0.075": 5,
+            "0.0875": 1,
+            "0.1": 2,
+            "0.1125": 2,
+            "0.125": 9,
+            "0.1375": 4,
+            "0.15": 7,
+            "0.1625": 5,
+            "0.175": 6,
+            "0.1875": 2,
+            "0.2": 8,
+            "0.2125": 3,
+            "0.225": 3,
+            "0.2375": 3,
+            "0.25": 5,
+            "0.2625": 3,
+            "0.275": 2,
+            "0.2875": 2,
+            "0.3": 3,
+            "0.3125": 1,
+            "0.325": 3,
+            "0.3375": 1,
+            "0.35": 1,
+            "0.3625": 1,
+            "0.375": 1,
+            "0.3875": 1,
+            "0.4": 3,
+            "0.4125": 1,
+            "0.4375": 1,
+            "0.45": 3
+          },
+          "n_distinct_dist": {
+            "1": 2,
+            "2": 11,
+            "3": 36,
+            "4": 51
+          },
+          "pairwise_mean": 0.8716666666666666,
+          "max_tie_dist": {
+            "1": 75,
+            "2": 19,
+            "3": 4,
+            "4": 2
+          }
+        },
+        "subs": {
+          "case_type": {
+            "std": {
+              "n": 100,
+              "mean": 0.0,
+              "std": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.0,
+              "p90": 0.0
+            },
+            "zero_var_groups": 100,
+            "zero_var_ratio": 1.0,
+            "nonzero_var_ratio": 0.0,
+            "range": {
+              "n": 100,
+              "mean": 0.0,
+              "std": 0.0,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 0.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.0,
+              "p90": 0.0
+            },
+            "range_hist": {
+              "0.0": 100
+            },
+            "n_distinct_dist": {
+              "1": 100,
+              "2": 0,
+              "3": 0,
+              "4": 0
+            },
+            "pairwise_mean": 0.0,
+            "max_tie_dist": {
+              "1": 0,
+              "2": 0,
+              "3": 0,
+              "4": 100
+            }
+          },
+          "plaintiff_claims": {
+            "std": {
+              "n": 100,
+              "mean": 0.3975432898120023,
+              "std": 0.3350350492627025,
+              "median": 0.5,
+              "min": 0.0,
+              "max": 1.4142135623730951,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.5773502691896257,
+              "p90": 0.8305896336105885
+            },
+            "zero_var_groups": 35,
+            "zero_var_ratio": 0.35,
+            "nonzero_var_ratio": 0.65,
+            "range": {
+              "n": 100,
+              "mean": 0.77,
+              "std": 0.6644660649838723,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 3.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 1.0,
+              "p90": 2.0
+            },
+            "range_hist": {
+              "0.0": 35,
+              "1.0": 54,
+              "2.0": 10,
+              "3.0": 1
+            },
+            "n_distinct_dist": {
+              "1": 35,
+              "2": 57,
+              "3": 8,
+              "4": 0
+            },
+            "pairwise_mean": 0.38666666666666666,
+            "max_tie_dist": {
+              "1": 17,
+              "2": 27,
+              "3": 21,
+              "4": 35
+            }
+          },
+          "defendant_defenses": {
+            "std": {
+              "n": 100,
+              "mean": 1.0697486727436423,
+              "std": 0.7734903470631558,
+              "median": 0.9574271077563381,
+              "min": 0.0,
+              "max": 2.309401076758503,
+              "p10": 0.0,
+              "p25": 0.5,
+              "p75": 1.8929694486000912,
+              "p90": 2.0
+            },
+            "zero_var_groups": 18,
+            "zero_var_ratio": 0.18,
+            "nonzero_var_ratio": 0.8200000000000001,
+            "range": {
+              "n": 100,
+              "mean": 2.14,
+              "std": 1.4976075196219745,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 1.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "range_hist": {
+              "0.0": 18,
+              "1.0": 23,
+              "2.0": 14,
+              "3.0": 17,
+              "4.0": 28
+            },
+            "n_distinct_dist": {
+              "1": 18,
+              "2": 51,
+              "3": 30,
+              "4": 1
+            },
+            "pairwise_mean": 0.5466666666666666,
+            "max_tie_dist": {
+              "1": 36,
+              "2": 28,
+              "3": 18,
+              "4": 18
+            }
+          },
+          "court_facts": {
+            "std": {
+              "n": 100,
+              "mean": 0.5240552477892686,
+              "std": 0.3570352536110017,
+              "median": 0.5,
+              "min": 0.0,
+              "max": 1.5,
+              "p10": 0.0,
+              "p25": 0.5,
+              "p75": 0.5773502691896257,
+              "p90": 0.9574271077563381
+            },
+            "zero_var_groups": 22,
+            "zero_var_ratio": 0.22,
+            "nonzero_var_ratio": 0.78,
+            "range": {
+              "n": 100,
+              "mean": 1.06,
+              "std": 0.7630348761506397,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 3.0,
+              "p10": 0.0,
+              "p25": 1.0,
+              "p75": 1.0,
+              "p90": 2.0
+            },
+            "range_hist": {
+              "0.0": 22,
+              "1.0": 54,
+              "2.0": 20,
+              "3.0": 4
+            },
+            "n_distinct_dist": {
+              "1": 22,
+              "2": 57,
+              "3": 21,
+              "4": 0
+            },
+            "pairwise_mean": 0.495,
+            "max_tie_dist": {
+              "1": 32,
+              "2": 27,
+              "3": 19,
+              "4": 22
+            }
+          },
+          "legal_basis": {
+            "std": {
+              "n": 100,
+              "mean": 0.41373525212628176,
+              "std": 0.5857365858139175,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 2.309401076758503,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.5193375672974064,
+              "p90": 1.1650610584625063
+            },
+            "zero_var_groups": 53,
+            "zero_var_ratio": 0.53,
+            "nonzero_var_ratio": 0.47,
+            "range": {
+              "n": 100,
+              "mean": 0.82,
+              "std": 1.1753357568857257,
+              "median": 0.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 1.0,
+              "p90": 2.1000000000000085
+            },
+            "range_hist": {
+              "0.0": 53,
+              "1.0": 30,
+              "2.0": 7,
+              "3.0": 2,
+              "4.0": 8
+            },
+            "n_distinct_dist": {
+              "1": 53,
+              "2": 42,
+              "3": 5,
+              "4": 0
+            },
+            "pairwise_mean": 0.27,
+            "max_tie_dist": {
+              "1": 8,
+              "2": 13,
+              "3": 26,
+              "4": 53
+            }
+          },
+          "judgment_result": {
+            "std": {
+              "n": 100,
+              "mean": 0.6394148896451146,
+              "std": 0.5545786754884509,
+              "median": 0.5773502691896257,
+              "min": 0.0,
+              "max": 2.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 0.9574271077563381,
+              "p90": 1.5
+            },
+            "zero_var_groups": 32,
+            "zero_var_ratio": 0.32,
+            "nonzero_var_ratio": 0.6799999999999999,
+            "range": {
+              "n": 100,
+              "mean": 1.32,
+              "std": 1.1796250046159378,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.0,
+              "p25": 0.0,
+              "p75": 2.0,
+              "p90": 3.0
+            },
+            "range_hist": {
+              "0.0": 32,
+              "1.0": 25,
+              "2.0": 27,
+              "3.0": 11,
+              "4.0": 5
+            },
+            "n_distinct_dist": {
+              "1": 32,
+              "2": 37,
+              "3": 26,
+              "4": 5
+            },
+            "pairwise_mean": 0.47333333333333344,
+            "max_tie_dist": {
+              "1": 20,
+              "2": 27,
+              "3": 21,
+              "4": 32
+            }
+          }
+        },
+        "discriminability": {
+          "tied_groups_per_sub": {
+            "case_type": 100,
+            "plaintiff_claims": 35,
+            "defendant_defenses": 18,
+            "court_facts": 22,
+            "legal_basis": 53,
+            "judgment_result": 32
+          },
+          "all_subs_tied_groups": 0,
+          "combination_counts": {
+            "plaintiff_claims+defendant_defenses+judgment_result": 3,
+            "plaintiff_claims+defendant_defenses+court_facts+legal_basis+judgment_result": 17,
+            "defendant_defenses+court_facts+judgment_result": 7,
+            "plaintiff_claims+defendant_defenses+court_facts+judgment_result": 13,
+            "defendant_defenses": 3,
+            "plaintiff_claims+defendant_defenses+court_facts+legal_basis": 6,
+            "defendant_defenses+court_facts+legal_basis": 2,
+            "plaintiff_claims+defendant_defenses+court_facts": 11,
+            "plaintiff_claims+defendant_defenses": 1,
+            "defendant_defenses+court_facts": 3,
+            "defendant_defenses+court_facts+legal_basis+judgment_result": 7,
+            "plaintiff_claims+court_facts+legal_basis+judgment_result": 1,
+            "defendant_defenses+judgment_result": 2,
+            "plaintiff_claims+court_facts+judgment_result": 3,
+            "legal_basis": 1,
+            "court_facts+judgment_result": 3,
+            "plaintiff_claims+defendant_defenses+legal_basis+judgment_result": 5,
+            "plaintiff_claims+legal_basis+judgment_result": 1,
+            "plaintiff_claims+defendant_defenses+legal_basis": 2,
+            "court_facts+legal_basis+judgment_result": 2,
+            "plaintiff_claims+judgment_result": 2,
+            "legal_basis+judgment_result": 2,
+            "court_facts": 2,
+            "court_facts+legal_basis": 1
+          }
+        }
+      },
+      "length_bias": {
+        "global": {
+          "reward~candidate_chars": {
+            "pearson_r": 0.0286856649495692,
+            "pearson_p": 0.5672978626869701,
+            "spearman_r": 0.028945212297413245,
+            "spearman_p": 0.5637952257617632
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": 0.18450463385710392,
+            "pearson_p": 0.00020689253919088784,
+            "spearman_r": 0.20675228240745014,
+            "spearman_p": 3.083419708375371e-05
+          },
+          "reward~len_diff_to_ref": {
+            "pearson_r": 0.1865303040966205,
+            "pearson_p": 0.0001754916789662142,
+            "spearman_r": 0.20472020438940375,
+            "spearman_p": 3.7014848961669954e-05
+          }
+        },
+        "within_group": {
+          "reward~candidate_chars": {
+            "pearson_r": 0.2831743288406502,
+            "pearson_p": 8.20624306297814e-09,
+            "spearman_r": 0.26079615757989166,
+            "spearman_p": 1.213530288893143e-07
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": 0.27480015369113986,
+            "pearson_p": 2.3140075370194484e-08,
+            "spearman_r": 0.25657106674879415,
+            "spearman_p": 1.964061717634238e-07
+          }
+        },
+        "shortest_highest": {
+          "groups_usable": 100,
+          "count": 29,
+          "ratio": 0.29
+        },
+        "longest_highest": {
+          "count": 49,
+          "ratio": 0.49
+        },
+        "shortest_lowest": {
+          "count": 37,
+          "ratio": 0.37
+        }
+      },
+      "contribution": {
+        "terms": {
+          "case_type": {
+            "label": "案件类型",
+            "weight": 0.05,
+            "mean_contribution": 0.05,
+            "share_of_reward_mean": 0.07538280329799764
+          },
+          "plaintiff_claims": {
+            "label": "原告诉讼请求",
+            "weight": 0.15,
+            "mean_contribution": 0.12103124999999998,
+            "share_of_reward_mean": 0.18247349823321551
+          },
+          "defendant_defenses": {
+            "label": "被告辩称",
+            "weight": 0.15,
+            "mean_contribution": 0.0825,
+            "share_of_reward_mean": 0.1243816254416961
+          },
+          "court_facts": {
+            "label": "法院查明事实与说理",
+            "weight": 0.5,
+            "mean_contribution": 0.2771875,
+            "share_of_reward_mean": 0.4179034157832744
+          },
+          "legal_basis": {
+            "label": "法律依据",
+            "weight": 0.1,
+            "mean_contribution": 0.0921875,
+            "share_of_reward_mean": 0.13898704358068315
+          },
+          "judgment_result": {
+            "label": "裁判结果",
+            "weight": 0.05,
+            "mean_contribution": 0.040374999999999994,
+            "share_of_reward_mean": 0.06087161366313309
+          }
+        },
+        "within_group_var_reward_mean": 0.010841015624999999,
+        "within_group_variance_share": {
+          "case_type": 0.0,
+          "plaintiff_claims": 0.034915144308723375,
+          "defendant_defenses": 0.2252729434655713,
+          "court_facts": 0.5777153220672842,
+          "legal_basis": 0.029450269640519354,
+          "judgment_result": 0.010281170804357491,
+          "case_type~plaintiff_claims": 0.0,
+          "case_type~defendant_defenses": 0.0,
+          "case_type~court_facts": 0.0,
+          "case_type~legal_basis": 0.0,
+          "case_type~judgment_result": 0.0,
+          "plaintiff_claims~defendant_defenses": 0.014917306237163554,
+          "plaintiff_claims~court_facts": 0.008647713760674521,
+          "plaintiff_claims~legal_basis": 0.004756242568370987,
+          "plaintiff_claims~judgment_result": 0.008863906604691385,
+          "defendant_defenses~court_facts": 0.06269592476489029,
+          "defendant_defenses~legal_basis": 0.011386156451554785,
+          "defendant_defenses~judgment_result": -0.008791842323352431,
+          "court_facts~legal_basis": -0.01489328481005057,
+          "court_facts~judgment_result": 0.03170828378913992,
+          "legal_basis~judgment_result": 0.003074742670462053
+        }
+      },
+      "ranking": {
+        "top1_tie_dist": {
+          "1": 75,
+          "2": 19,
+          "3": 4,
+          "4": 2
+        },
+        "mean_within_group_spearman_reward_vs_sub": {
+          "plaintiff_claims": 0.35372335146609335,
+          "defendant_defenses": 0.5495123972651104,
+          "judgment_result": 0.35971509125749107,
+          "court_facts": 0.7864159359711297,
+          "legal_basis": 0.2863633651939175
+        }
+      }
+    },
+    "expression_efficiency": {
+      "label": "表达效率",
+      "weight_field": "dimension_weights",
+      "weights": {
+        "semantic_redundancy": 0.2,
+        "verbal_redundancy": 0.2,
+        "abstraction_adequacy": 0.6
+      },
+      "global": {
+        "label": "表达效率",
+        "n": 400,
+        "reward": {
+          "describe": {
+            "n": 400,
+            "mean": 0.647625,
+            "std": 0.2119561816327394,
+            "median": 0.65,
+            "min": 0.0,
+            "max": 1.0,
+            "p10": 0.4,
+            "p25": 0.55,
+            "p75": 0.85,
+            "p90": 0.95
+          },
+          "hist_counts": [
+            1,
+            1,
+            13,
+            0,
+            2,
+            8,
+            11,
+            0,
+            33,
+            15,
+            6,
+            65,
+            0,
+            125,
+            0,
+            3,
+            68,
+            0,
+            22,
+            27
+          ],
+          "hist_edges": [
+            0.0,
+            0.05,
+            0.1,
+            0.15,
+            0.2,
+            0.25,
+            0.3,
+            0.35,
+            0.4,
+            0.45,
+            0.5,
+            0.55,
+            0.6,
+            0.65,
+            0.7,
+            0.75,
+            0.8,
+            0.85,
+            0.9,
+            0.95,
+            1.0
+          ],
+          "full_ratio": 0.0675,
+          "high_ratio_ge075": 0.3,
+          "low_ratio_le05": 0.225,
+          "zero_ratio": 0.0025
+        },
+        "subs": {
+          "semantic_redundancy": {
+            "label": "语义冗余",
+            "describe": {
+              "n": 400,
+              "mean": 2.95,
+              "std": 0.9616714772078809,
+              "median": 3.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 2.0,
+              "p25": 2.0,
+              "p75": 4.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 4,
+              "1": 24,
+              "2": 99,
+              "3": 134,
+              "4": 139
+            },
+            "raw_ratio": {
+              "0": 0.01,
+              "1": 0.06,
+              "2": 0.2475,
+              "3": 0.335,
+              "4": 0.3475
+            },
+            "full_ratio": 0.3475,
+            "low_ratio_le2": 0.3175,
+            "entropy": 1.2941201860211247
+          },
+          "verbal_redundancy": {
+            "label": "表达冗余",
+            "describe": {
+              "n": 400,
+              "mean": 2.6825,
+              "std": 0.9664516656590426,
+              "median": 3.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 2.0,
+              "p25": 2.0,
+              "p75": 3.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 7,
+              "1": 26,
+              "2": 150,
+              "3": 121,
+              "4": 96
+            },
+            "raw_ratio": {
+              "0": 0.0175,
+              "1": 0.065,
+              "2": 0.375,
+              "3": 0.3025,
+              "4": 0.24
+            },
+            "full_ratio": 0.24,
+            "low_ratio_le2": 0.4575,
+            "entropy": 1.3204764032467269
+          },
+          "abstraction_adequacy": {
+            "label": "抽象适当性",
+            "describe": {
+              "n": 400,
+              "mean": 2.44,
+              "std": 1.0579215448167547,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 1.0,
+              "p25": 2.0,
+              "p75": 3.0,
+              "p90": 4.0
+            },
+            "raw_counts": {
+              "0": 14,
+              "1": 53,
+              "2": 155,
+              "3": 99,
+              "4": 79
+            },
+            "raw_ratio": {
+              "0": 0.035,
+              "1": 0.1325,
+              "2": 0.3875,
+              "3": 0.2475,
+              "4": 0.1975
+            },
+            "full_ratio": 0.1975,
+            "low_ratio_le2": 0.555,
+            "entropy": 1.418448515449036
+          }
+        }
+      },
+      "group": {
+        "n_groups": 100,
+        "reward": {
+          "std": {
+            "n": 100,
+            "mean": 0.15119545368550616,
+            "std": 0.0754917757121197,
+            "median": 0.13384410281524778,
+            "min": 0.0,
+            "max": 0.3567795771434607,
+            "p10": 0.07071067811865477,
+            "p25": 0.09999999999999998,
+            "p75": 0.18874586088176876,
+            "p90": 0.25543664022520846
+          },
+          "zero_var_groups": 2,
+          "zero_var_ratio": 0.02,
+          "nonzero_var_ratio": 0.98,
+          "range": {
+            "n": 100,
+            "mean": 0.332,
+            "std": 0.1741530732697328,
+            "median": 0.29999999999999993,
+            "min": 0.0,
+            "max": 0.7999999999999999,
+            "p10": 0.15000000000000002,
+            "p25": 0.19999999999999996,
+            "p75": 0.44999999999999996,
+            "p90": 0.6
+          },
+          "range_hist": {
+            "0.0": 2,
+            "0.05": 1,
+            "0.1": 5,
+            "0.15": 7,
+            "0.2": 17,
+            "0.25": 12,
+            "0.3": 12,
+            "0.35": 9,
+            "0.4": 9,
+            "0.45": 6,
+            "0.5": 4,
+            "0.55": 5,
+            "0.6": 4,
+            "0.65": 2,
+            "0.7": 3,
+            "0.8": 2
+          },
+          "n_distinct_dist": {
+            "1": 2,
+            "2": 19,
+            "3": 51,
+            "4": 28
+          },
+          "pairwise_mean": 0.8083333333333331,
+          "max_tie_dist": {
+            "1": 65,
+            "2": 25,
+            "3": 8,
+            "4": 2
+          }
+        },
+        "subs": {
+          "semantic_redundancy": {
+            "std": {
+              "n": 100,
+              "mean": 0.7337910966737407,
+              "std": 0.40603688580641206,
+              "median": 0.5773502691896257,
+              "min": 0.0,
+              "max": 2.0615528128088303,
+              "p10": 0.4500000000000002,
+              "p25": 0.5,
+              "p75": 0.9574271077563381,
+              "p90": 1.2583057392117916
+            },
+            "zero_var_groups": 10,
+            "zero_var_ratio": 0.1,
+            "nonzero_var_ratio": 0.9,
+            "range": {
+              "n": 100,
+              "mean": 1.5,
+              "std": 0.8932971498777985,
+              "median": 1.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 0.9000000000000004,
+              "p25": 1.0,
+              "p75": 2.0,
+              "p90": 3.0
+            },
+            "range_hist": {
+              "0.0": 10,
+              "1.0": 44,
+              "2.0": 35,
+              "3.0": 8,
+              "4.0": 3
+            },
+            "n_distinct_dist": {
+              "1": 10,
+              "2": 57,
+              "3": 28,
+              "4": 5
+            },
+            "pairwise_mean": 0.61,
+            "max_tie_dist": {
+              "1": 39,
+              "2": 34,
+              "3": 17,
+              "4": 10
+            }
+          },
+          "verbal_redundancy": {
+            "std": {
+              "n": 100,
+              "mean": 0.7696551021782452,
+              "std": 0.3483453291989753,
+              "median": 0.816496580927726,
+              "min": 0.0,
+              "max": 1.5,
+              "p10": 0.5,
+              "p25": 0.5,
+              "p75": 0.9680703308172536,
+              "p90": 1.1650610584625063
+            },
+            "zero_var_groups": 7,
+            "zero_var_ratio": 0.07,
+            "nonzero_var_ratio": 0.9299999999999999,
+            "range": {
+              "n": 100,
+              "mean": 1.61,
+              "std": 0.7640270765734509,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 3.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p75": 2.0,
+              "p90": 2.1000000000000085
+            },
+            "range_hist": {
+              "0.0": 7,
+              "1.0": 35,
+              "2.0": 48,
+              "3.0": 10
+            },
+            "n_distinct_dist": {
+              "1": 7,
+              "2": 51,
+              "3": 39,
+              "4": 3
+            },
+            "pairwise_mean": 0.6333333333333333,
+            "max_tie_dist": {
+              "1": 47,
+              "2": 28,
+              "3": 18,
+              "4": 7
+            }
+          },
+          "abstraction_adequacy": {
+            "std": {
+              "n": 100,
+              "mean": 0.7766764000181652,
+              "std": 0.39368812493987737,
+              "median": 0.816496580927726,
+              "min": 0.0,
+              "max": 1.8929694486000912,
+              "p10": 0.5,
+              "p25": 0.5,
+              "p75": 1.0,
+              "p90": 1.2615746101641931
+            },
+            "zero_var_groups": 8,
+            "zero_var_ratio": 0.08,
+            "nonzero_var_ratio": 0.92,
+            "range": {
+              "n": 100,
+              "mean": 1.62,
+              "std": 0.8964576753178946,
+              "median": 2.0,
+              "min": 0.0,
+              "max": 4.0,
+              "p10": 1.0,
+              "p25": 1.0,
+              "p75": 2.0,
+              "p90": 3.0
+            },
+            "range_hist": {
+              "0.0": 8,
+              "1.0": 39,
+              "2.0": 39,
+              "3.0": 11,
+              "4.0": 3
+            },
+            "n_distinct_dist": {
+              "1": 8,
+              "2": 55,
+              "3": 32,
+              "4": 5
+            },
+            "pairwise_mean": 0.6199999999999999,
+            "max_tie_dist": {
+              "1": 43,
+              "2": 26,
+              "3": 23,
+              "4": 8
+            }
+          }
+        },
+        "discriminability": {
+          "tied_groups_per_sub": {
+            "semantic_redundancy": 10,
+            "verbal_redundancy": 7,
+            "abstraction_adequacy": 8
+          },
+          "all_subs_tied_groups": 1,
+          "combination_counts": {
+            "semantic_redundancy+verbal_redundancy": 6,
+            "semantic_redundancy+verbal_redundancy+abstraction_adequacy": 81,
+            "semantic_redundancy+abstraction_adequacy": 2,
+            "verbal_redundancy+abstraction_adequacy": 6,
+            "(none)": 1,
+            "abstraction_adequacy": 3,
+            "semantic_redundancy": 1
+          }
+        }
+      },
+      "length_bias": {
+        "global": {
+          "reward~candidate_chars": {
+            "pearson_r": -0.19964248778967936,
+            "pearson_p": 5.797523171118361e-05,
+            "spearman_r": -0.23587241404965473,
+            "spearman_p": 1.8408245220214312e-06
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": -0.08877989660311472,
+            "pearson_p": 0.07613849083043167,
+            "spearman_r": -0.11221000505529279,
+            "spearman_p": 0.02481510404930232
+          },
+          "reward~len_diff_to_ref": {
+            "pearson_r": -0.08708933884762853,
+            "pearson_p": 0.08192181679286227,
+            "spearman_r": -0.10736818484892208,
+            "spearman_p": 0.03180499124284926
+          }
+        },
+        "within_group": {
+          "reward~candidate_chars": {
+            "pearson_r": -0.06684797988841454,
+            "pearson_p": 0.1821158989852357,
+            "spearman_r": -0.09823215618519442,
+            "spearman_p": 0.049617681321382494
+          },
+          "reward~len_ratio_to_ref": {
+            "pearson_r": -0.08562719464670435,
+            "pearson_p": 0.08720543909952491,
+            "spearman_r": -0.10808916883537628,
+            "spearman_p": 0.03066800749040044
+          }
+        },
+        "shortest_highest": {
+          "groups_usable": 100,
+          "count": 46,
+          "ratio": 0.46
+        },
+        "longest_highest": {
+          "count": 32,
+          "ratio": 0.32
+        },
+        "shortest_lowest": {
+          "count": 30,
+          "ratio": 0.3
+        }
+      },
+      "contribution": {
+        "terms": {
+          "semantic_redundancy": {
+            "label": "语义冗余",
+            "weight": 0.2,
+            "mean_contribution": 0.1475,
+            "share_of_reward_mean": 0.22775525960239335
+          },
+          "verbal_redundancy": {
+            "label": "表达冗余",
+            "weight": 0.2,
+            "mean_contribution": 0.13412500000000002,
+            "share_of_reward_mean": 0.20710287589268483
+          },
+          "abstraction_adequacy": {
+            "label": "抽象适当性",
+            "weight": 0.6,
+            "mean_contribution": 0.36599999999999994,
+            "share_of_reward_mean": 0.5651418645049218
+          }
+        },
+        "within_group_var_reward_mean": 0.02850208333333333,
+        "within_group_variance_share": {
+          "semantic_redundancy": 0.061545208683575776,
+          "verbal_redundancy": 0.062495431620495596,
+          "abstraction_adequacy": 0.5973247569622104,
+          "semantic_redundancy~verbal_redundancy": 0.06461515971054749,
+          "semantic_redundancy~abstraction_adequacy": 0.10130838389006651,
+          "verbal_redundancy~abstraction_adequacy": 0.11271105913310431
+        }
+      },
+      "ranking": {
+        "top1_tie_dist": {
+          "1": 65,
+          "2": 25,
+          "3": 8,
+          "4": 2
+        },
+        "mean_within_group_spearman_reward_vs_sub": {
+          "semantic_redundancy": 0.5338736375917517,
+          "verbal_redundancy": 0.5571567535873146,
+          "abstraction_adequacy": 0.8791638747389592
+        }
+      }
+    }
+  },
+  "cross_metric": {
+    "correlations": {
+      "fact_consistency~element_coverage": {
+        "pearson_r": 0.470456660140967,
+        "pearson_p": 2.017718103599167e-23,
+        "spearman_r": 0.4478596502185635,
+        "spearman_p": 3.969840447495401e-21
+      },
+      "fact_consistency~expression_efficiency": {
+        "pearson_r": 0.48306509067919495,
+        "pearson_p": 8.888772557132067e-25,
+        "spearman_r": 0.4445308162926392,
+        "spearman_p": 8.365477468466735e-21
+      },
+      "fact_consistency~candidate_chars": {
+        "pearson_r": -0.10332719567801582,
+        "pearson_p": 0.03886546545520939,
+        "spearman_r": -0.08457943469992539,
+        "spearman_p": 0.09115753987905381
+      },
+      "element_coverage~expression_efficiency": {
+        "pearson_r": 0.33228995824596985,
+        "pearson_p": 9.120253933600391e-12,
+        "spearman_r": 0.29748191520278533,
+        "spearman_p": 1.2874389350887283e-09
+      },
+      "element_coverage~candidate_chars": {
+        "pearson_r": 0.0286856649495692,
+        "pearson_p": 0.5672978626869701,
+        "spearman_r": 0.028945212297413245,
+        "spearman_p": 0.5637952257617632
+      },
+      "expression_efficiency~candidate_chars": {
+        "pearson_r": -0.19964248778967936,
+        "pearson_p": 5.797523171118361e-05,
+        "spearman_r": -0.23587241404965473,
+        "spearman_p": 1.8408245220214312e-06
+      }
+    },
+    "discriminating_groups_per_metric": {
+      "fact_consistency": 98,
+      "element_coverage": 98,
+      "expression_efficiency": 98
+    },
+    "all_metrics_tied_groups": 0,
+    "combination_counts": {
+      "fact_consistency+element_coverage+expression_efficiency": 94,
+      "fact_consistency+expression_efficiency": 2,
+      "fact_consistency+element_coverage": 2,
+      "element_coverage+expression_efficiency": 2
+    },
+    "pairwise": {
+      "fact_consistency~element_coverage": {
+        "mean_within_group_spearman": 0.2729780481373599,
+        "top1_agreement": 0.39
+      },
+      "fact_consistency~expression_efficiency": {
+        "mean_within_group_spearman": 0.28053049131296925,
+        "top1_agreement": 0.37
+      },
+      "element_coverage~expression_efficiency": {
+        "mean_within_group_spearman": 0.15966142677012668,
+        "top1_agreement": 0.29
+      }
+    }
+  },
+  "rewards": {
+    "raw_reward": {
+      "field": "raw_reward",
+      "n": 400,
+      "n_missing": 0,
+      "usable_groups": 100,
+      "global": {
+        "describe": {
+          "n": 400,
+          "mean": 0.6621984375,
+          "std": 0.14238368694047432,
+          "median": 0.676875,
+          "min": 0.23625000000000002,
+          "max": 0.975,
+          "p10": 0.484375,
+          "p25": 0.5725,
+          "p75": 0.7575000000000001,
+          "p90": 0.8387500000000001
+        },
+        "hist_counts": [
+          0,
+          0,
+          0,
+          0,
+          1,
+          6,
+          5,
+          6,
+          13,
+          20,
+          34,
+          39,
+          46,
+          57,
+          66,
+          47,
+          25,
+          21,
+          11,
+          3
+        ],
+        "hist_edges": [
+          0.0,
+          0.05,
+          0.1,
+          0.15,
+          0.2,
+          0.25,
+          0.3,
+          0.35,
+          0.4,
+          0.45,
+          0.5,
+          0.55,
+          0.6,
+          0.65,
+          0.7,
+          0.75,
+          0.8,
+          0.85,
+          0.9,
+          0.95,
+          1.0
+        ],
+        "full_ratio": 0.0,
+        "zero_ratio": 0.0,
+        "high_ratio_ge075": 0.2675,
+        "low_ratio_le05": 0.13
+      },
+      "group": {
+        "std": {
+          "n": 100,
+          "mean": 0.09753475246311098,
+          "std": 0.04600935114133468,
+          "median": 0.08814781313020573,
+          "min": 0.018296601460380535,
+          "max": 0.22353341472808935,
+          "p10": 0.047204772558516746,
+          "p25": 0.06275211820130763,
+          "p75": 0.12948959731965365,
+          "p90": 0.17155264174263235
+        },
+        "zero_var_groups": 0,
+        "zero_var_ratio": 0.0,
+        "nonzero_var_ratio": 1.0,
+        "range": {
+          "n": 100,
+          "mean": 0.21698125,
+          "std": 0.10418068295852427,
+          "median": 0.19968749999999993,
+          "min": 0.039999999999999925,
+          "max": 0.48,
+          "p10": 0.10568749999999996,
+          "p25": 0.14046874999999998,
+          "p75": 0.28546874999999994,
+          "p90": 0.377625
+        },
+        "range_hist": {
+          "0.04": 1,
+          "0.04875": 1,
+          "0.05625": 1,
+          "0.058125": 1,
+          "0.061875": 1,
+          "0.08375": 1,
+          "0.085625": 1,
+          "0.09375": 2,
+          "0.100625": 1,
+          "0.10625": 1,
+          "0.106875": 1,
+          "0.1075": 1,
+          "0.11": 1,
+          "0.1125": 1,
+          "0.11375": 1,
+          "0.114375": 1,
+          "0.119375": 1,
+          "0.120625": 1,
+          "0.123125": 1,
+          "0.12375": 1,
+          "0.125625": 1,
+          "0.133125": 1,
+          "0.13375": 1,
+          "0.14": 1,
+          "0.140625": 1,
+          "0.14125": 1,
+          "0.1425": 1,
+          "0.14625": 1,
+          "0.14875": 1,
+          "0.15125": 1,
+          "0.151875": 1,
+          "0.154375": 1,
+          "0.16": 1,
+          "0.163125": 1,
+          "0.164375": 1,
+          "0.166875": 1,
+          "0.17": 1,
+          "0.1725": 1,
+          "0.174375": 1,
+          "0.17625": 1,
+          "0.1775": 1,
+          "0.179375": 1,
+          "0.180625": 1,
+          "0.18125": 1,
+          "0.184375": 1,
+          "0.186875": 2,
+          "0.1925": 1,
+          "0.196875": 1,
+          "0.2025": 1,
+          "0.205": 3,
+          "0.20625": 1,
+          "0.21": 1,
+          "0.210625": 1,
+          "0.21375": 1,
+          "0.215": 1,
+          "0.21625": 1,
+          "0.219375": 2,
+          "0.22625": 1,
+          "0.22875": 1,
+          "0.23125": 1,
+          "0.2325": 1,
+          "0.23375": 1,
+          "0.255": 1,
+          "0.26125": 1,
+          "0.26375": 1,
+          "0.26625": 1,
+          "0.269375": 1,
+          "0.273125": 1,
+          "0.278125": 1,
+          "0.28375": 1,
+          "0.290625": 1,
+          "0.29625": 1,
+          "0.305": 1,
+          "0.315": 1,
+          "0.3175": 1,
+          "0.324375": 2,
+          "0.3275": 1,
+          "0.329375": 2,
+          "0.351875": 1,
+          "0.36125": 1,
+          "0.365": 1,
+          "0.376875": 1,
+          "0.3775": 1,
+          "0.37875": 1,
+          "0.384375": 1,
+          "0.39": 1,
+          "0.395625": 1,
+          "0.3975": 1,
+          "0.4025": 1,
+          "0.421875": 1,
+          "0.454375": 1,
+          "0.46625": 1,
+          "0.48": 1
+        },
+        "n_distinct_dist": {
+          "1": 0,
+          "2": 0,
+          "3": 3,
+          "4": 97
+        },
+        "pairwise_mean": 0.995,
+        "max_tie_dist": {
+          "1": 100,
+          "2": 0,
+          "3": 0,
+          "4": 0
+        }
+      },
+      "correlations": {
+        "fact_consistency": {
+          "pearson_r": 0.6735045587030319,
+          "pearson_p": 3.43073601826683e-54,
+          "spearman_r": 0.6368187597231297,
+          "spearman_p": 7.027629306203936e-47
+        },
+        "element_coverage": {
+          "pearson_r": 0.7199989452843547,
+          "pearson_p": 3.965269216648813e-65,
+          "spearman_r": 0.6925460646540598,
+          "spearman_p": 2.0318753903094842e-58
+        },
+        "expression_efficiency": {
+          "pearson_r": 0.8837974630638321,
+          "pearson_p": 2.3162364200543336e-133,
+          "spearman_r": 0.8639462177371313,
+          "spearman_p": 1.2289274331260654e-120
+        }
+      }
+    },
+    "effective_reward": {
+      "field": "effective_reward",
+      "n": 400,
+      "n_missing": 0,
+      "usable_groups": 100,
+      "global": {
+        "describe": {
+          "n": 400,
+          "mean": 0.6348046875,
+          "std": 0.19615825825636368,
+          "median": 0.6743750000000001,
+          "min": 0.0,
+          "max": 0.975,
+          "p10": 0.4281875,
+          "p25": 0.55109375,
+          "p75": 0.7559374999999999,
+          "p90": 0.8370625
+        },
+        "hist_counts": [
+          18,
+          0,
+          0,
+          0,
+          1,
+          6,
+          5,
+          5,
+          12,
+          19,
+          32,
+          34,
+          45,
+          54,
+          64,
+          46,
+          25,
+          20,
+          11,
+          3
+        ],
+        "hist_edges": [
+          0.0,
+          0.05,
+          0.1,
+          0.15,
+          0.2,
+          0.25,
+          0.3,
+          0.35,
+          0.4,
+          0.45,
+          0.5,
+          0.55,
+          0.6,
+          0.65,
+          0.7,
+          0.75,
+          0.8,
+          0.85,
+          0.9,
+          0.95,
+          1.0
+        ],
+        "full_ratio": 0.0,
+        "zero_ratio": 0.045,
+        "high_ratio_ge075": 0.2625,
+        "low_ratio_le05": 0.1675
+      },
+      "group": {
+        "std": {
+          "n": 100,
+          "mean": 0.1415120472553557,
+          "std": 0.10776423485265221,
+          "median": 0.09940009256656951,
+          "min": 0.018296601460380535,
+          "max": 0.4419503928492239,
+          "p10": 0.0494756952120411,
+          "p25": 0.06717086061158528,
+          "p75": 0.17219314562937194,
+          "p90": 0.3460812878570532
+        },
+        "zero_var_groups": 0,
+        "zero_var_ratio": 0.0,
+        "nonzero_var_ratio": 1.0,
+        "range": {
+          "n": 100,
+          "mean": 0.30992499999999995,
+          "std": 0.23027074397392092,
+          "median": 0.219375,
+          "min": 0.039999999999999925,
+          "max": 0.923125,
+          "p10": 0.10568749999999996,
+          "p25": 0.15171874999999999,
+          "p75": 0.3778125,
+          "p90": 0.7430000000000003
+        },
+        "range_hist": {
+          "0.04": 1,
+          "0.04875": 1,
+          "0.05625": 1,
+          "0.058125": 1,
+          "0.061875": 1,
+          "0.08375": 1,
+          "0.085625": 1,
+          "0.09375": 2,
+          "0.100625": 1,
+          "0.10625": 1,
+          "0.106875": 1,
+          "0.11": 1,
+          "0.1125": 1,
+          "0.11375": 1,
+          "0.119375": 1,
+          "0.120625": 1,
+          "0.125625": 1,
+          "0.13375": 1,
+          "0.14": 1,
+          "0.140625": 1,
+          "0.14125": 1,
+          "0.14625": 1,
+          "0.14875": 1,
+          "0.15125": 1,
+          "0.151875": 1,
+          "0.154375": 1,
+          "0.16": 1,
+          "0.164375": 1,
+          "0.166875": 1,
+          "0.17": 1,
+          "0.1725": 1,
+          "0.174375": 1,
+          "0.1775": 1,
+          "0.179375": 1,
+          "0.184375": 1,
+          "0.186875": 2,
+          "0.1925": 1,
+          "0.196875": 1,
+          "0.2025": 1,
+          "0.205": 3,
+          "0.20625": 1,
+          "0.21": 1,
+          "0.210625": 1,
+          "0.21375": 1,
+          "0.21625": 1,
+          "0.219375": 2,
+          "0.22625": 1,
+          "0.22875": 1,
+          "0.23125": 1,
+          "0.2325": 1,
+          "0.23375": 1,
+          "0.255": 1,
+          "0.26125": 1,
+          "0.26375": 1,
+          "0.269375": 1,
+          "0.273125": 1,
+          "0.290625": 1,
+          "0.29625": 1,
+          "0.305": 1,
+          "0.315": 1,
+          "0.3175": 1,
+          "0.324375": 2,
+          "0.3275": 1,
+          "0.329375": 2,
+          "0.36125": 1,
+          "0.365": 1,
+          "0.376875": 1,
+          "0.3775": 1,
+          "0.37875": 1,
+          "0.384375": 1,
+          "0.395625": 1,
+          "0.3975": 1,
+          "0.421875": 1,
+          "0.454375": 1,
+          "0.46625": 1,
+          "0.48": 1,
+          "0.54875": 1,
+          "0.605": 1,
+          "0.618125": 1,
+          "0.69625": 1,
+          "0.698125": 1,
+          "0.74": 2,
+          "0.77": 1,
+          "0.77375": 2,
+          "0.789375": 1,
+          "0.7925": 1,
+          "0.848125": 1,
+          "0.861875": 1,
+          "0.87375": 1,
+          "0.875": 1,
+          "0.923125": 1
+        },
+        "n_distinct_dist": {
+          "1": 0,
+          "2": 0,
+          "3": 4,
+          "4": 96
+        },
+        "pairwise_mean": 0.9933333333333334,
+        "max_tie_dist": {
+          "1": 100,
+          "2": 0,
+          "3": 0,
+          "4": 0
+        }
+      }
+    },
+    "effective_reward_fc": {
+      "field": "effective_reward_fc",
+      "n": 400,
+      "n_missing": 0,
+      "usable_groups": 100,
+      "global": {
+        "describe": {
+          "n": 400,
+          "mean": 0.28938125,
+          "std": 0.36496643311122784,
+          "median": 0.0,
+          "min": 0.0,
+          "max": 0.975,
+          "p10": 0.0,
+          "p25": 0.0,
+          "p75": 0.70640625,
+          "p90": 0.803875
+        },
+        "hist_counts": [
+          242,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          1,
+          4,
+          5,
+          8,
+          17,
+          20,
+          35,
+          26,
+          18,
+          15,
+          6,
+          3
+        ],
+        "hist_edges": [
+          0.0,
+          0.05,
+          0.1,
+          0.15,
+          0.2,
+          0.25,
+          0.3,
+          0.35,
+          0.4,
+          0.45,
+          0.5,
+          0.55,
+          0.6,
+          0.65,
+          0.7,
+          0.75,
+          0.8,
+          0.85,
+          0.9,
+          0.95,
+          1.0
+        ],
+        "full_ratio": 0.0,
+        "zero_ratio": 0.605,
+        "high_ratio_ge075": 0.17,
+        "low_ratio_le05": 0.6175
+      },
+      "group": {
+        "std": {
+          "n": 100,
+          "mean": 0.2888221265738517,
+          "std": 0.17523384646005136,
+          "median": 0.36171875,
+          "min": 0.0,
+          "max": 0.521600351881911,
+          "p10": 0.0,
+          "p25": 0.10017680705096185,
+          "p75": 0.42793980773876344,
+          "p90": 0.46523571951643294
+        },
+        "zero_var_groups": 20,
+        "zero_var_ratio": 0.2,
+        "nonzero_var_ratio": 0.8,
+        "range": {
+          "n": 100,
+          "mean": 0.56311875,
+          "std": 0.3366104824738833,
+          "median": 0.7159375,
+          "min": 0.0,
+          "max": 0.975,
+          "p10": 0.0,
+          "p25": 0.22421875,
+          "p75": 0.8040624999999999,
+          "p90": 0.8738750000000001
+        },
+        "range_hist": {
+          "0.0": 20,
+          "0.05625": 1,
+          "0.100625": 1,
+          "0.119375": 1,
+          "0.17": 1,
+          "0.210625": 1,
+          "0.22875": 1,
+          "0.26125": 1,
+          "0.315": 1,
+          "0.4725": 1,
+          "0.496875": 1,
+          "0.5425": 1,
+          "0.57125": 1,
+          "0.58": 1,
+          "0.59875": 1,
+          "0.605": 1,
+          "0.630625": 1,
+          "0.63125": 1,
+          "0.639375": 1,
+          "0.644375": 1,
+          "0.65": 1,
+          "0.655": 1,
+          "0.6575": 1,
+          "0.698125": 2,
+          "0.70625": 2,
+          "0.706875": 1,
+          "0.709375": 1,
+          "0.711875": 1,
+          "0.714375": 1,
+          "0.7175": 1,
+          "0.718125": 1,
+          "0.720625": 1,
+          "0.72625": 1,
+          "0.74": 2,
+          "0.741875": 1,
+          "0.745625": 1,
+          "0.74875": 1,
+          "0.751875": 1,
+          "0.754375": 2,
+          "0.7575": 1,
+          "0.76": 1,
+          "0.768125": 1,
+          "0.77375": 2,
+          "0.775": 1,
+          "0.776875": 1,
+          "0.788125": 1,
+          "0.789375": 2,
+          "0.795": 1,
+          "0.799375": 1,
+          "0.80375": 1,
+          "0.805": 1,
+          "0.809375": 1,
+          "0.810625": 2,
+          "0.824375": 1,
+          "0.83875": 1,
+          "0.8475": 1,
+          "0.848125": 1,
+          "0.85125": 1,
+          "0.85375": 1,
+          "0.855625": 1,
+          "0.86375": 1,
+          "0.866875": 1,
+          "0.870625": 1,
+          "0.87375": 1,
+          "0.875": 1,
+          "0.880625": 2,
+          "0.914375": 1,
+          "0.91625": 1,
+          "0.9175": 1,
+          "0.923125": 1,
+          "0.93125": 1,
+          "0.970625": 1,
+          "0.975": 1
+        },
+        "n_distinct_dist": {
+          "1": 20,
+          "2": 30,
+          "3": 32,
+          "4": 18
+        },
+        "pairwise_mean": 0.5983333333333334,
+        "max_tie_dist": {
+          "1": 79,
+          "2": 1,
+          "3": 0,
+          "4": 20
+        }
+      }
+    }
+  },
+  "mixed": {
+    "field": "raw_reward",
+    "n": 400,
+    "n_missing": 0,
+    "usable_groups": 100,
+    "global": {
+      "describe": {
+        "n": 400,
+        "mean": 0.6621984375,
+        "std": 0.14238368694047432,
+        "median": 0.676875,
+        "min": 0.23625000000000002,
+        "max": 0.975,
+        "p10": 0.484375,
+        "p25": 0.5725,
+        "p75": 0.7575000000000001,
+        "p90": 0.8387500000000001
+      },
+      "hist_counts": [
+        0,
+        0,
+        0,
+        0,
+        1,
+        6,
+        5,
+        6,
+        13,
+        20,
+        34,
+        39,
+        46,
+        57,
+        66,
+        47,
+        25,
+        21,
+        11,
+        3
+      ],
+      "hist_edges": [
+        0.0,
+        0.05,
+        0.1,
+        0.15,
+        0.2,
+        0.25,
+        0.3,
+        0.35,
+        0.4,
+        0.45,
+        0.5,
+        0.55,
+        0.6,
+        0.65,
+        0.7,
+        0.75,
+        0.8,
+        0.85,
+        0.9,
+        0.95,
+        1.0
+      ],
+      "full_ratio": 0.0,
+      "zero_ratio": 0.0,
+      "high_ratio_ge075": 0.2675,
+      "low_ratio_le05": 0.13
+    },
+    "group": {
+      "std": {
+        "n": 100,
+        "mean": 0.09753475246311098,
+        "std": 0.04600935114133468,
+        "median": 0.08814781313020573,
+        "min": 0.018296601460380535,
+        "max": 0.22353341472808935,
+        "p10": 0.047204772558516746,
+        "p25": 0.06275211820130763,
+        "p75": 0.12948959731965365,
+        "p90": 0.17155264174263235
+      },
+      "zero_var_groups": 0,
+      "zero_var_ratio": 0.0,
+      "nonzero_var_ratio": 1.0,
+      "range": {
+        "n": 100,
+        "mean": 0.21698125,
+        "std": 0.10418068295852427,
+        "median": 0.19968749999999993,
+        "min": 0.039999999999999925,
+        "max": 0.48,
+        "p10": 0.10568749999999996,
+        "p25": 0.14046874999999998,
+        "p75": 0.28546874999999994,
+        "p90": 0.377625
+      },
+      "range_hist": {
+        "0.04": 1,
+        "0.04875": 1,
+        "0.05625": 1,
+        "0.058125": 1,
+        "0.061875": 1,
+        "0.08375": 1,
+        "0.085625": 1,
+        "0.09375": 2,
+        "0.100625": 1,
+        "0.10625": 1,
+        "0.106875": 1,
+        "0.1075": 1,
+        "0.11": 1,
+        "0.1125": 1,
+        "0.11375": 1,
+        "0.114375": 1,
+        "0.119375": 1,
+        "0.120625": 1,
+        "0.123125": 1,
+        "0.12375": 1,
+        "0.125625": 1,
+        "0.133125": 1,
+        "0.13375": 1,
+        "0.14": 1,
+        "0.140625": 1,
+        "0.14125": 1,
+        "0.1425": 1,
+        "0.14625": 1,
+        "0.14875": 1,
+        "0.15125": 1,
+        "0.151875": 1,
+        "0.154375": 1,
+        "0.16": 1,
+        "0.163125": 1,
+        "0.164375": 1,
+        "0.166875": 1,
+        "0.17": 1,
+        "0.1725": 1,
+        "0.174375": 1,
+        "0.17625": 1,
+        "0.1775": 1,
+        "0.179375": 1,
+        "0.180625": 1,
+        "0.18125": 1,
+        "0.184375": 1,
+        "0.186875": 2,
+        "0.1925": 1,
+        "0.196875": 1,
+        "0.2025": 1,
+        "0.205": 3,
+        "0.20625": 1,
+        "0.21": 1,
+        "0.210625": 1,
+        "0.21375": 1,
+        "0.215": 1,
+        "0.21625": 1,
+        "0.219375": 2,
+        "0.22625": 1,
+        "0.22875": 1,
+        "0.23125": 1,
+        "0.2325": 1,
+        "0.23375": 1,
+        "0.255": 1,
+        "0.26125": 1,
+        "0.26375": 1,
+        "0.26625": 1,
+        "0.269375": 1,
+        "0.273125": 1,
+        "0.278125": 1,
+        "0.28375": 1,
+        "0.290625": 1,
+        "0.29625": 1,
+        "0.305": 1,
+        "0.315": 1,
+        "0.3175": 1,
+        "0.324375": 2,
+        "0.3275": 1,
+        "0.329375": 2,
+        "0.351875": 1,
+        "0.36125": 1,
+        "0.365": 1,
+        "0.376875": 1,
+        "0.3775": 1,
+        "0.37875": 1,
+        "0.384375": 1,
+        "0.39": 1,
+        "0.395625": 1,
+        "0.3975": 1,
+        "0.4025": 1,
+        "0.421875": 1,
+        "0.454375": 1,
+        "0.46625": 1,
+        "0.48": 1
+      },
+      "n_distinct_dist": {
+        "1": 0,
+        "2": 0,
+        "3": 3,
+        "4": 97
+      },
+      "pairwise_mean": 0.995,
+      "max_tie_dist": {
+        "1": 100,
+        "2": 0,
+        "3": 0,
+        "4": 0
+      }
+    },
+    "correlations": {
+      "fact_consistency": {
+        "pearson_r": 0.6735045587030319,
+        "pearson_p": 3.43073601826683e-54,
+        "spearman_r": 0.6368187597231297,
+        "spearman_p": 7.027629306203936e-47
+      },
+      "element_coverage": {
+        "pearson_r": 0.7199989452843547,
+        "pearson_p": 3.965269216648813e-65,
+        "spearman_r": 0.6925460646540598,
+        "spearman_p": 2.0318753903094842e-58
+      },
+      "expression_efficiency": {
+        "pearson_r": 0.8837974630638321,
+        "pearson_p": 2.3162364200543336e-133,
+        "spearman_r": 0.8639462177371313,
+        "spearman_p": 1.2289274331260654e-120
+      }
+    }
+  },
+  "gate": {
+    "n": 400,
+    "gate_enabled": true,
+    "text_gate": {
+      "count": 18,
+      "rate": 0.045,
+      "reasons": {
+        "length_too_long": {
+          "count": 12,
+          "rate": 0.03
+        },
+        "length_too_short": {
+          "count": 1,
+          "rate": 0.0025
+        },
+        "no_result_marker": {
+          "count": 5,
+          "rate": 0.0125
+        }
+      }
+    },
+    "fc_gate_config": {
+      "enabled": false,
+      "threshold": 0,
+      "fact_consistency_enabled": true,
+      "count": 0,
+      "rate": 0.0
+    },
+    "fc_gate_strict": {
+      "rule": "事实一致性六要素中任意一个原始分为 0 → 整条 reward = 0",
+      "threshold": 1,
+      "count": 236,
+      "rate": 0.59
+    },
+    "effective_gated": {
+      "count": 18,
+      "rate": 0.045
+    },
+    "effective_gated_strict": {
+      "count": 242,
+      "rate": 0.605
+    },
+    "overlap_config_scope": {
+      "none": {
+        "count": 382,
+        "rate": 0.955
+      },
+      "only_text": {
+        "count": 18,
+        "rate": 0.045
+      }
+    },
+    "fc_scored_records": 400,
+    "per_element_zero": {
+      "案件类型": {
+        "count": 10,
+        "rate": 0.025
+      },
+      "原告诉讼请求": {
+        "count": 12,
+        "rate": 0.03
+      },
+      "被告辩称": {
+        "count": 129,
+        "rate": 0.3225
+      },
+      "法院查明事实与说理": {
+        "count": 80,
+        "rate": 0.2
+      },
+      "法律依据": {
+        "count": 10,
+        "rate": 0.025
+      },
+      "裁判结果": {
+        "count": 65,
+        "rate": 0.1625
+      }
+    },
+    "per_element_trigger": {
+      "案件类型": {
+        "count": 0,
+        "rate": 0.0
+      },
+      "原告诉讼请求": {
+        "count": 0,
+        "rate": 0.0
+      },
+      "被告辩称": {
+        "count": 0,
+        "rate": 0.0
+      },
+      "法院查明事实与说理": {
+        "count": 0,
+        "rate": 0.0
+      },
+      "法律依据": {
+        "count": 0,
+        "rate": 0.0
+      },
+      "裁判结果": {
+        "count": 0,
+        "rate": 0.0
+      }
+    }
+  },
+  "gate_group": {
+    "n_groups": 100,
+    "all_gated_groups": 0,
+    "all_gated_ratio": 0.0,
+    "partial_gated_groups": 17,
+    "partial_gated_ratio": 0.17,
+    "never_gated_groups": 83,
+    "never_gated_ratio": 0.83,
+    "distinguishable_before_tied_after": 0,
+    "distinguishable_before_tied_after_ratio": 0.0
+  },
+  "gate_impact": {
+    "n_usable_groups": 100,
+    "top1_changed_groups": 2,
+    "top1_changed_ratio": 0.02,
+    "top1_same_groups": 98,
+    "kendall_tau_b": {
+      "mean": 0.9518257418583506,
+      "valid_groups": 100,
+      "undefined_groups": 0
+    },
+    "pairwise": {
+      "pairs": 600,
+      "keep": 585,
+      "flip": 14,
+      "tie_gain": 0,
+      "tie_loss": 1,
+      "flip_rate": 0.023333333333333334,
+      "keep_rate": 0.975,
+      "tie_change_rate": 0.0016666666666666668
+    }
+  },
+  "consistency": {
+    "n": 400,
+    "gated_implies_zero": {
+      "n_checked": 18,
+      "n_ok": 18,
+      "pass": true
+    },
+    "ungated_equals_raw": {
+      "n_checked": 382,
+      "n_ok": 382,
+      "pass": true
+    },
+    "fc_gate_reason_implies_zero": {
+      "n_checked": 0,
+      "n_ok": 0,
+      "pass": true
+    },
+    "text_gate_reason_implies_zero": {
+      "n_checked": 18,
+      "n_ok": 18,
+      "pass": true
+    },
+    "raw_equals_weighted_terms": {
+      "n_checked": 400,
+      "n_ok": 400,
+      "pass": true
+    },
+    "reward_source": "sfzy.rl.reward.compute_reward（与 GRPO 训练同一函数）"
+  },
+  "repeat": {
+    "n_repeat_records": 80,
+    "n_candidates_repeated": 80,
+    "fields": [
+      "fact_consistency",
+      "element_coverage",
+      "expression_efficiency",
+      "raw_reward",
+      "effective_reward",
+      "effective_reward_fc"
+    ],
+    "per_repeat_index": {
+      "0": {
+        "n": 80,
+        "per_field": {
+          "fact_consistency": {
+            "n_pairs": 80,
+            "exact_rate": 0.65,
+            "mean_abs_diff": 0.03359375,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.45,
+            "top1_intersection_rate": 0.6,
+            "top1_all_tied_groups": 1,
+            "kendall_tau_b_mean": 0.7049355309094674,
+            "kendall_tau_b_valid_groups": 19,
+            "kendall_tau_b_undefined_groups": 1,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 11,
+              "keep": 98,
+              "flip": 13,
+              "tie_gain": 5,
+              "tie_loss": 4,
+              "flip_rate": 0.10833333333333334,
+              "keep_rate": 0.8166666666666667,
+              "tie_change_rate": 0.075
+            },
+            "sub_exact_rate": {
+              "case_type": 0.9875,
+              "plaintiff_claims": 0.9125,
+              "defendant_defenses": 0.9,
+              "court_facts": 0.825,
+              "legal_basis": 0.925,
+              "judgment_result": 0.9
+            },
+            "sub_mean_abs_diff": {
+              "case_type": 0.0125,
+              "plaintiff_claims": 0.125,
+              "defendant_defenses": 0.2,
+              "court_facts": 0.2,
+              "legal_basis": 0.075,
+              "judgment_result": 0.125
+            }
+          },
+          "element_coverage": {
+            "n_pairs": 80,
+            "exact_rate": 0.775,
+            "mean_abs_diff": 0.022031250000000002,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.85,
+            "top1_intersection_rate": 0.95,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.8704751790508014,
+            "kendall_tau_b_valid_groups": 20,
+            "kendall_tau_b_undefined_groups": 0,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 8,
+              "keep": 106,
+              "flip": 4,
+              "tie_gain": 7,
+              "tie_loss": 3,
+              "flip_rate": 0.03333333333333333,
+              "keep_rate": 0.8833333333333333,
+              "tie_change_rate": 0.08333333333333333
+            },
+            "sub_exact_rate": {
+              "case_type": 1.0,
+              "plaintiff_claims": 0.9125,
+              "defendant_defenses": 0.8875,
+              "court_facts": 0.85,
+              "legal_basis": 0.95,
+              "judgment_result": 0.9375
+            },
+            "sub_mean_abs_diff": {
+              "case_type": 0.0,
+              "plaintiff_claims": 0.0875,
+              "defendant_defenses": 0.125,
+              "court_facts": 0.15,
+              "legal_basis": 0.05,
+              "judgment_result": 0.075
+            }
+          },
+          "expression_efficiency": {
+            "n_pairs": 80,
+            "exact_rate": 0.7,
+            "mean_abs_diff": 0.040625,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.55,
+            "top1_intersection_rate": 0.95,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.7606120321728842,
+            "kendall_tau_b_valid_groups": 17,
+            "kendall_tau_b_undefined_groups": 3,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 15,
+              "keep": 88,
+              "flip": 6,
+              "tie_gain": 12,
+              "tie_loss": 14,
+              "flip_rate": 0.05,
+              "keep_rate": 0.7333333333333333,
+              "tie_change_rate": 0.21666666666666667
+            },
+            "sub_exact_rate": {
+              "semantic_redundancy": 0.95,
+              "verbal_redundancy": 0.8375,
+              "abstraction_adequacy": 0.825
+            },
+            "sub_mean_abs_diff": {
+              "semantic_redundancy": 0.05,
+              "verbal_redundancy": 0.2,
+              "abstraction_adequacy": 0.2125
+            }
+          },
+          "raw_reward": {
+            "n_pairs": 80,
+            "exact_rate": 0.4,
+            "mean_abs_diff": 0.028179687499999995,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.8,
+            "top1_intersection_rate": 0.8,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.782158383625775,
+            "kendall_tau_b_valid_groups": 20,
+            "kendall_tau_b_undefined_groups": 0,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 0,
+              "keep": 105,
+              "flip": 12,
+              "tie_gain": 1,
+              "tie_loss": 2,
+              "flip_rate": 0.1,
+              "keep_rate": 0.875,
+              "tie_change_rate": 0.025
+            }
+          },
+          "effective_reward": {
+            "n_pairs": 80,
+            "exact_rate": 0.425,
+            "mean_abs_diff": 0.027273437499999997,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.8,
+            "top1_intersection_rate": 0.8,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.7988250502924417,
+            "kendall_tau_b_valid_groups": 20,
+            "kendall_tau_b_undefined_groups": 0,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 0,
+              "keep": 106,
+              "flip": 11,
+              "tie_gain": 1,
+              "tie_loss": 2,
+              "flip_rate": 0.09166666666666666,
+              "keep_rate": 0.8833333333333333,
+              "tie_change_rate": 0.025
+            }
+          },
+          "effective_reward_fc": {
+            "n_pairs": 80,
+            "exact_rate": 0.7,
+            "mean_abs_diff": 0.050882812500000006,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.7,
+            "top1_intersection_rate": 0.9,
+            "top1_all_tied_groups": 1,
+            "kendall_tau_b_mean": 0.8897547855324287,
+            "kendall_tau_b_valid_groups": 16,
+            "kendall_tau_b_undefined_groups": 4,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 31,
+              "keep": 103,
+              "flip": 4,
+              "tie_gain": 5,
+              "tie_loss": 8,
+              "flip_rate": 0.03333333333333333,
+              "keep_rate": 0.8583333333333333,
+              "tie_change_rate": 0.10833333333333334
+            }
+          }
+        },
+        "per_metric": {
+          "fact_consistency": {
+            "n_pairs": 80,
+            "exact_rate": 0.65,
+            "mean_abs_diff": 0.03359375,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.45,
+            "top1_intersection_rate": 0.6,
+            "top1_all_tied_groups": 1,
+            "kendall_tau_b_mean": 0.7049355309094674,
+            "kendall_tau_b_valid_groups": 19,
+            "kendall_tau_b_undefined_groups": 1,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 11,
+              "keep": 98,
+              "flip": 13,
+              "tie_gain": 5,
+              "tie_loss": 4,
+              "flip_rate": 0.10833333333333334,
+              "keep_rate": 0.8166666666666667,
+              "tie_change_rate": 0.075
+            },
+            "sub_exact_rate": {
+              "case_type": 0.9875,
+              "plaintiff_claims": 0.9125,
+              "defendant_defenses": 0.9,
+              "court_facts": 0.825,
+              "legal_basis": 0.925,
+              "judgment_result": 0.9
+            },
+            "sub_mean_abs_diff": {
+              "case_type": 0.0125,
+              "plaintiff_claims": 0.125,
+              "defendant_defenses": 0.2,
+              "court_facts": 0.2,
+              "legal_basis": 0.075,
+              "judgment_result": 0.125
+            }
+          },
+          "element_coverage": {
+            "n_pairs": 80,
+            "exact_rate": 0.775,
+            "mean_abs_diff": 0.022031250000000002,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.85,
+            "top1_intersection_rate": 0.95,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.8704751790508014,
+            "kendall_tau_b_valid_groups": 20,
+            "kendall_tau_b_undefined_groups": 0,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 8,
+              "keep": 106,
+              "flip": 4,
+              "tie_gain": 7,
+              "tie_loss": 3,
+              "flip_rate": 0.03333333333333333,
+              "keep_rate": 0.8833333333333333,
+              "tie_change_rate": 0.08333333333333333
+            },
+            "sub_exact_rate": {
+              "case_type": 1.0,
+              "plaintiff_claims": 0.9125,
+              "defendant_defenses": 0.8875,
+              "court_facts": 0.85,
+              "legal_basis": 0.95,
+              "judgment_result": 0.9375
+            },
+            "sub_mean_abs_diff": {
+              "case_type": 0.0,
+              "plaintiff_claims": 0.0875,
+              "defendant_defenses": 0.125,
+              "court_facts": 0.15,
+              "legal_basis": 0.05,
+              "judgment_result": 0.075
+            }
+          },
+          "expression_efficiency": {
+            "n_pairs": 80,
+            "exact_rate": 0.7,
+            "mean_abs_diff": 0.040625,
+            "n_groups": 20,
+            "n_usable_groups": 20,
+            "top1_strict_agreement": 0.55,
+            "top1_intersection_rate": 0.95,
+            "top1_all_tied_groups": 0,
+            "kendall_tau_b_mean": 0.7606120321728842,
+            "kendall_tau_b_valid_groups": 17,
+            "kendall_tau_b_undefined_groups": 3,
+            "pairwise": {
+              "pairs": 120,
+              "both_tied_pairs": 15,
+              "keep": 88,
+              "flip": 6,
+              "tie_gain": 12,
+              "tie_loss": 14,
+              "flip_rate": 0.05,
+              "keep_rate": 0.7333333333333333,
+              "tie_change_rate": 0.21666666666666667
+            },
+            "sub_exact_rate": {
+              "semantic_redundancy": 0.95,
+              "verbal_redundancy": 0.8375,
+              "abstraction_adequacy": 0.825
+            },
+            "sub_mean_abs_diff": {
+              "semantic_redundancy": 0.05,
+              "verbal_redundancy": 0.2,
+              "abstraction_adequacy": 0.2125
+            }
+          }
+        },
+        "group_ranking": {
+          "fact_consistency": {
+            "n_groups": 20,
+            "top1_agreement": 0.45,
+            "mean_kendall_tau": 0.7049355309094674
+          },
+          "element_coverage": {
+            "n_groups": 20,
+            "top1_agreement": 0.85,
+            "mean_kendall_tau": 0.8704751790508014
+          },
+          "expression_efficiency": {
+            "n_groups": 20,
+            "top1_agreement": 0.55,
+            "mean_kendall_tau": 0.7606120321728842
+          }
+        }
+      }
+    }
+  },
+  "samples": [
+    {
+      "scope": "fact_consistency",
+      "category": "fully_tied",
+      "group_id": "8c1c4007ae2a3631e7fc5c33fa863e3a"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "fully_tied",
+      "group_id": "2ccc7fd4d8a6b852d2c4d018750bb0f0"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "max_spread",
+      "group_id": "ad76b2488e445969ddb83fcf927b036c"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "max_spread",
+      "group_id": "4c07d77f01f7045f1c6dcc964d24a6ce"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "sub_conflict",
+      "group_id": "4d36b33b20b8ee199fb764f0a9017dd2"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "sub_conflict",
+      "group_id": "37afda8ac88ada83fde9c82ba2b7663c"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "longest_highest",
+      "group_id": "8da43367c56fa5e9beb2c605d14237dd"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "shortest_lowest",
+      "group_id": "8da43367c56fa5e9beb2c605d14237dd"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "longest_highest",
+      "group_id": "52658d1593ddd3c337d2adcee410c3af"
+    },
+    {
+      "scope": "fact_consistency",
+      "category": "shortest_lowest",
+      "group_id": "00ad482f7cd9bbda997ef7c6ccb45597"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "fully_tied",
+      "group_id": "6b6a5d64320e162171135f997498ccf7"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "fully_tied",
+      "group_id": "5a44bfc9a5cef2885dcbc9b161f76e58"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "max_spread",
+      "group_id": "aa743edbc64d0a019764e965ff4b7709"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "max_spread",
+      "group_id": "4c07d77f01f7045f1c6dcc964d24a6ce"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "sub_conflict",
+      "group_id": "3205b50f21fa6abdfd7a659a9497ab78"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "sub_conflict",
+      "group_id": "68ad99cdde5ceff504c2c57a5187bf58"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "longest_highest",
+      "group_id": "d621a8e4e0d8389fd78f254bd06d8176"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "longest_highest",
+      "group_id": "8da43367c56fa5e9beb2c605d14237dd"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "shortest_lowest",
+      "group_id": "52658d1593ddd3c337d2adcee410c3af"
+    },
+    {
+      "scope": "element_coverage",
+      "category": "shortest_lowest",
+      "group_id": "65ec487eeba664c8366bf4f1253e4b2d"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "fully_tied",
+      "group_id": "7d68dce3ff106acea0ad27cd514da0ce"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "fully_tied",
+      "group_id": "00466e3adf9829d8fdea71798c3e72bd"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "max_spread",
+      "group_id": "5088b68f052e481e84c3a4a8c388a072"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "max_spread",
+      "group_id": "ce1df16953e10401a6b161fe5ef2d21d"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "sub_conflict",
+      "group_id": "8c1c4007ae2a3631e7fc5c33fa863e3a"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "sub_conflict",
+      "group_id": "4154c6d0caf6f34409de043a33b952dc"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "longest_highest",
+      "group_id": "8da43367c56fa5e9beb2c605d14237dd"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "longest_highest",
+      "group_id": "52658d1593ddd3c337d2adcee410c3af"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "shortest_lowest",
+      "group_id": "52658d1593ddd3c337d2adcee410c3af"
+    },
+    {
+      "scope": "expression_efficiency",
+      "category": "shortest_lowest",
+      "group_id": "00ad482f7cd9bbda997ef7c6ccb45597"
+    },
+    {
+      "scope": "cross",
+      "category": "metric_top1_conflict",
+      "group_id": "d621a8e4e0d8389fd78f254bd06d8176"
+    },
+    {
+      "scope": "cross",
+      "category": "metric_top1_conflict",
+      "group_id": "8da43367c56fa5e9beb2c605d14237dd"
+    }
+  ]
+}

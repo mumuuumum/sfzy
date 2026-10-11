@@ -82,10 +82,7 @@ ELEMENT_WEIGHTS = {
 # 两个 reward 都开，权重 0.3 / 0.7（和为 1，归一化后不变）
 SPEC = {"terms": {
     "rouge_l": {"enabled": True, "weight": 0.3},
-    "fact_consistency": {
-        "enabled": True, "weight": 0.7,
-        "element_weights": dict(ELEMENT_WEIGHTS),
-    },
+    "fact_consistency": {"enabled": True, "weight": 0.7},
 }}
 
 
@@ -136,7 +133,7 @@ def test_多个reward按归一化权重求和():
 def test_权重会被归一到一():
     spec = {"terms": {
         "rouge_l": {"weight": 30},
-        "fact_consistency": {"weight": 70, "element_weights": dict(ELEMENT_WEIGHTS)},
+        "fact_consistency": {"weight": 70},
     }}
     score, bd = compute_reward(
         REF, REF, spec=spec, judge_signals={"fact_consistency": 1.0}
@@ -157,10 +154,7 @@ def test_可以只开一个reward():
 def test_可以关掉rouge只留裁判():
     spec = {"terms": {
         "rouge_l": {"enabled": False},
-        "fact_consistency": {
-            "enabled": True, "weight": 1.0,
-            "element_weights": dict(ELEMENT_WEIGHTS),
-        },
+        "fact_consistency": {"enabled": True, "weight": 1.0},
     }}
     score, bd = compute_reward(
         REF, REF, spec=spec, judge_signals={"fact_consistency": 0.4}
@@ -171,8 +165,7 @@ def test_可以关掉rouge只留裁判():
 
 def test_两个裁判项各按自己的权重进入总分():
     spec = {"terms": {
-        "fact_consistency": {"enabled": True, "weight": 0.6,
-                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "fact_consistency": {"enabled": True, "weight": 0.6},
         "element_coverage": {"enabled": True, "weight": 0.4,
                              "element_weights": dict(ELEMENT_WEIGHTS)},
     }}
@@ -228,21 +221,21 @@ def test_门控可以整块关掉():
 
 # ---------------------------------------------------------------- 事实一致性硬门控
 
-def test_事实门控_任一要素0分整条reward归0():
+def test_事实门控_裁判判定有事实错误则整条reward归0():
     score, bd = compute_reward(
         REF, REF, spec=SPEC,
-        judge_signals={"fact_consistency": 0.9, "fact_consistency_min_raw": 0.0},
+        judge_signals={"fact_consistency": 0.9, "fact_has_error": 1.0},
     )
     assert bd.gated is True
-    assert bd.gate_reason == "fact_element_raw<1"
+    assert bd.gate_reason == "fact_has_error"
     assert score == 0.0
     assert bd.values == {}          # 门控命中就不再算任何分项
 
 
-def test_事实门控_六要素都非0则按配置权重正常混合():
+def test_事实门控_没有事实错误则按配置权重正常混合():
     score, bd = compute_reward(
         REF, REF, spec=SPEC,
-        judge_signals={"fact_consistency": 0.8, "fact_consistency_min_raw": 1.0},
+        judge_signals={"fact_consistency": 0.8, "fact_has_error": 0.0},
     )
     assert bd.gated is False
     assert score == pytest.approx(0.3 * bd.values["rouge_l"] + 0.7 * 0.8)
@@ -253,11 +246,11 @@ def test_事实门控_缺信号时不拦_保持向后兼容():
     assert bd.gated is False
 
 
-def test_事实门控_阈值设0等于关闭():
-    spec = {**SPEC, "gate": {"fact_consistency_min_raw": 0}}
+def test_事实门控_开关设0等于关闭():
+    spec = {**SPEC, "gate": {"fact_has_error": 0}}
     _, bd = compute_reward(
         REF, REF, spec=spec,
-        judge_signals={"fact_consistency": 0.9, "fact_consistency_min_raw": 0.0},
+        judge_signals={"fact_consistency": 0.0, "fact_has_error": 1.0},
     )
     assert bd.gated is False
 
@@ -265,7 +258,7 @@ def test_事实门控_阈值设0等于关闭():
 def test_事实门控_没开事实项就不生效():
     spec = {
         "terms": {"rouge_l": {"enabled": True, "weight": 1.0}},
-        "gate": {"fact_consistency_min_raw": 1},
+        "gate": {"fact_has_error": 1},
     }
     _, bd = compute_reward(REF, REF, spec=spec, judge_signals={})
     assert bd.gated is False
@@ -370,17 +363,16 @@ def test_EE不引入新的硬门控():
 
 def test_EE与fact各自独立加权():
     spec = {"terms": {
-        "fact_consistency": {"enabled": True, "weight": 0.7,
-                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "fact_consistency": {"enabled": True, "weight": 0.7},
         "expression_efficiency": {"enabled": True, "weight": 0.3},
-    }, "gate": {"fact_consistency_min_raw": 0}}
+    }, "gate": {"fact_has_error": 0}}
     score, bd = compute_reward(
         REF, REF, spec=spec,
         judge_signals={"fact_consistency": 0.8, "expression_efficiency": 0.5},
     )
     assert score == pytest.approx(0.7 * 0.8 + 0.3 * 0.5)
     # 不含事实门控辅助信号 —— EE 没有把 gate 信号带进来
-    assert "fact_consistency_min_raw" not in bd.values
+    assert "fact_has_error" not in bd.values
 
 
 # ---------------------------------------------------------------- 批量与统计

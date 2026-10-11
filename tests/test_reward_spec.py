@@ -28,7 +28,14 @@ ELEMENT_WEIGHTS = {
 
 
 def fact_term(**over):
-    entry = {"enabled": True, "weight": 0.7, "element_weights": dict(ELEMENT_WEIGHTS)}
+    # 新的事实一致性没有子项权重（只有 enabled / weight）
+    entry = {"enabled": True, "weight": 0.7}
+    entry.update(over)
+    return entry
+
+
+def cov_term(**over):
+    entry = {"enabled": True, "weight": 0.4, "element_weights": dict(ELEMENT_WEIGHTS)}
     entry.update(over)
     return entry
 
@@ -65,9 +72,9 @@ def test_可以单独开关():
 
 def test_关掉的term也可以仍然写全():
     s = spec({"rouge_l": {"enabled": True, "weight": 1.0},
-              "fact_consistency": fact_term(enabled=False)})
+              "element_coverage": cov_term(enabled=False)})
     assert s.needs_judge() is False
-    assert s.terms["fact_consistency"].options["element_weights"]["court_facts"] == 0.25
+    assert s.terms["element_coverage"].options["element_weights"]["court_facts"] == 0.25
 
 
 # ---------------------------------------------------------------- 权重（term 级）
@@ -116,32 +123,34 @@ def test_启用项权重全零报错():
 
 def test_内部权重被解析出来():
     s = spec(dict(BOTH))
-    assert s.terms["fact_consistency"].options["element_weights"] == ELEMENT_WEIGHTS
-    assert s.judge_term_options() == {"fact_consistency": {"element_weights": ELEMENT_WEIGHTS}}
+    # 事实一致性没有内部权重
+    assert s.terms["fact_consistency"].options == {}
+    assert s.judge_term_options() == {"fact_consistency": {}}
 
 
-def test_启用fact却没写element_weights要报错():
-    with pytest.raises(RewardConfigError, match="element_weights"):
-        spec({"fact_consistency": {"enabled": True, "weight": 1.0}})
+def test_fact不再接受element_weights():
+    """新的事实一致性只有 has_factual_error + 整体分，不再有六要素权重。"""
+    with pytest.raises(RewardConfigError, match="不认识的字段"):
+        spec({"fact_consistency": fact_term(element_weights=dict(ELEMENT_WEIGHTS))})
 
 
 def test_内部权重缺少键要报错():
     bad = {"case_type": 0.1, "plaintiff_claims": 0.9}          # 少四个
     with pytest.raises(RewardConfigError, match="键不对"):
-        spec({"fact_consistency": fact_term(element_weights=bad)})
+        spec({"element_coverage": cov_term(element_weights=bad)})
 
 
 def test_内部权重多了未知键要报错():
     bad = dict(ELEMENT_WEIGHTS, unknown_element=0.0)
     with pytest.raises(RewardConfigError, match="键不对"):
-        spec({"fact_consistency": fact_term(element_weights=bad)})
+        spec({"element_coverage": cov_term(element_weights=bad)})
 
 
 def test_内部权重之和必须为1():
     bad = dict(ELEMENT_WEIGHTS)
     bad["judgment_result"] = 0.50                              # 和变成 1.2
     with pytest.raises(RewardConfigError, match="之和必须为 1"):
-        spec({"fact_consistency": fact_term(element_weights=bad)})
+        spec({"element_coverage": cov_term(element_weights=bad)})
 
 
 def test_内部权重不能为负():
@@ -149,18 +158,19 @@ def test_内部权重不能为负():
     bad["case_type"] = -0.05
     bad["judgment_result"] = 0.40
     with pytest.raises(RewardConfigError, match="不能为负"):
-        spec({"fact_consistency": fact_term(element_weights=bad)})
+        spec({"element_coverage": cov_term(element_weights=bad)})
 
 
 def test_内部权重不是映射要报错():
     with pytest.raises(RewardConfigError, match="必须是"):
-        spec({"fact_consistency": fact_term(element_weights=[0.1, 0.9])})
+        spec({"element_coverage": cov_term(element_weights=[0.1, 0.9])})
 
 
 def test_rouge_l没有内部权重字段():
     """写错字段名（比如照抄老的 semantic.weights）要当场报错。"""
     with pytest.raises(RewardConfigError, match="不认识的字段"):
-        spec({"fact_consistency": {**fact_term(), "weights": dict(ELEMENT_WEIGHTS)}})
+        spec({"rouge_l": {"enabled": True, "weight": 1.0,
+                          "weights": dict(ELEMENT_WEIGHTS)}})
 
 
 # ---------------------------------------------------------------- 两个 judge 项
@@ -168,11 +178,12 @@ def test_rouge_l没有内部权重字段():
 def test_两个judge项各有各的内部权重():
     s = spec({
         "fact_consistency": fact_term(weight=0.6),
-        "element_coverage": {"enabled": True, "weight": 0.4,
-                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "element_coverage": cov_term(weight=0.4),
     })
     assert s.required_signals == {"fact_consistency", "element_coverage"}
     assert set(s.judge_term_options()) == {"fact_consistency", "element_coverage"}
+    assert s.terms["fact_consistency"].options == {}
+    assert s.terms["element_coverage"].options["element_weights"] == ELEMENT_WEIGHTS
     assert s.normalized_weights() == {
         "fact_consistency": pytest.approx(0.6), "element_coverage": pytest.approx(0.4),
     }
@@ -267,7 +278,7 @@ def test_EE_可与其他reward一起归一化加权():
 
 def test_EE_不是硬门控信号():
     s = spec({"expression_efficiency": ee_term()})
-    assert s.fact_element_gate_enabled is False
+    assert s.fact_error_gate_enabled is False
     assert s.gate_signals == set()
     assert s.needed_signals == {"expression_efficiency"}
 
@@ -320,25 +331,31 @@ def test_门控可只覆盖部分阈值():
 
 def test_事实硬门控默认开启且需要额外信号():
     s = spec({"fact_consistency": fact_term()})
-    assert s.gate.cfg["fact_consistency_min_raw"] == 1
-    assert s.fact_element_gate_enabled is True
-    assert s.gate_signals == {"fact_consistency_min_raw"}
-    assert s.needed_signals == {"fact_consistency", "fact_consistency_min_raw"}
+    assert s.gate.cfg["fact_has_error"] == 1
+    assert s.fact_error_gate_enabled is True
+    assert s.gate_signals == {"fact_has_error"}
+    assert s.needed_signals == {"fact_consistency", "fact_has_error"}
     # required_signals 仍然只表示 judge **任务**信号，不被门控辅助信号污染
     assert s.required_signals == {"fact_consistency"}
 
 
 def test_事实硬门控可关闭():
     s = spec({"fact_consistency": fact_term()},
-             gate={"fact_consistency_min_raw": 0})
-    assert s.fact_element_gate_enabled is False
+             gate={"fact_has_error": 0})
+    assert s.fact_error_gate_enabled is False
     assert s.gate_signals == set()
     assert s.needed_signals == {"fact_consistency"}
 
 
+def test_事实硬门控随gate整块关闭():
+    s = spec({"fact_consistency": fact_term()}, gate={"enabled": False})
+    assert s.fact_error_gate_enabled is False
+    assert s.gate_signals == set()
+
+
 def test_没开事实项就不需要硬门控信号():
     s = spec({"rouge_l": {"weight": 1.0}})
-    assert s.fact_element_gate_enabled is False
+    assert s.fact_error_gate_enabled is False
     assert s.needed_signals == set()
 
 
@@ -362,11 +379,9 @@ def test_正式配置只开事实一致性(name):
     assert cfg.path_("semantic.backend") == "fact"
     # 门控保留为全局开关
     assert s.gate.enabled is True
-    # 六要素权重来自配置文件。只校验结构（键齐全 + 和为 1）——
-    # 具体数值是拿来调的，钉死在测试里只会让每次调参都红一片。
-    weights = s.terms["fact_consistency"].options["element_weights"]
-    assert set(weights) == set(ELEMENT_WEIGHTS)
-    assert sum(weights.values()) == pytest.approx(1.0)
+    # 新的事实一致性没有子项权重
+    assert s.terms["fact_consistency"].options == {}
+    assert s.fact_error_gate_enabled is True
 
 
 def test_旧的semantic_weights不再被接受():
@@ -395,7 +410,7 @@ def test_a100配置用bf16全精度裁判():
     assert cfg.path_("semantic.load_in_4bit") is False
 
 
-@pytest.mark.parametrize("name", ["grpo_fact_coverage_inp_t4.yaml", "grpo_fact_coverage_a100.yaml"])
+@pytest.mark.parametrize("name", ["grpo_fact_coverage_inp_t4.yaml", "grpo_fact_coverage_vGPU48.yaml"])
 def test_合并配置能解析_结构正确(name):
     cfg = _load(name)
     s = RewardSpec.from_config(cfg.path_("rl.reward"))

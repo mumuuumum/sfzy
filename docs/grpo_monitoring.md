@@ -54,7 +54,8 @@
 | `relation_log_interval` | 20 | 相关性、Coverage/EE 冲突、分项消融 |
 | `entropy_log_interval` | 20 | 策略熵（同一次前向） |
 | `lora_update_log_interval` | 20 | LoRA 更新范数 |
-| `eval_interval` / `eval.every_n_steps` | 100 | 固定验证集 |
+| `eval_interval` / `eval.every_n_steps` | 100 | 固定验证集（按步数轮询） |
+| `eval.quantile_points` | 0（关） | 固定验证集（按分位点：n 步等分成 x 段，第 k/x 分位点各验一次） |
 | `correlation_window` | 512 | 跨步相关性窗口样本数 |
 | `near_zero_std_eps` | 1e-6 | "近零方差组"阈值 |
 | `ee_low_threshold` / `ee_high_threshold` | 0.5 / 0.75 | EE 低/高分阈值 |
@@ -62,6 +63,8 @@
 | `near_upper_gate_margin` | 0.1 | 距长度比上界多近算"接近上界" |
 | `relation_enabled` | true | 可整体关掉关系/消融分析 |
 | `eval.enabled` / `eval.data_file` / `eval.max_samples` / `eval.baseline` | 关闭 / 无 | 可选固定验证集 |
+| `eval.save_best` / `eval.best_metric` | true / `rouge_total` | 按验证分维护 `best.pt` |
+| `eval.max_length` | null | null = 与训练的 `rl.max_length` 一致（**不要填更小的值**） |
 
 步数很少时，`GRPOMonitor._interval` 自动缩短上述间隔（至多 `total_steps//5`），
 避免短跑一条扩展曲线都记不到。
@@ -292,6 +295,24 @@ token：`length/tokens_mean/std/p90`
 
 缺信号的项不写（例如裁判只有 fact 时不写 `eval/coverage_mean`）。
 
+**验证调度**。两种二选一：
+
+* `eval.every_n_steps`（或旧的 `eval_interval`）：每 N 步一次，按步数轮询；
+* `eval.quantile_points = x`：**按分位点** —— 把总步数 n 等分成 x 段，在第
+  k/x 分位点各验一次（k=1..x）。x=10、n=10738 → 第 1074/2148/…/10738 步。
+  最后一个点必然落在最后一步，所以"训练结束时的模型"一定会被评到。设了
+  `quantile_points` 就以它为准，`every_n_steps` 被忽略。
+
+**best.pt**。每次验证后，用 `eval.best_metric`（默认 `rouge_total`，即官方口径
+`0.2*R1 + 0.4*R2 + 0.4*RL`）与历史最好分比较（越大越好）；刷新了就覆盖
+`<output_dir>/best.pt`，并在日志里打一行 `★ 验证集 eval/rouge_total=… 刷新最好成绩`。
+历史最好分存在 `RLState` 里随 checkpoint 落盘，所以**续训不会用更差的分覆盖
+best.pt**；`best.pt` 不参与 `keep_last_n_checkpoints` 的清理。
+
+验证的截断/生成预算必须与训练可比：`eval.max_length: null` 表示跟训练用同一个
+`rl.max_length`（给了整数则取 `min(它, rl.max_length)`），`eval.max_new_tokens`
+则取 `min(它, rl.max_new_tokens)`。
+
 ## 4. 未记录 / 不适用
 
 | 需求项 | 处理与原因 |
@@ -307,11 +328,11 @@ token：`length/tokens_mean/std/p90`
 
 ## 5. 手写 GRPO 关键量解释
 
-- **old/current logprob**：`rollout` 后、任何参数更新前先算 `old_logprobs`（detach），
-  再用同一批参数算带梯度的 `logprobs`。因此**在 dropout 关闭的确定性前向下**，
-  首次更新前 `ratio≈1`、`clip_frac≈0`；出现明显偏离说明实现或参数状态有问题。
-  本训练每批只做一次更新，无异步采样，所以 Ratio/Clip 是"实现正确性检查"，
-  而不是"模型更新后的策略漂移"。
+- **old/current logprob**：`rollout` 后、任何参数更新前先算 `old_logprobs`（detach，
+  **整个 μ 内层循环共用**），再用同一批参数算带梯度的 `logprobs`。因此**在
+  dropout 关闭的确定性前向下**：`rl.inner_iterations`（μ）=1 时 `ratio≡1`、
+  `clip_frac≡0` —— 这是"每批只更新一次"的结构性结果，不是实现出错；μ>1 时第 1 轮
+  仍是 1，第 2 轮起才出现真实漂移，这时 Ratio/Clip 才是在看"策略被这一步推了多远"。
 - **advantage**：`A_i=(r_i-mean)/ (std+eps)`，`eps` 保证组内全同退化为 0 而非 nan。
   `advantage/raw_*` 是其原始值；`advantage/effective_*` 是再经长度缩放与组 Mask 后
   真正进 loss 的值。
@@ -319,9 +340,14 @@ token：`length/tokens_mean/std/p90`
   默认 `sqrt`：`A ← A / sqrt(len)`；`length/normalization_factor_*` 与之一致。
   `relation/effective_signal_length_spearman` 用有效优势与长度的相关观察长度偏置。
 - **PPO 裁剪**：`loss=-mean(min(ratio·A, clip(ratio)·A))`，`clip_frac` 是算法返回值，
-  `clip_frac_low/high` 按 `[1-ε,1+ε]` 分界统计。
+  `clip_frac_low/high` 按 `[1-ε,1+ε]` 分界统计。μ=1 时它必然为 0（裁剪不起作用），
+  μ>1 才会真正生效；多个内层迭代的 ratio **拼接**在一起统计，所以 μ>1 时
+  `ratio_*` / `clip_frac_*` 的口径是"整步全部迭代"，日志里另有
+  `μ{μ} clip 首轮%→末轮%` 一行看漂移怎么长起来。
 - **KL**：k3 无偏估计 `mean(exp(ref-policy)-(ref-policy)-1)`；`ref_kl_estimate` 是估计值，
-  `kl_penalty` 是乘系数后计入 loss 的值，两者分开记录。`kl_coef=0` 不加载参考模型、不记 0。
+  `kl_penalty` 是乘系数后计入 loss 的值，两者分开记录。参考策略 = **同一底座 +
+  SFT 的 LoRA 快照**（不额外加载 6B 权重），参考 logprob 与策略参数无关，所以整个
+  μ 循环只算一次。`kl_coef=0` 时不加载参考策略、不记 0。
 
 ## 6. 单元测试
 

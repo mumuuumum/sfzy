@@ -1,0 +1,107 @@
+{
+  "arms": {
+    "human": {
+      "n": 100,
+      "mean_reward": 0.9275,
+      "mean_fact_score": 3.71,
+      "score_counts": {
+        "0": 7,
+        "1": 0,
+        "2": 0,
+        "3": 1,
+        "4": 92
+      },
+      "error_count": 7,
+      "error_rate": 0.07,
+      "fallback_ratio": 0.0
+    },
+    "candidate": {
+      "n": 400,
+      "mean_reward": 0.71375,
+      "mean_fact_score": 2.855,
+      "score_counts": {
+        "0": 111,
+        "1": 0,
+        "2": 0,
+        "3": 14,
+        "4": 275
+      },
+      "error_count": 111,
+      "error_rate": 0.2775,
+      "fallback_ratio": 0.0
+    }
+  },
+  "comparison": {
+    "groups": 100,
+    "n_pairs": 400,
+    "candidate_error": 111,
+    "human_error": 28,
+    "both_error": 6,
+    "mean_candidate": 0.71375,
+    "mean_human": 0.9275,
+    "human_gt_candidate_ratio": 0.2925,
+    "candidate_error_human_scores": {
+      "0": 6,
+      "1": 0,
+      "2": 0,
+      "3": 1,
+      "4": 104
+    },
+    "candidate_error_human_error": 6
+  },
+  "gold_errors": [
+    {
+      "group_id": "66becf3cc1a6e2aa31e7d32770c7f522",
+      "fact_score": 0,
+      "error_reason": "摘要中称'审理查明原告系李志荣的遗孀'，这与原文严重矛盾。原文明确指出'被告系李志荣的遗孀'，而'原告系李桂忠之女'（即李志荣之子李桂清之姐或妹），原告是李志荣的孙女，绝非遗孀。此外，摘要称'被告辩称...此开荒地与被告无关'，原文中被告辩称的是'此开荒地与[原告/被告家庭]无关'且强调由儿子耕种，但最致命的错误在于混淆了原被告身份关系。",
+      "chars": 197
+    },
+    {
+      "group_id": "a1435a7c167db4365040ec879348dde7",
+      "fact_score": 0,
+      "error_reason": "摘要中称“驳回原告的诉讼请求”，这与原文严重不符。原文明确判决支持原告成都市鼎盛和建材有限公司的诉讼请求（支付租赁费及违约金），仅驳回了另一原告张利的诉讼请求。摘要笼统地称“驳回原告”且未指明是部分驳回，导致事实含义与原文截然相反，属于彻头彻尾的编造或严重错误。",
+      "chars": 285
+    },
+    {
+      "group_id": "d045d8faaea61ea8ec6646c63a633ab3",
+      "fact_score": 0,
+      "error_reason": "摘要中称“案外人部分清偿了本金150000元”，与原文严重不符。原文明确记载案外人龚节兵和杨胜江分别偿还了借款本金150万元，合计300万元（即全部本金已清偿），而非15万元。",
+      "chars": 315
+    },
+    {
+      "group_id": "9865bd27ddd42f5faa8fb354cbc5156d",
+      "fact_score": 0,
+      "error_reason": "摘要中称“第三人与被告订立汽车营运服务合同”，这与原文严重矛盾。原文明确指出是实际出资人（第三人）马启淞与重庆久发汽车运输有限公司长寿分公司（即原告主张的所有权人，非被告修理厂）订立了汽车营运服务合同，而非与被告水城县成联汽车修理厂订立。",
+      "chars": 292
+    },
+    {
+      "group_id": "dd84e76ca69513f7e52df02978714fc9",
+      "fact_score": 0,
+      "error_reason": "摘要中称'被告未答辩'与原文事实严重不符。原文明确记载被告韩玉庆到庭并进行了答辩（称欠款由合伙人陈为善承担），仅被告陈玲玲未答辩。此外，摘要遗漏了原告在庭审中变更诉讼请求、放弃利息主张的关键事实，导致后续判决结果描述不准确。",
+      "chars": 290
+    },
+    {
+      "group_id": "e9d264c41834bf8973bcc9a5d8bedb13",
+      "fact_score": 0,
+      "error_reason": "摘要中表述为'应当支付原告...二倍工资差额'，原文及判决结果均为'支付被告...二倍工资差额'。原告是用人单位（起诉方），被告是劳动者（被诉方）。法院判决是原告向被告支付款项，而非支付给原告。这是严重的主体错误和事实编造。",
+      "chars": 338
+    },
+    {
+      "group_id": "8d062818acd6c29781e061f6a2393c8a",
+      "fact_score": 0,
+      "error_reason": "摘要中将被告姓名'苏保安'错误表述为'孙保安'，且判决主文中遗漏了具体的被告姓名（仅写'被告'），与原文事实严重不符。",
+      "chars": 327
+    }
+  ],
+  "meta": {
+    "input": "/home/yukino/projects/sfzy/data/triples/sft_val_100_n4.jsonl",
+    "n_groups": 100,
+    "arms": [
+      "candidate",
+      "human"
+    ],
+    "judge_model": "qwen3.7-flash",
+    "judge_base_url": "https://maas.qianwenaiapi.com/compatible-mode/v1",
+    "created_at": "2026-10-10T17:22:07"
+  }
+}

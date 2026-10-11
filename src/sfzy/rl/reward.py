@@ -156,22 +156,21 @@ def check_gate(candidate: str, reference: str, gate_cfg: Mapping[str, Any]) -> O
     return None
 
 
-def check_fact_element_gate(
+def check_fact_error_gate(
     spec: "RewardSpec",
     judge_signals: Mapping[str, Optional[float]],
 ) -> Optional[str]:
-    """事实一致性硬门控：六个要素有一个低于阈值就整条出局。
+    """事实硬门控：裁判判定"存在明确事实错误"就整条出局。
 
     为什么要做成**全局门控**而不是把 fact_consistency 这项清零：需求是
-    "任一要素 0 分 → reward 直接 0"，而加权求和里 fact 权重是 0.7，清零它
-    还会剩下 0.3 的覆盖率分，达不到"直接 0"。
+    "有事实错误 → reward 直接 0"，而加权求和里 fact 只占一部分权重，
+    清零它还会剩下覆盖率/EE 的分，达不到"直接 0"。
 
     信号缺失（裁判失败被组内均值补过、或外部只传了聚合分）时**不拦**，
-    保证向后兼容、也不让裁判抖动变成惩罚。threshold<=0 或 fact 项没启用
-    时这条规则整体不生效。
+    保证向后兼容、也不让裁判抖动变成惩罚。门控关闭或 fact 项没启用时
+    这条规则整体不生效。
     """
-    min_raw = spec.fact_element_min_raw
-    if min_raw <= 0 or not spec.fact_consistency_enabled:
+    if not spec.fact_error_gate_enabled:
         return None
     value = judge_signals.get(FACT_GATE_SIGNAL)
     if value is None:
@@ -180,8 +179,8 @@ def check_fact_element_gate(
         value = float(value)
     except (TypeError, ValueError):
         return None
-    if value < min_raw:
-        return f"fact_element_raw<{min_raw}"
+    if value >= 1.0:
+        return "fact_has_error"
     return None
 
 
@@ -300,7 +299,7 @@ def _compute_one(
             bd.total = 0.0
             return 0.0, bd
         # 事实一致性硬门控：六要素里有 0 分 → 整条 reward 0
-        reason = check_fact_element_gate(spec, judge_signals)
+        reason = check_fact_error_gate(spec, judge_signals)
         if reason is not None:
             bd.gated = True
             bd.gate_reason = reason

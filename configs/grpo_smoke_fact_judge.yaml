@@ -86,14 +86,6 @@ rl:
       fact_consistency:
         enabled: true
         weight: 0.7
-        element_weights:
-          case_type:          0.05
-          plaintiff_claims:   0.15
-          defendant_defenses: 0.10
-          court_facts:        0.25
-          legal_basis:        0.15
-          judgment_result:    0.30
-
   anchor:
     enabled: false
     slack: 0.05

@@ -71,9 +71,15 @@ class MonitorConfig:
     eval_enabled: bool = False
     eval_data_file: Optional[str] = None
     eval_every_n_steps: int = 100
+    # 按**分位点**验证：把总步数 n 等分成 x 段，在第 k/x 分位点各验一次（k=1..x），
+    # 所以最后一个点就是训练结束那一步。x=0 表示不启用（退回 eval_every_n_steps）。
+    eval_quantile_points: int = 0
     eval_max_samples: int = 100
     eval_max_new_tokens: int = 384
-    eval_max_length: int = 2048
+    # None = 与训练用同一个 rl.max_length（推荐：验证的截断规则必须和训练一致，
+    # 否则"训练看 7168 token、验证只喂 2048"会让验证分系统性低于真实水平，
+    # 白白压低基线）。给了整数则取 min(它, rl.max_length)。
+    eval_max_length: Optional[int] = None
     eval_baseline: Dict[str, float] = field(default_factory=dict)
 
     @classmethod
@@ -101,9 +107,12 @@ class MonitorConfig:
             eval_enabled=bool(ev.get("enabled", False)),
             eval_data_file=ev.get("data_file"),
             eval_every_n_steps=max(1, eval_interval),
+            eval_quantile_points=max(0, int(ev.get("quantile_points", 0) or 0)),
             eval_max_samples=max(1, int(ev.get("max_samples", 100))),
             eval_max_new_tokens=int(ev.get("max_new_tokens", 384)),
-            eval_max_length=int(ev.get("max_length", 2048)),
+            eval_max_length=(
+                None if ev.get("max_length") is None else int(ev["max_length"])
+            ),
             eval_baseline=dict(ev.get("baseline") or {}),
         )
 
@@ -237,7 +246,6 @@ class MonitorBatch:
     learning_rate: float
     clip_ratio: float
     fact_gate_enabled: bool
-    fact_gate_min_raw: int
     upper_length_ratio: Optional[float]
     result_markers: Sequence[str] = ()
     forbidden_prefixes: Sequence[str] = ()
@@ -275,12 +283,34 @@ class GRPOMonitor:
         self.coverage_enabled = coverage_enabled
         self.ee_enabled = ee_enabled
         self.total_steps: Optional[int] = None
+        # 按分位点验证的调度表（set_total_steps 时算出来），None = 用 every_n_steps
+        self._eval_steps: Optional[Tuple[int, ...]] = None
         # 跨 step 的相关性窗口：每条候选一条记录
         self._window: deque = deque(maxlen=cfg.correlation_window)
 
     def set_total_steps(self, total_steps: int) -> None:
-        """训练总步数已知后，若总步数很少则自动缩短日志间隔。"""
+        """训练总步数已知后，若总步数很少则自动缩短日志间隔；顺便排定验证点。
+
+        分位点调度（`eval.quantile_points = x`）就是"把 n 步等分成 x 段"：
+
+            x=4, n=1000 → 在第 250 / 500 / 750 / 1000 步验证
+
+        最后一个点必然落在最后一步（k=x），所以"训练结束时的模型"一定会被评到、
+        也一定有机会成为 best。x 大于总步数时按 set 去重（不会重复验同一步）。
+        """
         self.total_steps = max(1, int(total_steps))
+        x = self.cfg.eval_quantile_points
+        if x > 0:
+            total = self.total_steps
+            self._eval_steps = tuple(sorted({
+                max(1, min(total, int(round(total * k / x)))) for k in range(1, x + 1)
+            }))
+        else:
+            self._eval_steps = None
+
+    def eval_schedule(self) -> Optional[Tuple[int, ...]]:
+        """本 run 的验证步（按分位点时才有；否则 None 表示按 every_n_steps 轮询）。"""
+        return self._eval_steps
 
     def _interval(self, base: int) -> int:
         """步数少时缩短间隔：保证至少能记到几次扩展统计。"""
@@ -295,12 +325,13 @@ class GRPOMonitor:
         return self.cfg.enabled and step % self._interval(self.cfg.lora_update_log_interval) == 0
 
     def eval_due(self, step: int) -> bool:
-        return (
-            self.cfg.enabled
-            and self.cfg.eval_enabled
-            and bool(self.cfg.eval_data_file)
-            and step % self._interval(self.cfg.eval_every_n_steps) == 0
-        )
+        if not (self.cfg.enabled and self.cfg.eval_enabled and self.cfg.eval_data_file):
+            return False
+        if self._eval_steps is not None:
+            # 分位点调度：显式列出来的步才验（不再叠加 `_interval` 的自动缩短，
+            # 否则 1000 步的 run 里"每 250 步"会被缩成"每 200 步"，和配置不符）。
+            return step in self._eval_steps
+        return step % self._interval(self.cfg.eval_every_n_steps) == 0
 
     # ------------------------------------------------------------------
     def observe(self, batch: MonitorBatch) -> Dict[str, float]:
@@ -464,7 +495,7 @@ class GRPOMonitor:
 
         out = {
             "gate/total_rate": _rate([bool(r) for r in reasons]),
-            "gate/fact_rate": cat_rate(lambda r: r.startswith("fact_element_raw")),
+            "gate/fact_rate": cat_rate(lambda r: r == "fact_has_error"),
             "gate/length_too_long_rate": cat_rate(lambda r: r == "length_too_long"),
             "gate/length_too_short_rate": cat_rate(lambda r: r == "length_too_short"),
             "gate/min_length_rate": cat_rate(lambda r: r == "too_short"),
@@ -581,60 +612,37 @@ class GRPOMonitor:
                     if sum(1 for v in g if v is not None) >= 2]
             _put(out, "fact/group_std", _mean(stds))
         # 事实硬门控：只统计被 fact 门控拦下的比例
-        fact_gated = [r.startswith("fact_element_raw") for r in b.gate_reasons]
+        fact_gated = [r == "fact_has_error" for r in b.gate_reasons]
         out["fact/gate_rate"] = _rate(fact_gated)
         out["fact/pass_rate"] = 1.0 - out["fact/gate_rate"]
-        out.update(self._fact_element_metrics(b))
+        out.update(self._fact_score_metrics(b))
         return out
 
-    def _fact_element_metrics(self, b: MonitorBatch) -> Dict[str, float]:
+    def _fact_score_metrics(self, b: MonitorBatch) -> Dict[str, float]:
+        """事实一致性：整体 0-4 分 + 事实错误门控信号（不再有六要素明细）。"""
         out: Dict[str, float] = {}
         G = b.group_size
         results = b.judge_results or []
         if not results:
             return out
-        # 逐要素按组聚合（组内候选连续）
-        per_elem: Dict[str, List[float]] = {name: [] for name in _ELEMENTS}
-        grouped: Dict[str, List[List[float]]] = {name: [] for name in _ELEMENTS}
-        zero_counts, min_scores = [], []
-        all_raw: List[int] = []
-        # 每个候选的事实硬门控是否通过（用于组级统计）
+        scores: List[int] = []
         fact_pass: List[Optional[bool]] = [None] * b.n
-        threshold = b.fact_gate_min_raw
-        for s, e in _group_slices(b.n, b.group_size):
-            for name in _ELEMENTS:
-                grouped[name].append([])
-            for i in range(s, min(e, len(results))):
-                res = results[i]
-                if res is None or not getattr(res, "raw_scores", None):
-                    continue
-                raws = res.raw_scores
-                all_raw.extend(int(raws[name]) for name in _ELEMENTS)
-                zero_counts.append(sum(1 for name in _ELEMENTS if int(raws[name]) == 0))
-                min_scores.append(float(getattr(res, "min_element_score", 0.0)))
-                for name in _ELEMENTS:
-                    value = int(raws[name]) / 4.0
-                    per_elem[name].append(value)
-                    grouped[name][-1].append(value)
-                if b.fact_gate_enabled and threshold > 0:
-                    fact_pass[i] = min(int(raws[name]) for name in _ELEMENTS) >= threshold
-                else:
-                    fact_pass[i] = True
-        if not all_raw:
-            return out
-        _put(out, "fact/zero_element_count_mean", _mean(zero_counts))
-        out["fact/multi_zero_element_rate"] = _rate([c >= 2 for c in zero_counts])
-        _put(out, "fact/min_element_score_mean", _mean(min_scores))
-        for level in range(5):
-            out[f"fact/score_ratio_{level}"] = _rate([v == level for v in all_raw])
-        for name in _ELEMENTS:
-            vals = per_elem[name]
-            if not vals:
+        for i, res in enumerate(results[: b.n]):
+            score = getattr(res, "fact_score", None)
+            has_error = getattr(res, "has_factual_error", None)
+            if score is None:
                 continue
-            _put(out, f"fact/{name}/mean", _mean(vals))
-            out[f"fact/{name}/zero_rate"] = _rate([v == 0.0 for v in vals])
-            stds = [_pstd(g) for g in grouped[name] if len(g) >= 2]
-            _put(out, f"fact/{name}/group_std", _mean(stds))
+            scores.append(int(score))
+            fact_pass[i] = not bool(has_error) if b.fact_gate_enabled else True
+        if not scores:
+            return out
+        _put(out, "fact/score_mean", _mean([s / 4.0 for s in scores]))
+        for level in range(5):
+            out[f"fact/score_ratio_{level}"] = _rate([v == level for v in scores])
+        errors = [1 if (getattr(r, "has_factual_error", None) or 0) else 0
+                  for r in results[: b.n] if getattr(r, "fact_score", None) is not None]
+        if errors:
+            out["fact/error_rate"] = _rate([e == 1 for e in errors])
         # 组级 gate 通过情况（分母 = 有裁判数据的组）
         group_flags: List[List[bool]] = []
         for s, e in _group_slices(b.n, G):

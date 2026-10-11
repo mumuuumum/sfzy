@@ -17,7 +17,20 @@ from pathlib import Path
 
 import pytest
 
-from sfzy.judge.schema import ELEMENTS, MAX_SCORE, aggregate
+from sfzy.judge.schema import MAX_SCORE, JudgeResult
+
+
+def _fact_result(cid, score, has_error=False, reason=""):
+    """按新的 FC 口径造一条判定结果。"""
+    return JudgeResult(
+        candidate_id=str(cid),
+        weighted_reward=score / float(MAX_SCORE),
+        scores={"fact_consistency": score / float(MAX_SCORE)},
+        raw_scores={"fact_consistency": score},
+        fact_score=score,
+        has_factual_error=1 if has_error else 0,
+        error_reason=reason,
+    )
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -44,13 +57,13 @@ class _FakeJudge:
     def judge_candidates(self, document, candidates, candidate_ids=None):
         self.seen.append((document, candidates, candidate_ids))
         if self.fail_on and document == self.fail_on:
-            raise RuntimeError("六要素抽取失败")
+            raise RuntimeError("裁判调用失败")
         out = []
         for cid, cand in zip(candidate_ids or [], candidates):
-            raw = {e: MAX_SCORE for e in ELEMENTS}
             if "驳回" in cand:
-                raw["judgment_result"] = 0
-            out.append(aggregate(raw, candidate_id=str(cid)))
+                out.append(_fact_result(cid, 0, True, "裁判结果写反"))
+            else:
+                out.append(_fact_result(cid, MAX_SCORE))
         return out
 
 
@@ -63,7 +76,9 @@ def test_逐条打分对齐到正确的_id():
     out = TOOL.score_records(judge, rows)
     assert [r[0] for r in out] == ["a", "b"]
     assert out[0][1].weighted_reward == pytest.approx(1.0)
-    assert out[1][1].weighted_reward == pytest.approx(0.70)     # 结果写反
+    # 结果写反 → 裁判判"存在事实错误" → 整体分 0 → 奖励 0
+    assert out[1][1].weighted_reward == pytest.approx(0.0)
+    assert out[1][1].has_factual_error == 1
 
 
 def test_单条失败只记_error_不写假分数():
@@ -83,7 +98,7 @@ def test_单条失败只记_error_不写假分数():
 
 def test_失败条目不参与均值():
     """把失败当 0 分会让"模型变差了"这种假结论直接冒出来。"""
-    good = TOOL.result_to_record("a", aggregate({e: MAX_SCORE for e in ELEMENTS}), None)
+    good = TOOL.result_to_record("a", _fact_result("a", MAX_SCORE), None)
     bad = TOOL.result_to_record("b", None, "APIError: 裁判调用失败")
     stats = TOOL.summarize([good, bad])
     assert stats["n"] == 1.0 and stats["n_failed"] == 1.0
@@ -91,12 +106,11 @@ def test_失败条目不参与均值():
 
 
 def test_汇总复用需求的统计口径():
-    rows = [TOOL.result_to_record(str(i), aggregate({e: i % 5 for e in ELEMENTS}), None)
-            for i in range(5)]
+    rows = [TOOL.result_to_record(str(i), _fact_result(str(i), i), None) for i in range(5)]
     stats = TOOL.summarize(rows)
     assert stats["mean_fact_reward"] == pytest.approx(0.5)
-    assert "mean_min_element_score" in stats
-    assert all(f"mean_{e}_score" in stats for e in ELEMENTS)
+    assert stats["mean_fact_score"] == pytest.approx(0.5)
+    assert "fact_error_rate" in stats
     assert sum(stats[f"ratio_score_{lv}"] for lv in range(MAX_SCORE + 1)) == pytest.approx(1.0)
 
 

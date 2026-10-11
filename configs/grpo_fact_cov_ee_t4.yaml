@@ -25,7 +25,7 @@ model:
   bnb_4bit_compute_dtype: float16
   torch_dtype: float16
   device_map: {"": 0}
-  max_length: 2048
+  max_length: 8192
   config_patches: {}
 
 lora:
@@ -73,29 +73,22 @@ rl:
     # 设 1 = "任一要素得 0 分即出局"；设 0 关闭这条规则（其余门控项沿默认）。
     # 注意：这是全局硬门控，离线验证时人工摘要也会被同一条规则拦下。
     gate:
-      fact_consistency_min_raw: 0
+      fact_has_error: 0
     terms:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
-        enabled: false
-        weight: 0.5
-        element_weights:
-          case_type:          0.05
-          plaintiff_claims:   0.20
-          defendant_defenses: 0.15
-          court_facts:        0.25
-          legal_basis:        0.15
-          judgment_result:    0.20
+        enabled: true
+        weight: 0.1
       element_coverage:
-        enabled: false
-        weight: 1
+        enabled: true
+        weight: 0.45
         element_weights:
           case_type:          0.05
-          plaintiff_claims:   0.20
+          plaintiff_claims:   0.15
           defendant_defenses: 0.15
-          court_facts:        0.25
-          legal_basis:        0.15
-          judgment_result:    0.20
+          court_facts:        0.50
+          legal_basis:        0.10
+          judgment_result:    0.05
       # ---- INP（信息必要性精确率）----
       # prompt 常量 INP_JUDGE_PROMPT 已由使用者填写，打开即生效。
       information_necessity_precision:
@@ -107,11 +100,11 @@ rl:
       # 只要求非负、和 > 0（R_EE 自带按权重和归一）。
       expression_efficiency:
         enabled: true
-        weight: 1
+        weight: 0.45
         dimension_weights:
-          semantic_redundancy: 0.3
-          verbal_redundancy: 0.3
-          abstraction_adequacy: 0.4
+          semantic_redundancy: 0.2
+          verbal_redundancy: 0.2
+          abstraction_adequacy: 0.6
       # ---- Coverage × INP 的 Fβ 组合 ----
       # 启用后 coverage / inp 不再参与独立加权和，改由 Fβ 一项参与。
       # quality_fbeta:
@@ -141,9 +134,16 @@ semantic:
   # 判定走 API（不加载本地裁判，也就不吃显存）。
   # 密钥只从环境变量读，不写进配置。
   judge_api:
-    base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
+    # base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
+    base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
     api_key_env: SFZY_JUDGE_API_KEY
-    model: deepseek-chat                       # 想换更强裁判改这里
+    # model: deepseek-chat                       # 想换更强裁判改这里
+    model: qwen3.7-flash                       # 想换更强裁判改这里
+    # Qwen3 系列默认 **开启思考模式**：非流式调用会先产出一大段 reasoning 再给
+    # JSON，单次判定因此慢好几倍，而且 512 的 max_tokens 会被思考吃掉、JSON
+    # 被截断。Model Studio 兼容模式用这个字段关掉思考（直接进请求体顶层）。
+    extra_body:
+      enable_thinking: false
     concurrency: 16                            # 线程池并发（API 是 I/O 密集）
     max_retries: 3
     timeout_s: 60

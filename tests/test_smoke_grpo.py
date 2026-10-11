@@ -152,10 +152,7 @@ def reward_cfg(**over):
         "normalize_weights": True,
         "terms": {
             "rouge_l": {"enabled": True, "weight": 0.3},
-            "fact_consistency": {
-                "enabled": True, "weight": 0.7,
-                "element_weights": dict(ELEMENT_WEIGHTS),
-            },
+            "fact_consistency": {"enabled": True, "weight": 0.7},
         },
         "rouge_mode": "char",
         # 门控整块关掉：生成只有 8 个 token，正常门控会全拦下，测不出东西。
@@ -357,8 +354,7 @@ def test_两个reward同时训练(tmp_path):
     """事实一致性 + 关键要素覆盖率：两路信号都要进指标、都要有组内方差。"""
     reward = reward_cfg(terms={
         "rouge_l": {"enabled": False, "weight": 0.0},
-        "fact_consistency": {"enabled": True, "weight": 0.6,
-                             "element_weights": dict(ELEMENT_WEIGHTS)},
+        "fact_consistency": {"enabled": True, "weight": 0.6},
         "element_coverage": {"enabled": True, "weight": 0.4,
                              "element_weights": dict(ELEMENT_WEIGHTS)},
     })

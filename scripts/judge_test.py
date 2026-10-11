@@ -48,11 +48,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                         # noqa: E402
-from sfzy.judge import (                                   # noqa: E402
-    ELEMENTS,
-    ELEMENT_ZH,
-    FactConsistencyJudge,
-)
+from sfzy.judge import FactConsistencyJudge                # noqa: E402
 from sfzy.judge.runtime import TorchRuntime                # noqa: E402
 
 
@@ -172,28 +168,21 @@ def load_documents() -> dict:
 def run_single(judge: FactConsistencyJudge, document: str, candidate: str) -> None:
     """需求第十三节要打印的五项，一次看全。
 
-    现在是一次性判定：把 (原文全文, 摘要全文) 一次喂给裁判，直接拿六个分。
+    现在是一次判定：把 (原文全文, 摘要全文) 一次喂给裁判，输出
+    ``has_factual_error`` + 整体 ``fact_consistency_score`` + ``error_reason``。
     """
-    from sfzy.judge.schema import aggregate
+    raw = judge.judge_fact_batch([(document, candidate)])[0]
+    score = int(raw["fact_consistency_score"])
+    has_error = int(raw["has_factual_error"])
 
-    raw = judge.judge_fact_six_batch([(document, candidate)])[0]
-    result = aggregate(
-        dict(raw),
-        weights=judge.weights,
-        sources={name: "judge" for name in ELEMENTS},
-    )
-
-    print("\n【1】六要素判定（一次判定 (原文, 摘要) → 六个分）")
-    for name in ELEMENTS:
-        print(f"  {ELEMENT_ZH[name]:<8}判定 {raw[name]}/4")
-
-    print("\n【2】六个归一化评分（/4）")
-    for name in ELEMENTS:
-        print(f"  {ELEMENT_ZH[name]:<8}{result.scores[name]:.2f}")
-    print(f"\n【3】weighted fact_reward = {result.weighted_reward:.4f}")
-    print(f"     min_element_score     = {result.min_element_score:.4f}"
-          "   （不含案由）")
-    print(f"     judgment_result_score = {result.judgment_result_score:.4f}")
+    print("\n【1】事实错误检测（任务一）")
+    print(f"  has_factual_error = {has_error}"
+          f"{'（会触发事实硬门控 → reward=0）' if has_error else ''}")
+    print("\n【2】整体事实一致性评分（任务二）")
+    print(f"  fact_consistency_score = {score}/4"
+          f"  → 归一化 {score / 4.0:.4f}")
+    print("\n【3】事实错误原因（任务三）")
+    print(f"  error_reason = {raw.get('error_reason') or '（空）'}")
 
 
 def run_cases(judge: FactConsistencyJudge, cases: list, docs: dict, verbose: bool) -> None:
@@ -211,18 +200,17 @@ def run_cases(judge: FactConsistencyJudge, cases: list, docs: dict, verbose: boo
         )
         for c, r in zip(group, results):
             if verbose:
-                scores = " ".join(
-                    f"{ELEMENT_ZH[n]}={r.raw_scores.get(n)}" for n in ELEMENTS
-                )
-                print(f"  【{c['id']}】{scores}")
+                print(f"  【{c['id']}】fact_score={r.fact_score} "
+                      f"has_error={r.has_factual_error} {r.error_reason[:60]}")
             rows.append((doc_id, c, r))
 
     print("\n" + "=" * 92)
-    print(f"{'案例':<7}{'类型':<5}{'fact':>8}{'min':>7}{'结果分':>8}   说明")
+    print(f"{'案例':<7}{'类型':<5}{'fact':>8}{'整体分':>8}{'判错':>6}   说明")
     print("-" * 92)
     for doc_id, c, r in rows:
         print(f"{c['id']:<7}{c['case']:<5}{r.weighted_reward:>8.4f}"
-              f"{r.min_element_score:>7.2f}{r.judgment_result_score:>8.2f}"
+              f"{(r.fact_score if r.fact_score is not None else 0) / 4.0:>8.2f}"
+              f"{'  是' if r.has_factual_error else '  否':>6}"
               f"   {c['desc']}")
 
     # ---- 判据 ----

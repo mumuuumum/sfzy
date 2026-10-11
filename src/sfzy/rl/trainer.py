@@ -8,7 +8,9 @@ SFT 是"给定输入和答案，算 loss 反向传播"；GRPO 要多一步**在�
         2. 打分        —— 规则奖励（门控 → 事实覆盖 + ROUGE）
         3. old_logprobs —— 采样那一刻的策略对数概率，**必须 detach**
         4. advantage   —— 组内归一化 + 长度归一化 + 组内过滤
-        5. 更新        —— GRPO loss + KL 惩罚，反向传播
+        5. 更新 ×μ     —— GRPO loss + KL 惩罚，反向传播，做 μ 次（rl.inner_iterations）
+                          μ=1 时 old/新 logprob 同参数 ⇒ ρ≡1 ⇒ clip 不可能生效，
+                          此时它等价于"组内归一化的 REINFORCE"；μ>1 才会走 PPO 式的裁剪
 
 ============================ 四个工程要点 ============================
 **一、rollout 必须用批处理。** 实测 batch=8 相对 batch=1 有 5~6 倍加速。
@@ -39,6 +41,7 @@ import torch
 from sfzy.config import Config
 from sfzy.data.prompts import build_messages
 from sfzy.models.chat_template import encode_prompt
+from sfzy.models.lora import lora_snapshot_scale, use_lora_weights
 from sfzy.rl.dpo import sequence_logprob
 from sfzy.rl.grpo import compute_advantages, group_mask, grpo_loss, kl_penalty
 from sfzy.rl.grpo import group_advantages
@@ -67,12 +70,19 @@ class RLState:
     # 实验跟踪的 run_id。存进 checkpoint 才能在续训时接回 swanlab 上原来那条
     # 曲线；不存的话一次断点重启就会在面板上多出一条断掉的新曲线。
     tracker_run_id: Optional[str] = None
+    # 验证集最好成绩（含它发生在第几步）。**必须随 checkpoint 一起存**：
+    # 续训时如果不记得之前的最好分，下一次验证就会用一个更差的分去覆盖 best.pt，
+    # 而你不会收到任何提示。
+    best_eval_score: Optional[float] = None
+    best_step: Optional[int] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "step": self.step,
             "history": self.history,
             "tracker_run_id": self.tracker_run_id,
+            "best_eval_score": self.best_eval_score,
+            "best_step": self.best_step,
         }
 
 
@@ -85,13 +95,22 @@ class GRPOTrainer:
         tokenizer: Any,
         cfg: Config,
         reference_model: Any = None,
+        reference_lora: Optional[Dict[str, Any]] = None,
         output_dir: Optional[str] = None,
         tracker: Any = None,
         is_main_process: bool = True,
         scorer: Any = None,
     ) -> None:
-        """参考模型不传时用 `disable_adapter()` 拿 —— LoRA 底座是冻结的，
-        关掉 adapter 就是 SFT 后的参考策略，不用额外加载一份权重。
+        """KL 的参考策略有两种给法，二选一即可，都不需要第二份 6B 权重：
+
+        * `reference_lora` —— **本项目走这条**。策略与 SFT 策略共用同一个冻结
+          底座、只有 LoRA 不同，所以只要在载入 SFT 权重之后 `snapshot_lora()`
+          存一份 LoRA 副本（≈118 MB），算 KL 时临时换进去前向一次再换回来。
+        * `reference_model` —— 外部已经备好一份冻结模型时直接传（占一份显存）。
+
+        两者都没有时，退回到 `model.disable_adapter()`（那是 **peft.PeftModel**
+        的方法；本仓库的手写 LoRA 没有它）。三条路都不通而 `kl_coef > 0`，
+        直接报错 —— 静默跳过会让 KL 恒为 0，而曲线看上去"正在做 KL 约束"。
 
         `scorer` 是裁判（`sfzy.judge.scorer.SixElementScorer`）。奖励由
         `rl.reward.terms` 决定开哪些项；只要有 judge 项而没裁判，直接报错 ——
@@ -114,6 +133,24 @@ class GRPOTrainer:
         self.top_p = rl.get("top_p", 0.95)
         self.clip_ratio = rl.get("clip_ratio", 0.2)
         self.kl_coef = rl.get("kl_coef", 0.0)
+        # μ：一次 rollout 做几次梯度更新（DeepSeekMath Algorithm 1 的内层循环）。
+        #   μ=1（默认）：old/新 logprob 在同一参数状态下算 ⇒ ρ≡1 ⇒ clip 不可能生效，
+        #                整个流程退化成"组内归一化 + 长度缩放的 REINFORCE"；
+        #   μ>1：内层第 2 次起 π_θ ≠ π_θold，ρ≠1，clip/信任域才真正起作用；
+        #        代价是同一批 rollout 被用来做 μ 次更新（生成是最贵的一环，所以
+        #        μ 大省的是生成时间，不省反传时间）。
+        raw_mu = rl.get("inner_iterations", 1)
+        try:
+            self.inner_iterations = int(raw_mu)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"rl.inner_iterations 必须是整数（μ），收到 {raw_mu!r}"
+            ) from exc
+        if self.inner_iterations < 1:
+            raise ValueError(
+                f"rl.inner_iterations 必须 ≥ 1，收到 {self.inner_iterations}"
+                "（1 = 每个 rollout 只更新一次，即原来的行为）"
+            )
         self.length_mode = rl.get("length_norm", "sqrt")
         # logprob 前向的批内切分。None = 一次算完（默认，行为和以前一致）；
         # 设成 1~4 能把 (N, L, vocab) 的 logits 峰值按比例压下来 ——
@@ -133,6 +170,55 @@ class GRPOTrainer:
         self.anchor_enabled = bool(anchor.get("enabled", False))
         self.anchor_slack = float(anchor.get("slack", 0.05))
         self.baseline_rewards: Dict[str, float] = {}
+
+        # ---- KL 的参考策略：必须有，不许静默跳过 ----
+        # 优先级：reference_model > reference_lora（换旁路）> disable_adapter()。
+        # 最后那条只对 peft.PeftModel 有效：transformers 4.40 的 PreTrainedModel
+        # 只有 disable_adapters（复数），本仓库用的又是手写 LoRA，所以实际上
+        # 要么传 reference_lora，要么把 kl_coef 保持 0。
+        self.reference_lora = dict(reference_lora) if reference_lora else None
+        if self.kl_coef > 0:
+            if self.reference_model is not None:
+                logger.info("KL 参考策略 = 外部传入的 reference_model")
+            elif self.reference_lora is not None:
+                b_abs, total_abs = lora_snapshot_scale(self.reference_lora)
+                logger.info(
+                    "KL 参考策略 = SFT 的 LoRA 快照（%d 个张量，|B| 和 %.4g，|W| 和 %.4g）",
+                    len(self.reference_lora), b_abs, total_abs,
+                )
+                if b_abs == 0.0:
+                    logger.warning(
+                        "LoRA 快照里的 lora_B 全是 0：参考策略等于**原始底座**，"
+                        "不是 SFT 策略。检查快照是不是在载入 SFT 权重之前取的。"
+                    )
+            elif hasattr(self.model, "disable_adapter"):
+                logger.info("KL 参考策略 = disable_adapter()（PEFT 模型）")
+            else:
+                raise ValueError(
+                    "rl.kl_coef > 0，但拿不到参考策略。\n"
+                    "  本项目的 LoRA 是手写的（models/lora.py），模型上没有 "
+                    "disable_adapter（那是 peft.PeftModel 的方法），所以必须显式给：\n"
+                    "    · 走 scripts/train_grpo.py：它会在载入 SFT adapter 之后自动 "
+                    "snapshot_lora(model) 并传进来；\n"
+                    "    · 自己构造 GRPOTrainer：传 reference_lora=snapshot_lora(模型) "
+                    "或 reference_model=<冻结的 SFT 模型>。\n"
+                    "  不想做 KL 约束就把 rl.kl_coef 保持 0.0。"
+                )
+
+        # ---- μ（rl.inner_iterations）的启动播报 ----
+        if self.inner_iterations > 1:
+            logger.info(
+                "内层更新 μ=%d：一次 rollout 做 %d 次梯度更新（optimizer 更新数 = "
+                "训练步数 × %d）。第 2 次起 ρ≠1，clip_ratio=%.2f 才开始真正生效。",
+                self.inner_iterations, self.inner_iterations, self.inner_iterations,
+                self.clip_ratio,
+            )
+            if self.clip_ratio <= 0 and self.kl_coef <= 0:
+                logger.warning(
+                    "μ=%d 但 clip_ratio 与 kl_coef 都是 0：同一批数据连续更新多次却"
+                    "没有任何信任域约束，策略可能一步走太远。",
+                    self.inner_iterations,
+                )
 
         # ---- 奖励规格：开哪些项、权重、要不要裁判，全在这里定 ----
         self.reward_spec = RewardSpec.from_config(self.reward_cfg)
@@ -295,6 +381,121 @@ class GRPOTrainer:
             missing += miss
             total += len(scores)
         return filled, missing / max(total, 1)
+
+    # ------------------------------------------------------------------
+    def _reference_logprobs(self, batch: Dict[str, Any]) -> Optional[torch.Tensor]:
+        """参考策略的序列 logprob（已 detach）。返回 None = 没有参考策略。
+
+        LoRA 快照那条是"共用底座、临时换旁路"：把 SFT 的 lora_A/B 就地
+        `copy_` 进当前模型，跑一次 no_grad 前向，再恢复原值。所以不需要第二份
+        6B 权重（省一份 12 GB 的显存），也不需要第二遍反传。
+
+        **顺序很关键**：必须在策略 logprobs 之后调用。策略 logprobs 要带梯度、
+        用当前（RL）权重；这里换的只是旁路权重，换进换出之间的梯度图不存在
+        （no_grad）。
+        """
+        micro = self.logprob_micro_batch
+        ids, labels = batch["input_ids"], batch["labels"]
+
+        if self.reference_model is not None:
+            with torch.no_grad():
+                return sequence_logprob(
+                    self.reference_model, ids, labels, micro_batch=micro
+                ).detach()
+
+        if self.reference_lora is not None:
+            # 用 eval：参考分布应该是确定的（dropout 关掉）。这段没有反传，
+            # 所以顺带关掉梯度检查点也不会让显存变差；结束后恢复原模式。
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                with torch.no_grad(), use_lora_weights(self.model, self.reference_lora):
+                    ref = sequence_logprob(self.model, ids, labels, micro_batch=micro)
+            finally:
+                if was_training:
+                    self.model.train()
+            return ref.detach()
+
+        if hasattr(self.model, "disable_adapter"):
+            with torch.no_grad(), self.model.disable_adapter():
+                return sequence_logprob(
+                    self.model, ids, labels, micro_batch=micro
+                ).detach()
+
+        return None
+
+    # ------------------------------------------------------------------
+    def _inner_update(
+        self,
+        batch: Dict[str, Any],
+        old_logprobs: torch.Tensor,
+        advantages: torch.Tensor,
+        ref_logprobs: Optional[torch.Tensor],
+        want_entropy: bool = False,
+    ) -> Dict[str, Any]:
+        """μ 循环的循环体：策略 logprob → GRPO loss(+KL) → 反传 → 裁剪 → 更新一步。
+
+        **`old_logprobs` 与 `advantages` 整个循环里冻结**：前者是"采样那一刻的行为
+        策略"π_θold 的对数概率，后者是这一组采样的相对好坏，两者都跟内层第几次
+        迭代无关。于是：
+
+            μ=1  → 循环体只跑一次，π_θ 与 π_θold 同参数 ⇒ ρ≡1 ⇒ clip 不生效；
+            μ>1  → 第 2 次起 π_θ 已移动 ⇒ ρ≠1 ⇒ clip 才开始真正起作用。
+
+        `want_entropy` 只在 μ 循环的第一次打开：完整词表的 fp32 概率很贵，
+        而"这一步开始时策略有多随机"看第一次就够。
+        """
+        self.optimizer.zero_grad(set_to_none=True)
+
+        # 监控用的策略熵在**同一次前向**里算（不额外跑模型）；只在低频步开启。
+        entropy_values: Optional[List[float]] = None
+        if want_entropy:
+            logprobs, entropy_tensor = sequence_logprob(
+                self.model, batch["input_ids"], batch["labels"],
+                micro_batch=self.logprob_micro_batch, return_entropy=True,
+            )
+            entropy_values = [float(x) for x in entropy_tensor.detach().reshape(-1).tolist()]
+        else:
+            logprobs = sequence_logprob(
+                self.model, batch["input_ids"], batch["labels"],
+                micro_batch=self.logprob_micro_batch,
+            )
+
+        policy_loss, clipped_frac = grpo_loss(
+            logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
+        )
+        loss = policy_loss
+
+        # KL 惩罚：参考 logprob 由调用方算好传进来（与策略参数无关，整步只算一次）。
+        kl_value = 0.0
+        if ref_logprobs is not None:
+            kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
+            loss = loss + kl_term
+            kl_value = float(kl_term.detach())
+
+        # 比值分布（μ>1 时它才是"漂移有多大"的真实读数：第 1 次恒为 1）
+        ratios = [
+            float(x) for x in torch.exp(logprobs.detach() - old_logprobs).reshape(-1).tolist()
+        ]
+
+        loss.backward()
+        # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
+        # 单一信号：突然窜到几十说明这一步的 advantage 尺度失控（常见于
+        # 奖励被噪声污染、或被裁剪的 ratio 占了大头）。
+        grad_norm_preclip = float(torch.nn.utils.clip_grad_norm_(
+            [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
+        ))
+        self.optimizer.step()
+
+        return {
+            "loss": float(loss.detach()),
+            "policy_loss": float(policy_loss.detach()),
+            "clipped_frac": float(clipped_frac),
+            "grad_norm_preclip": grad_norm_preclip,
+            "kl": kl_value,
+            "ratios": ratios,
+            "entropy": entropy_values,
+        }
 
     # ------------------------------------------------------------------
     def rollout(self, prompts: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -464,66 +665,21 @@ class GRPOTrainer:
         # 每次进前向都要重新保证一次。dropout 也随之为训练打开。
         self.model.train()
 
-        # ---- old_logprobs：必须在任何参数更新之前算 ----
+        # ---- 参考策略的 logprob：只与 batch 有关，与策略参数无关 ----
+        # 所以整个 μ 循环只算一次（μ=4 时省下 3 次参考前向）。
+        ref_logprobs = self._reference_logprobs(batch) if self.kl_coef > 0 else None
+
+        # ---- old_logprobs：必须在**任何**参数更新之前算，μ 次内层更新共用 ----
+        # 它就是"采样那一刻的行为策略" π_θold，在整个内层循环里是常数 —— 也正因为
+        # 如此，μ=1 时 ρ≡1（clip 不生效），μ>1 时第 2 次起 ρ≠1 才开始生效。
         with torch.no_grad():
             old_logprobs = sequence_logprob(
                 self.model, batch["input_ids"], batch["labels"],
                 micro_batch=self.logprob_micro_batch,
             ).detach()
 
-        # ---- 策略 logprob（带梯度）----
-        self.optimizer.zero_grad(set_to_none=True)
-        # 监控用的策略熵在**同一次前向**里算（不额外跑模型）；只在低频步开启。
-        entropy_values: Optional[List[float]] = None
-        if want_entropy:
-            logprobs, entropy_tensor = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"],
-                micro_batch=self.logprob_micro_batch, return_entropy=True,
-            )
-            entropy_values = [float(x) for x in entropy_tensor.detach().reshape(-1).tolist()]
-        else:
-            logprobs = sequence_logprob(
-                self.model, batch["input_ids"], batch["labels"],
-                micro_batch=self.logprob_micro_batch,
-            )
-        policy_loss, clipped_frac = grpo_loss(
-            logprobs, old_logprobs, advantages, clip_ratio=self.clip_ratio
-        )
-        loss = policy_loss
-
-        # ---- KL 惩罚（可选）----
-        kl_value = 0.0
-        kl_estimate_value: Optional[float] = None
-        kl_penalty_value: Optional[float] = None
-        if self.kl_coef > 0:
-            if self.reference_model is not None:
-                ref_model = self.reference_model
-            elif hasattr(self.model, "disable_adapter"):
-                ref_model = self.model
-            else:
-                ref_model = None
-            if ref_model is not None:
-                ctx = (self.model.disable_adapter() if ref_model is self.model
-                       else torch.no_grad())
-                with torch.no_grad():
-                    with (ctx if hasattr(ctx, "__enter__") else torch.no_grad()):
-                        ref_logprobs = sequence_logprob(
-                            ref_model, batch["input_ids"], batch["labels"],
-                            micro_batch=self.logprob_micro_batch,
-                        ).detach()
-                kl_term = kl_penalty(logprobs, ref_logprobs, coef=self.kl_coef)
-                loss = loss + kl_term
-                kl_value = float(kl_term.detach())
-                # k3 无偏估计 = 加权惩罚 / 系数；两者分开记录，避免混淆。
-                kl_estimate_value = kl_value / self.kl_coef
-                kl_penalty_value = kl_value
-
-        # 监控用：比值分布（old/current 在同一参数状态、同一次更新前算，应接近 1）
-        ratio_values = [
-            float(x) for x in torch.exp(logprobs.detach() - old_logprobs).reshape(-1).tolist()
-        ]
-
-        # 监控用：LoRA 更新幅度（低频）。先快照，再在 optimizer.step() 后比差。
+        # 监控用：LoRA 更新幅度（低频）。在循环之前快照、循环之后比差 ——
+        # 量到的是整步漂移（μ 次更新累积），这才是"这一步把策略推了多远"。
         lora_before: Optional[Dict[str, torch.Tensor]] = None
         if want_lora:
             snapshot = {
@@ -534,17 +690,41 @@ class GRPOTrainer:
             # 没有 LoRA 参数时保持 None（不适用），而不是记一个 0。
             lora_before = snapshot or None
 
-        loss.backward()
-        # 返回值是**裁剪前**的梯度总范数。它免费，而且是"训练稳不稳"最快的
-        # 单一信号：突然窜到几十说明这一步的 advantage 尺度失控（常见于
-        # 奖励被噪声污染、或被裁剪的 ratio 占了大头）。
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
+        # ---- μ 次内层更新（μ=1 时与改动前逐步等价）----
+        iters = [
+            self._inner_update(
+                batch, old_logprobs, advantages, ref_logprobs,
+                want_entropy=want_entropy and it == 0,
+            )
+            for it in range(self.inner_iterations)
+        ]
+        losses = [x["loss"] for x in iters]
+        policy_losses = [x["policy_loss"] for x in iters]
+        clipped = [x["clipped_frac"] for x in iters]
+        grad_norms = [x["grad_norm_preclip"] for x in iters]
+        kl_values = [x["kl"] for x in iters]
+        # 比值把 μ 个内层迭代全留着：μ>1 时这才是真实的漂移分布（第 1 次恒为 1、
+        # 越往后越偏），μ=1 时与改动前完全一致。
+        ratio_values = [r for x in iters for r in x["ratios"]]
+        entropy_values = next(
+            (x["entropy"] for x in iters if x["entropy"] is not None), None
         )
-        grad_norm_preclip = float(grad_norm)
+
+        # 聚合口径（写清楚，避免"曲线好看但口径说不清"）：
+        #   loss / policy_loss / clipped_frac / kl → μ 次的**均值**
+        #   grad_norm → μ 次的**最大值**（稳定性看最坏的那一次）
+        #   clip_applied → 只要有一次被裁到就是 1
+        loss = float(sum(losses) / len(losses))
+        policy_loss_value = float(sum(policy_losses) / len(policy_losses))
+        clipped_frac = float(sum(clipped) / len(clipped))
+        grad_norm = float(max(grad_norms))
+        grad_norm_preclip = grad_norm
         grad_norm_postclip = min(grad_norm_preclip, float(self.max_grad_norm))
         clip_applied = 1.0 if grad_norm_preclip > float(self.max_grad_norm) else 0.0
-        self.optimizer.step()
+        kl_value = float(sum(kl_values) / len(kl_values))
+        # k3 无偏估计 = 加权惩罚 / 系数；两者分开记录，避免混淆。
+        kl_estimate_value = kl_value / self.kl_coef if ref_logprobs is not None else None
+        kl_penalty_value = kl_value if ref_logprobs is not None else None
 
         lora_update_norm: Optional[float] = None
         if lora_before is not None:
@@ -557,12 +737,18 @@ class GRPOTrainer:
 
         gate_stats = summarize_gate_reasons(breakdowns)
         metrics = {
-            "loss": float(loss.detach()),
+            "loss": loss,
+            # μ>1 时同一批数据更新多次：loss 会逐步下降，最后一轮的数值更能
+            # 说明"这一步结束时策略拟合到什么程度"；两个都留着，口径不混。
+            "loss_last": float(losses[-1]),
             "grad_norm": float(grad_norm),
             "reward_mean": float(rewards.mean()),
             "reward_std": float(rewards.std(unbiased=False)),
             "advantage_abs_mean": float(advantages.abs().mean()),
             "clipped_frac": float(clipped_frac),
+            "clipped_frac_first": float(clipped[0]),
+            "clipped_frac_last": float(clipped[-1]),
+            "inner_iterations": int(self.inner_iterations),
             "kl": kl_value,
             "kept_groups": int(keep.sum()),
             "total_groups": len(prompts),
@@ -634,15 +820,14 @@ class GRPOTrainer:
             normalization_factors=norm_factors,
             length_norm_mode=self.length_mode,
             clip_frac=float(clipped_frac),
-            policy_loss=float(policy_loss.detach()),
-            total_loss=float(loss.detach()),
+            policy_loss=policy_loss_value,
+            total_loss=loss,
             grad_norm_preclip=grad_norm_preclip,
             grad_norm_postclip=grad_norm_postclip,
             clip_applied=clip_applied,
             learning_rate=float(self.optimizer.param_groups[0]["lr"]),
             clip_ratio=float(self.clip_ratio),
-            fact_gate_enabled=self.reward_spec.fact_element_gate_enabled,
-            fact_gate_min_raw=self.reward_spec.fact_element_min_raw,
+            fact_gate_enabled=self.reward_spec.fact_error_gate_enabled,
             upper_length_ratio=upper_ratio,
             result_markers=tuple(gate_cfg.get("require_result_marker") and RESULT_MARKERS or ()),
             forbidden_prefixes=tuple(gate_cfg.get("forbidden_prefixes", [])),
@@ -666,9 +851,30 @@ class GRPOTrainer:
         n_steps = len(prompts) // self.prompts_per_step
         self.monitor.set_total_steps(max(1, n_steps))
         logger.info(
-            "GRPO 开始: %d 个 prompt，每步 %d 个，共 %d 步，G=%d",
+            "GRPO 开始: %d 个 prompt，每步 %d 个，共 %d 步，G=%d，μ=%d（共 %d 次梯度更新）",
             len(prompts), self.prompts_per_step, n_steps, self.group_size,
+            self.inner_iterations, n_steps * self.inner_iterations,
         )
+        # 验证集调度：x 个分位点 = "把 n 步等分成 x 段"，最后一点落在最后一步，
+        # 保证训练结束时的模型一定会被评到（也一定有机会成为 best.pt）。
+        if self.monitor.cfg.eval_enabled and self.monitor.cfg.eval_data_file:
+            schedule = self.monitor.eval_schedule()
+            key = self._best_metric_key()
+            if schedule:
+                preview = ", ".join(str(s) for s in schedule[:10])
+                if len(schedule) > 10:
+                    preview += " …"
+                logger.info(
+                    "验证集：x=%d 个分位点 → 共 %d 次，落在第 %s 步；best.pt 由 %s 决定",
+                    self.monitor.cfg.eval_quantile_points, len(schedule), preview,
+                    key or "（save_best=false，不存 best）",
+                )
+            else:
+                logger.info(
+                    "验证集：每 %d 步一次（未设 quantile_points）；best.pt 由 %s 决定",
+                    self.monitor.cfg.eval_every_n_steps,
+                    key or "（save_best=false，不存 best）",
+                )
         for step in range(self.state.step, n_steps):
             chunk = prompts[step * self.prompts_per_step:(step + 1) * self.prompts_per_step]
             metrics = self.step(chunk)
@@ -677,6 +883,9 @@ class GRPOTrainer:
             if self.is_main_process and self.monitor.eval_due(self.state.step):
                 eval_result = self._run_eval(self.state.step)
                 if eval_result:
+                    # 先决定要不要更新 best.pt，再并入上报指标（顺序无关，但这里
+                    # 写在前面，日志里"刷新最好成绩"会紧跟在那行验证日志之后）。
+                    self._maybe_save_best(eval_result, self.state.step)
                     self._last_monitor_metrics.update(eval_result)
 
             if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
@@ -695,6 +904,57 @@ class GRPOTrainer:
         if self.is_main_process:
             self.save()
         return self.state
+
+    # ------------------------------------------------------------------
+    def _best_metric_key(self) -> Optional[str]:
+        """`best.pt` 的判据指标（完整上报键）；`save_best: false` 时返回 None。
+
+        默认 `rouge_total` —— 就是 SFT 阶段那套官方口径综合分
+        `0.2*ROUGE-1 + 0.4*ROUGE-2 + 0.4*ROUGE-L`（见 `sfzy.eval.rouge.OFFICIAL_WEIGHTS`
+        与它的 `overall` 键）。
+        """
+        spec = self.cfg.path_("rl.monitor.eval") or {}
+        if not bool(spec.get("save_best", True)):
+            return None
+        metric = str(spec.get("best_metric", "rouge_total"))
+        return metric if "/" in metric else f"eval/{metric}"
+
+    def _maybe_save_best(self, eval_result: Dict[str, float], step: int) -> None:
+        """验证分刷新历史最好成绩 → 覆盖 `best.pt`。
+
+        "历史最好"记在 `self.state` 里并随 checkpoint 落盘，所以续训时不会用一个
+        更差的分数把 best.pt 覆盖掉（这点静默发生的话很难发现）。
+
+        比较口径只有一条：**越大越好**，阈值/多目标都不藏在这里。
+        """
+        if not eval_result:
+            return
+        key = self._best_metric_key()
+        if key is None:
+            return
+        value = eval_result.get(key)
+        if value is None:
+            logger.warning(
+                "验证集没有产出 %s，本次不更新 best.pt（本次可用的：%s）",
+                key, sorted(k for k in eval_result if k.startswith("eval/")),
+            )
+            return
+
+        best = self.state.best_eval_score
+        if best is not None and value <= best:
+            logger.info(
+                "验证集 %s=%.4f 未刷新最好成绩（%.4f @step %s），best.pt 不动",
+                key, value, best, self.state.best_step,
+            )
+            return
+
+        self.state.best_eval_score = float(value)
+        self.state.best_step = int(step)
+        self.save(tag="best")
+        logger.info(
+            "★ 验证集 %s=%.4f 刷新最好成绩（旧值 %s）→ 已写 best.pt（step %d）",
+            key, value, "无" if best is None else f"{best:.4f}", step,
+        )
 
     # ------------------------------------------------------------------
     def _log_step(self, step: int, n_steps: int, m: Dict[str, float]) -> None:
@@ -718,18 +978,26 @@ class GRPOTrainer:
             f"|g| {m['grad_norm']:.2f}",
             f"len {m['output_len_mean']:.0f}",
         ]
+        mu = int(m.get("inner_iterations", 1))
+        if mu > 1:
+            # 内层漂移的读数：clip 从第 1 次迭代（ρ≡1，必然 0%）到第 μ 次的变化。
+            # 最后一轮就已经几十个百分点，说明 μ 开大了（策略在一步内走太远）。
+            parts.append(
+                f"μ{mu} clip {m['clipped_frac_first'] * 100:.0f}%→"
+                f"{m['clipped_frac_last'] * 100:.0f}%"
+            )
         logger.info(" | ".join(parts))
 
-        # 六要素的逐项明细（需求第十二节）：均值 + 0-4 各档比例。
+        # 事实一致性的整体分布（需求第十二节）：均值 + 0-4 各档比例 + 错误率。
         if "mean_fact_reward" in m:
             ratio = " ".join(
                 f"{lv}:{m.get(f'ratio_score_{lv}', 0.0) * 100:.0f}%" for lv in range(5)
             )
             logger.info(
-                "  └ 事实一致性 fact_reward %.4f | 结果分 %.3f | 最低分 %.3f | 档位 %s",
+                "  └ 事实一致性 fact_reward %.4f | 整体分 %.3f | 事实错误率 %.1f%% | 档位 %s",
                 m["mean_fact_reward"],
-                m.get("mean_judgment_result_score", 0.0),
-                m.get("mean_min_element_score", 0.0),
+                m.get("mean_fact_score", 0.0),
+                100.0 * m.get("fact_error_rate", 0.0),
                 ratio,
             )
 
@@ -789,8 +1057,14 @@ class GRPOTrainer:
                     self.model, self.tokenizer, messages_list,
                     # 不超过训练生成长度，保证验证与训练同一解码预算。
                     max_new_tokens=min(cf.eval_max_new_tokens, self.max_new_tokens),
-                    # 不超过训练用的 max_length：验证集 prompt 也必须按同一规则截断。
-                    max_length=min(cf.eval_max_length, self.max_length),
+                    # 截断规则必须与训练一致：没显式配 max_length 时就用 rl.max_length，
+                    # 配了则取 min(它, rl.max_length) —— 绝不允许验证比训练更宽松，
+                    # 也不该反过来（"训练看 7168 token、验证只喂 2048"会把验证分
+                    # 系统性压低，best 的选择就失去意义）。
+                    max_length=(
+                        self.max_length if cf.eval_max_length is None
+                        else min(int(cf.eval_max_length), self.max_length)
+                    ),
                     do_sample=False,
                     num_return_sequences=1,
                 )

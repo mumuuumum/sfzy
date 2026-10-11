@@ -34,16 +34,16 @@ def make_config(**over) -> MonitorConfig:
     return MonitorConfig.from_config(cfg)
 
 
-def make_result(fact_raw=None, coverage_raw=None, ee_dims=None):
+def make_result(fact_score=4, has_error=0, coverage_raw=None, ee_dims=None):
+    """新的 FC 口径：整体分 + 事实错误门控（没有逐要素分）。"""
     from sfzy.judge.schema import JudgeResult
 
-    fact_raw = fact_raw or {e: 4 for e in ELEMENTS}
     res = JudgeResult(
-        raw_scores=dict(fact_raw),
-        scores={e: fact_raw[e] / 4.0 for e in ELEMENTS},
-        weighted_reward=sum(fact_raw[e] / 4.0 for e in ELEMENTS) / len(ELEMENTS),
-        min_element_score=min(fact_raw[e] for e in ELEMENTS if e != "case_type") / 4.0,
-        judgment_result_score=fact_raw["judgment_result"] / 4.0,
+        raw_scores={"fact_consistency": fact_score},
+        scores={"fact_consistency": fact_score / 4.0},
+        weighted_reward=fact_score / 4.0,
+        fact_score=fact_score,
+        has_factual_error=has_error,
         coverage_raw=dict(coverage_raw) if coverage_raw else {},
         ee_dims=dict(ee_dims) if ee_dims else {},
     )
@@ -83,7 +83,6 @@ def make_batch(**over) -> MonitorBatch:
         learning_rate=1e-5,
         clip_ratio=0.2,
         fact_gate_enabled=False,
-        fact_gate_min_raw=0,
         upper_length_ratio=None,
         max_new_tokens=100,
     )
@@ -186,7 +185,7 @@ def test_gate前后奖励与组内标准差():
         pre_gate_rewards=[0.9, 0.1, 0.8, 0.6],
         final_rewards=[0.0, 0.0, 0.8, 0.6],     # 组1被门控清零
         gate_flags=[True, True, False, False],
-        gate_reasons=["fact_element_raw<1", "fact_element_raw<1", "", ""],
+        gate_reasons=["fact_has_error", "fact_has_error", "", ""],
     )
     out = GRPOMonitor(make_config()).observe(b)
     assert out["gate/all_gated_group_rate"] == pytest.approx(0.5)
@@ -197,24 +196,19 @@ def test_gate前后奖励与组内标准差():
 
 
 # ---------------------------------------------------------------- 六要素 / 覆盖率 / EE
-def test_六要素fact为0的统计():
-    r0 = make_result(fact_raw={
-        "case_type": 4, "plaintiff_claims": 0, "defendant_defenses": 0,
-        "court_facts": 2, "legal_basis": 3, "judgment_result": 4,
-    })
-    r1 = make_result()   # 全 4
+def test_事实一致性整体分与错误率统计():
+    r0 = make_result(fact_score=0, has_error=1)     # 判为有事实错误 → 0 分
+    r1 = make_result(fact_score=4)                  # 没问题
     b = make_batch(
         n=2, group_size=2,
         raw_signals={"fact_consistency": [r0.weighted_reward, r1.weighted_reward]},
         judge_results=[r0, r1],
     )
     out = GRPOMonitor(make_config(), fact_enabled=True).observe(b)
-    assert out["fact/zero_element_count_mean"] == pytest.approx(1.0)
-    assert out["fact/multi_zero_element_rate"] == pytest.approx(0.5)
-    assert out["fact/plaintiff_claims/zero_rate"] == pytest.approx(0.5)
-    # 12 个要素里 2 个 0 分 → ratio_score_0 = 2/12
-    assert out["fact/score_ratio_0"] == pytest.approx(2 / 12)
-    assert out["fact/score_ratio_4"] == pytest.approx(8 / 12)
+    assert out["fact/score_mean"] == pytest.approx(0.5)          # (0+4)/2/4
+    assert out["fact/error_rate"] == pytest.approx(0.5)
+    assert out["fact/score_ratio_0"] == pytest.approx(0.5)
+    assert out["fact/score_ratio_4"] == pytest.approx(0.5)
 
 
 def test_覆盖率逐要素与漏覆盖():

@@ -1,0 +1,154 @@
+# ============================================================================
+# vGPU-48G × 1
+# 跑法：
+#   python scripts/train_grpo.py --config configs/grpo_fact_coverage_vGPU48.yaml
+# ============================================================================
+
+seed: 42
+device: auto
+
+# data_config: configs/data_splits.yaml
+
+model:
+  model_name_or_path: /root/autodl-tmp/chatglm3-6b   # 换成你机器上的路径
+  trust_remote_code: true
+  load_in_4bit: true
+  bnb_4bit_quant_type: nf4
+  bnb_4bit_use_double_quant: true
+  bnb_4bit_compute_dtype: bfloat16
+  torch_dtype: bfloat16
+  device_map: {"": 0}
+
+lora:
+  r: 16
+  alpha: 32
+  dropout: 0.0
+  target_modules: ["query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h"]
+
+rl:
+  output_dir: outputs/grpo_fact_coverage_ee_vGPU48
+  prompt_style: structured
+  prompt_file: data/splits/rl_prompts_full.jsonl
+  sft_adapter: outputs/sft_chatglm3/step_000336.pt   # 换成你机器上的路径
+  limit_prompts: null
+
+  quantize: true
+
+  group_size: 4
+  prompts_per_step: 2
+  max_length: 7168
+  max_new_tokens: 1023
+  temperature: 0.9
+  top_p: 0.95
+
+  gradient_checkpointing: true
+  logprob_micro_batch: 2
+
+  clip_ratio: 0.2
+  # μ：一次 rollout 做几次梯度更新（DeepSeekMath Algorithm 1 的内层循环）。
+  #   1（默认，= 改动前的行为）：old/新 logprob 在同一参数状态下算 ⇒ ρ≡1，
+  #     clip 不可能生效，整个流程等价于"组内归一化 + 长度缩放的 REINFORCE"；
+  #   2~4：内层第 2 次起 π_θ ≠ π_θold ⇒ ρ≠1，clip/信任域才真正起作用。同一批
+  #     rollout 被复用来做 μ 次更新 —— 生成是最贵的一环（ChatGLM3 串行生成），
+  #     所以 μ 大省的是生成时间，不省反传时间。
+  #   代价：内层更新越多，策略离采样点越远、方差越大。日志里 μ>1 会多一列
+  #     `μ4 clip 0%→44%`：第 1 次必然 0%，最后一轮才是漂移的真实读数
+  #     （最后一轮就几十个百分点 ⇒ μ 开大了）。
+  inner_iterations: 2
+  kl_coef: 0.03
+  length_norm: sqrt
+  learning_rate: 3e-6
+  max_grad_norm: 1.0
+
+  save_every_n_steps: 500
+  keep_last_n_checkpoints: 10
+  log_every_n_steps: 1
+  resume_from: null
+
+  # ---- 固定验证集：按分位点验证 + 用综合 ROUGE 选最好模型 ----
+  # 每次验证：贪心解码（可复现）跑 val 的前 max_samples 条 → 算 ROUGE-1/2/L 与
+  # 综合分，以及各裁判信号；`best.pt` 只在综合分刷新时被覆盖。
+  monitor:
+    eval:
+      enabled: true
+      data_file: data/splits/val.jsonl   # 1340 条，键 id/source/summary
+      # ★ x：把总步数 n 等分成 x 段，在第 k/x 分位点各验一次（最后一点 = 最后一步）。
+      #   你这份配置 n=10738、x=10 → 在第 1074/2148/3221/4295/5369/6443/7517/8590/9664/10738 步验证。
+      quantile_points: 10
+      # every_n_steps: 1000              # 旧的按步数触发；设了 quantile_points 就以它为准
+      max_samples: 100                   # 每次只验前 100 条（案由分布与全量 1340 条接近）
+      max_new_tokens: 1023                # 贪心生成上限：选模型的口径必须固定
+      max_length: null                   # null = 与训练同一个 rl.max_length（不要填更小的值）
+      save_best: true                    # 刷新最好分就覆盖 best.pt（永不被 prune 清理）
+      best_metric: rouge_total           # 官方口径 0.2*ROUGE-1 + 0.4*ROUGE-2 + 0.4*ROUGE-L
+
+  reward:
+    normalize_weights: true
+    gate:
+      fact_has_error: 1
+    terms:
+      rouge_l: {enabled: false, weight: 0.0}
+      fact_consistency:
+        enabled: true
+        weight: 0.1
+      element_coverage:
+        enabled: true
+        weight: 0.45
+        element_weights:
+          case_type:          0.05
+          plaintiff_claims:   0.15
+          defendant_defenses: 0.15
+          court_facts:        0.50
+          legal_basis:        0.10
+          judgment_result:    0.05
+      # ---- INP（信息必要性精确率）----
+      # prompt 常量 INP_JUDGE_PROMPT 已由使用者填写，打开即生效。
+      information_necessity_precision:
+        enabled: false
+        weight: 1            # 与 quality_fbeta 同时开启时，这个权重会失效
+      # ---- Expression Efficiency（表达效率）----
+      # prompt 常量 EE_JUDGE_PROMPT 目前是空串，由使用者填写后再打开。
+      # 三维权重可整段省略（默认 0.4 / 0.2 / 0.4）；写了就必须写全，
+      # 只要求非负、和 > 0（R_EE 自带按权重和归一）。
+      expression_efficiency:
+        enabled: true
+        weight: 0.45
+        dimension_weights:
+          semantic_redundancy: 0.2
+          verbal_redundancy: 0.2
+          abstraction_adequacy: 0.6
+      # ---- Coverage × INP 的 Fβ 组合 ----
+      # 启用后 coverage / inp 不再参与独立加权和，改由 Fβ 一项参与。
+      # quality_fbeta:
+      #   enabled: true
+      #   weight: 0.3
+      #   beta: 1.0              # β>1 偏重 Coverage；β<1 偏重 INP；β=1 即 F1
+
+
+  anchor:
+    enabled: false
+    slack: 0.05
+
+semantic:
+  backend: fact
+  six_max_new_tokens: 512
+  # 判定走 API（不加载本地裁判，也就不吃显存）。
+  # 密钥只从环境变量读，不写进配置。
+  judge_api:
+    # base_url: https://api.deepseek.com/v1      # 也可指向自建 vLLM 的 OpenAI 端口
+    base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+    api_key_env: SFZY_JUDGE_API_KEY
+    # model: deepseek-chat                       # 想换更强裁判改这里
+    model: qwen3.7-flash                       # 想换更强裁判改这里
+    # Qwen3 系列默认 **开启思考模式**：非流式调用会先产出一大段 reasoning 再给
+    # JSON，单次判定因此慢好几倍，而且 512 的 max_tokens 会被思考吃掉、JSON
+    # 被截断。Model Studio 兼容模式用这个字段关掉思考（直接进请求体顶层）。
+    extra_body:
+      enable_thinking: false
+    concurrency: 16                            # 线程池并发（API 是 I/O 密集）
+    max_retries: 3
+    timeout_s: 60
+    max_logprobs: 20         
+tracking:
+  backend: swanlab
+  project: sfzy

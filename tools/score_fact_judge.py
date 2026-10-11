@@ -41,7 +41,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from sfzy.config import load_config                          # noqa: E402
 from sfzy.judge.judge import FactConsistencyJudge            # noqa: E402
-from sfzy.judge.schema import ELEMENT_ZH, ELEMENTS, JudgeResult, summarize_scores  # noqa: E402
+from sfzy.judge.schema import JudgeResult, summarize_scores  # noqa: E402
 
 
 def resolve(path) -> Path:
@@ -85,10 +85,9 @@ def result_to_record(
     return {
         "id": rid,
         "fact_reward": result.weighted_reward,
-        "min_element_score": result.min_element_score,
-        "judgment_result_score": result.judgment_result_score,
-        "scores": {k: round(v, 6) for k, v in result.scores.items()},
-        "raw_scores": dict(result.raw_scores),
+        "fact_score": result.fact_score,
+        "has_factual_error": result.has_factual_error,
+        "error_reason": result.error_reason,
         "sources": dict(result.sources),
     }
 
@@ -100,12 +99,11 @@ def summarize(rows: Sequence[Dict[str, Any]]) -> Dict[str, float]:
         return {}
     n = len(ok)
 
-    class _R:                                  # summarize_scores 只用到这三个字段
+    class _R:                                  # summarize_scores 只用到这几个字段
         def __init__(self, row):
             self.weighted_reward = float(row["fact_reward"])
-            self.min_element_score = float(row.get("min_element_score", 0.0))
-            self.scores = {k: float(v) for k, v in (row.get("scores") or {}).items()}
-            self.raw_scores = {k: int(v) for k, v in (row.get("raw_scores") or {}).items()}
+            self.fact_score = row.get("fact_score")
+            self.has_factual_error = row.get("has_factual_error")
 
     stats = summarize_scores([_R(r) for r in ok])       # type: ignore[arg-type]
     stats["n"] = float(n)
@@ -120,12 +118,8 @@ def print_summary(title: str, rows: Sequence[Dict[str, Any]]) -> None:
         print("  全部失败，没有可统计的分数")
         return
     print(f"  事实一致性 fact_reward : {stats['mean_fact_reward']:.4f}")
-    print(f"  最低要素分（不含案由） : {stats['mean_min_element_score']:.4f}")
-    print(f"  裁判结果分             : {stats['mean_judgment_result_score']:.4f}")
-    elements = "  ".join(
-        f"{ELEMENT_ZH[k]} {stats[f'mean_{k}_score']:.2f}" for k in ELEMENTS
-    )
-    print(f"  六要素均值             : {elements}")
+    print(f"  事实一致性整体分       : {stats.get('mean_fact_score', 0.0):.4f}")
+    print(f"  判为存在事实错误       : {stats.get('fact_error_rate', 0.0):.1%}")
     ratio = "  ".join(f"{lv}:{stats[f'ratio_score_{lv}'] * 100:.0f}%" for lv in range(5))
     print(f"  评分档位分布           : {ratio}")
     print(f"  成功 {int(stats['n'])} 条，失败 {int(stats['n_failed'])} 条")
@@ -136,9 +130,8 @@ def compare_summaries(titles: Sequence[str], all_rows: Sequence[Sequence[Dict]])
     if len(all_rows) < 2:
         return
     stats = [summarize(rows) for rows in all_rows]
-    keys = ["mean_fact_reward", "mean_min_element_score", "mean_judgment_result_score"]
-    keys += [f"mean_{k}_score" for k in ELEMENTS]
-    label = {**{k: k for k in keys}, **{f"mean_{k}_score": ELEMENT_ZH[k] for k in ELEMENTS}}
+    keys = ["mean_fact_reward", "mean_fact_score", "fact_error_rate"]
+    label = {k: k for k in keys}
     print(f"\n{'=' * 72}\n对照（注意：只有同一批 id 才可比）\n{'=' * 72}")
     header = "指标".ljust(22) + "".join(t[:16].rjust(12) for t in titles)
     print(header)

@@ -82,13 +82,6 @@ rl:
       fact_consistency:
         enabled: true
         weight: 1.0
-        element_weights:      # 六要素内部权重：键固定六个，之和必须为 1
-          case_type:          0.05
-          plaintiff_claims:   0.15
-          defendant_defenses: 0.10
-          court_facts:        0.25
-          legal_basis:        0.15
-          judgment_result:    0.30
     # gate 不写 = 默认开启（格式不过关直接 0 分）；要关掉写 gate: {enabled: false}
 
   # SFT 基线锚：需要 prompt 池里带 sft_output，现在的池子没有，保持关闭

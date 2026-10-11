@@ -155,10 +155,12 @@ def main() -> None:
     judge = FactConsistencyJudge(runtime=runtime)
 
     probes = [json.loads(l) for l in open(resolve(args.probes), encoding="utf-8") if l.strip()]
-    # 一次性判定：每个探针把 (原文, 摘要) 喂给裁判拿六个分，只读它要测的那个要素。
-    six = judge.judge_fact_six_batch([(p["doc"], p["cand"]) for p in probes])
-    scores = [row.get(p["element"], 2) for row, p in zip(six, probes)]
-    sources = [json.dumps(row, ensure_ascii=False) for row in six]
+    # 一次判定：每个探针把 (原文, 摘要) 喂给裁判，读整体事实一致性分。
+    # 探针用例仍按"好/坏"两组构造，只是现在评分口径是整体分（0~4），
+    # 不再有逐要素分，所以 probe 里的 element 字段只作说明。
+    rows = judge.judge_fact_batch([(p["doc"], p["cand"]) for p in probes])
+    scores = [int(row.get("fact_consistency_score", 2)) for row in rows]
+    sources = [json.dumps(row, ensure_ascii=False) for row in rows]
     pmaxs = [None] * len(probes)
 
     # ================= 1. 汇总表格打印 =================

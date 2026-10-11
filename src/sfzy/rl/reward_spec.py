@@ -52,16 +52,16 @@ DEFAULT_GATE: Dict[str, Any] = {
     "length_ratio_range": [0.5, 1.5],
     "forbidden_prefixes": ["以下是", "摘要：", "摘要:", "本摘要", "这是"],
     "require_result_marker": True,
-    # 事实一致性硬门控：六个要素里只要有一个**原始分 < 这个值**，整条 reward
-    # 直接 0（不再算覆盖率/ROUGE）。1 就是需求里的"任一个要素得 0 分即出局"；
-    # 设 0 关闭这条规则。只在 fact_consistency 这个 term 被启用时生效。
-    "fact_consistency_min_raw": 1,
+    # 事实一致性硬门控：裁判判定摘要**存在明确事实错误**（has_factual_error=1）
+    # 时整条 reward 直接 0（不再算覆盖率/ROUGE）。1=启用，0=关闭。
+    # 只在 fact_consistency 这个 term 被启用时生效。
+    "fact_has_error": 1,
 }
 
-# 事实一致性硬门控要读的裁判信号名：六个要素原始分（0-4）的最小值。
+# 事实硬门控要读的裁判信号名：1 = 裁判判定存在明确事实错误。
 # judge.py / scorer.py 里也硬编码了同一个字符串 —— judge 层不 import 本模块，
 # 否则会把 torch 拉进纯 CPU 的 reward 路径。两边一致性由 tests 钉住。
-FACT_GATE_SIGNAL = "fact_consistency_min_raw"
+FACT_GATE_SIGNAL = "fact_has_error"
 
 # term 配置里除了内部权重字段、只能写这两个保留字段
 _RESERVED_FIELDS = ("enabled", "weight")
@@ -340,7 +340,7 @@ class RewardSpec:
     def gate_signals(self) -> Set[str]:
         """门控（不是 reward term）额外需要的裁判信号。"""
         out: Set[str] = set()
-        if self.fact_element_gate_enabled:
+        if self.fact_error_gate_enabled:
             out.add(FACT_GATE_SIGNAL)
         return out
 
@@ -359,18 +359,14 @@ class RewardSpec:
         return bool(term and term.enabled)
 
     @property
-    def fact_element_min_raw(self) -> int:
-        """六个要素原始分的最低要求；<=0 表示不做事实一致性硬门控。"""
-        if not self.gate.enabled:
-            return 0
+    def fact_error_gate_enabled(self) -> bool:
+        """事实硬门控是否生效：fact_consistency 启用 + gate 启用 + fact_has_error=1。"""
+        if not self.fact_consistency_enabled or not self.gate.enabled:
+            return False
         try:
-            return int(self.gate.cfg.get("fact_consistency_min_raw", 0) or 0)
+            return int(self.gate.cfg.get("fact_has_error", 0) or 0) > 0
         except (TypeError, ValueError):
-            return 0
-
-    @property
-    def fact_element_gate_enabled(self) -> bool:
-        return self.fact_consistency_enabled and self.fact_element_min_raw > 0
+            return False
 
     def judge_term_options(self) -> Dict[str, Dict[str, Any]]:
         """{裁判信号名: 该 reward 的内部权重}，交给裁判后端构造时使用。"""

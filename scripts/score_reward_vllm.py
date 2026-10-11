@@ -131,10 +131,9 @@ from sfzy.utils.text_fit import truncate_text as _truncate_text  # noqa: E402
 from sfzy.judge.runtime import DIGITS                        # noqa: E402
 from sfzy.judge.schema import (                              # noqa: E402
     EE_DIMENSIONS,
-    ELEMENT_ZH,
     ELEMENTS,
+    JudgeResult,
     MAX_SCORE,
-    aggregate,
     aggregate_coverage,
 )
 
@@ -482,7 +481,7 @@ def score_chunk(
 
     # ---- 2. 各路判定各一次批量前向 ----
     # 事实一致性：每个 (原文, 候选摘要) 一次调用
-    six_raws = judge.judge_fact_six_batch(six_items) if six_items else []
+    fact_raws = judge.judge_fact_batch(six_items) if six_items else []
     # 覆盖率：每个 (人工摘要, 候选摘要) 一次调用
     cov_raws = judge.judge_coverage_six_batch(cov_items) if cov_items else []
     # INP：每个 (原文, 人工摘要, 候选摘要) 一次调用
@@ -505,16 +504,20 @@ def score_chunk(
         error = entry["error"]
         try:
             if "fact_consistency" in tasks and "six_idx" in entry:
-                fact_result = aggregate(
-                    dict(six_raws[entry["six_idx"]]),
-                    weights=judge.weights,
-                    sources={name: "judge" for name in ELEMENTS},
+                fact_row = fact_raws[entry["six_idx"]]
+                fact_score = int(fact_row["fact_consistency_score"])
+                has_error = int(fact_row["has_factual_error"])
+                fact_result = JudgeResult(
                     candidate_id=f"{entry['id']}:{entry['arm']}",
+                    weighted_reward=fact_score / float(MAX_SCORE),
+                    scores={"fact_consistency": fact_score / float(MAX_SCORE)},
+                    raw_scores={"fact_consistency": fact_score},
+                    fact_score=fact_score,
+                    has_factual_error=has_error,
+                    error_reason=str(fact_row.get("error_reason") or ""),
                 )
                 signals["fact_consistency"] = fact_result.weighted_reward
-                signals["fact_consistency_min_raw"] = float(
-                    min(fact_result.raw_scores.values())
-                )
+                signals["fact_has_error"] = float(has_error)
             if "element_coverage" in tasks:
                 cov_present = list(ELEMENTS)
                 if entry.get("cov_self"):
@@ -597,12 +600,11 @@ def score_chunk(
             "rouge": rouge,
             "rouge_l": rouge.get("rouge-l-f"),
             "fact_consistency": (fact_result.weighted_reward if fact_result else None),
-            "min_element_score": (fact_result.min_element_score if fact_result else None),
-            "judgment_result_score": (
-                fact_result.judgment_result_score if fact_result else None
+            "fact_score": (fact_result.fact_score if fact_result else None),
+            "has_factual_error": (
+                fact_result.has_factual_error if fact_result else None
             ),
-            "fact_scores": (dict(fact_result.scores) if fact_result else {}),
-            "fact_raw": (dict(fact_result.raw_scores) if fact_result else {}),
+            "error_reason": (fact_result.error_reason if fact_result else ""),
             "element_coverage": coverage,
             # INP：逐命题评分 / 重复分组 / 最终分
             "inp": inp_value,
@@ -649,8 +651,8 @@ def score_with_fallback(
             return [{
                 "id": rid, "arm": arm, "reward": None, "reward_ungated": None,
                 "gated": False, "gate_reason": "", "terms": {},
-                "fact_consistency": None, "min_element_score": None,
-                "judgment_result_score": None, "fact_scores": {}, "fact_raw": {},
+                "fact_consistency": None, "fact_score": None,
+                "has_factual_error": None, "error_reason": "",
                 "element_coverage": None,
                 "error": f"{type(exc).__name__}: {exc}",
             } for arm in ("candidate", "human")]
@@ -868,19 +870,11 @@ def summarize(
 
     def arm_stats(arms: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         ok = [a for a in arms if a.get("reward") is not None]
-        # fact_raw 逐项为 0 的情况 —— reward 归零主要就是被这个触发的。
-        with_raw = [a for a in arms if a.get("fact_raw")]
-        n_raw = len(with_raw)
-        per_zero = {
-            name: sum(1 for a in with_raw if a["fact_raw"].get(name) == 0)
-            for name in ELEMENTS
-        }
-        zero_dist = Counter(
-            sum(1 for v in a["fact_raw"].values() if v == 0) for a in with_raw
-        )
-        any_zero = sum(
-            1 for a in with_raw if any(v == 0 for v in a["fact_raw"].values())
-        )
+        # 事实错误门控触发情况 —— 新口径下 reward 归零主要就是被它触发的。
+        with_fact = [a for a in arms if a.get("fact_score") is not None]
+        n_fact = len(with_fact)
+        score_dist = Counter(int(a["fact_score"]) for a in with_fact)
+        err = sum(1 for a in with_fact if int(a.get("has_factual_error") or 0) == 1)
         out: Dict[str, Any] = {
             "n": len(arms),
             "n_ok": len(ok),
@@ -898,18 +892,11 @@ def summarize(
             "mean_rouge_overall": _mean(
                 [a.get("rouge", {}).get("overall") for a in ok]
             ),
-            "fact_raw_zero": {
-                "n": n_raw,
-                "per_element_zero": {
-                    name: {"count": c, "rate": (c / n_raw if n_raw else None)}
-                    for name, c in per_zero.items()
-                },
-                "any_zero": {
-                    "count": any_zero,
-                    "rate": (any_zero / n_raw if n_raw else None),
-                },
-                # 每一行里有几个要素是 0（0/1/2/…）
-                "zero_count_distribution": dict(sorted(zero_dist.items())),
+            "fact_error": {
+                "n": n_fact,
+                "error_count": err,
+                "error_rate": (err / n_fact if n_fact else None),
+                "score_distribution": {str(k): score_dist.get(k, 0) for k in range(5)},
             },
         }
         for term in terms:
@@ -1062,19 +1049,11 @@ def print_summary(title: str, stats: Dict[str, Any]) -> None:
         print(f"  {label:<24}{cvs:>16}{hvs:>18}")
     if stats["delta_reward(human-candidate)"] is not None:
         print(f"\n  Δ 奖励（人工 − 候选）= {stats['delta_reward(human-candidate)']:+.4f}")
-    cz, hz = c.get("fact_raw_zero"), h.get("fact_raw_zero")
-    if cz and hz:
-        top = sorted(
-            cz["per_element_zero"].items(),
-            key=lambda kv: kv[1]["rate"] or 0.0, reverse=True,
-        )[:3]
-        print("  fact_raw=0 最多的要素（候选）：" + "，".join(
-            f"{ELEMENT_ZH.get(n, n)} {_pct(v['rate'])}" for n, v in top
-        ))
-        print(
-            f"  任一要素为 0（会触发事实硬门控）：候选 {_pct(cz['any_zero']['rate'], 1)} / "
-            f"人工 {_pct(hz['any_zero']['rate'], 1)}"
-        )
+    cf, hf = c.get("fact_error"), h.get("fact_error")
+    if cf and hf:
+        print(f"  裁判判定“存在事实错误”（会触发事实门控）："
+              f"候选 {cf['error_count']}/{cf['n']}（{_pct(cf['error_rate'], 1)}）/ "
+              f"人工 {hf['error_count']}/{hf['n']}（{_pct(hf['error_rate'], 1)}）")
     if stats["human_win_rate"] is not None:
         print(
             f"  人工胜 / 平 / 负 = {stats['human_win']} / {stats['tie']} / "
@@ -1190,29 +1169,20 @@ def render_report(title: str, stats: Dict[str, Any]) -> str:
         f"{_fmt(h['mean_rouge_overall'])} |",
         "",
     ]
-    # fact_raw 逐项为 0 —— reward 归零主要就是被这个触发的
-    if c.get("fact_raw_zero") and h.get("fact_raw_zero"):
-        cz, hz = c["fact_raw_zero"], h["fact_raw_zero"]
+    # 事实错误门控 —— 新口径下 reward 归零主要就是被这个触发的
+    if c.get("fact_error") and h.get("fact_error"):
+        cf, hf = c["fact_error"], h["fact_error"]
         lines += [
-            "## fact_raw 逐项为 0 的情况（reward 归零的来源）",
+            "## 事实错误门控触发情况（reward 归零的来源）",
             "",
-            "| 要素 | 候选 0 数 | 候选占比 | 人工 0 数 | 人工占比 |",
-            "|---|---:|---:|---:|---:|",
-        ]
-        for name in ELEMENTS:
-            cc = cz["per_element_zero"].get(name, {})
-            hh = hz["per_element_zero"].get(name, {})
-            lines.append(
-                f"| {ELEMENT_ZH.get(name, name)}（{name}） | {cc.get('count', 0)} | "
-                f"{_fmt(cc.get('rate'))} | {hh.get('count', 0)} | {_fmt(hh.get('rate'))} |"
-            )
-        lines += [
+            "| 口径 | 候选 | 人工 |",
+            "|---|---:|---:|",
+            f"| 判为“存在事实错误”(has_factual_error=1) | "
+            f"{cf['error_count']}/{cf['n']}（{_fmt(cf['error_rate'])}） | "
+            f"{hf['error_count']}/{hf['n']}（{_fmt(hf['error_rate'])}） |",
             "",
-            f"- 任一要素为 0（会触发 `fact_element_raw<1` 硬门控）："
-            f"候选 {cz['any_zero']['count']}/{cz['n']}（{_fmt(cz['any_zero']['rate'])}），"
-            f"人工 {hz['any_zero']['count']}/{hz['n']}（{_fmt(hz['any_zero']['rate'])}）",
-            f"- 每行 0 的个数分布：候选 `{cz['zero_count_distribution']}`，"
-            f"人工 `{hz['zero_count_distribution']}`",
+            f"- 整体分 0/1/2/3/4 分布：候选 `{cf['score_distribution']}`，"
+            f"人工 `{hf['score_distribution']}`",
             "",
         ]
     per_term = stats.get("per_term") or {}
@@ -1598,19 +1568,14 @@ def main() -> None:
     from sfzy.judge.judge import SUPPORTED_TASKS, FactConsistencyJudge
 
     # 只把真正的 judge task 拿去构造 Judge；事实硬门控要读的
-    # fact_consistency_min_raw 是 gate 辅助信号（在 score_chunk 里手工塞进
+    # fact_has_error 是 gate 辅助信号（在 score_chunk 里手工塞进
     # judge_signals），不是 task。
     judge_tasks = [
         t for t in sorted(spec.required_signals) if t in SUPPORTED_TASKS
     ] or ["fact_consistency"]
-    logger.info("裁判任务：%s（事实硬门控阈值=%d）",
-                judge_tasks, spec.fact_element_min_raw)
-
-    if spec.fact_element_gate_enabled:
-        logger.info(
-            "事实一致性硬门控已启用：六要素原始分任一 < %d → 整条 reward=0",
-            spec.fact_element_min_raw,
-        )
+    logger.info("裁判任务：%s（事实错误门控=%s）",
+                judge_tasks,
+                "开" if spec.fact_error_gate_enabled else "关")
 
     # 判定 runtime：配了 judge_api 就走 API（不加载本地裁判，也就不吃显存）；
     # 否则本地 vLLM。

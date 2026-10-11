@@ -31,7 +31,8 @@ ChatGLM3-6B 的注意力层名和 LLaMA 系不一样（它用融合的 query_key
 from __future__ import annotations
 
 import math
-from typing import Any, Dict, Iterable, List, Tuple
+from contextlib import contextmanager
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Tuple
 
 import torch
 import torch.nn as nn
@@ -164,6 +165,83 @@ def mark_only_lora_trainable(model: nn.Module) -> None:
     """
     for name, param in model.named_parameters():
         param.requires_grad = ("lora_A" in name or "lora_B" in name)
+
+
+def snapshot_lora(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """把当前的 LoRA 权重（lora_A / lora_B）**复制**出来，作为参考策略的快照。
+
+    用途：KL 惩罚需要"参考策略"的对数概率。本项目的策略与 SFT 策略共用同一个
+    冻结底座、只有 LoRA 不同，所以不必再加载一份 6B 模型 —— 把 SFT 那一刻的
+    LoRA 权重存下来，需要时临时换进去跑一次前向（见 `use_lora_weights`）。
+    代价只有快照本身：29.6M 参数 fp32 ≈ 118 MB。
+
+    **必须在载入 SFT 权重之后、任何 RL 更新之前调用**（train_grpo.py 里就是
+    紧接着 `load_checkpoint(adapter, ...)` 的位置）。存引用而不是拷贝的话，
+    下一步参数就被优化器改掉了，KL 会恒为 0。
+    """
+    weights = {
+        name: param.detach().clone()
+        for name, param in model.named_parameters()
+        if "lora_" in name
+    }
+    if not weights:
+        raise ValueError(
+            "模型里没有 LoRA 参数（名字含 lora_），做不了参考策略快照。\n"
+            "  调用顺序：inject_lora(model, ...) → snapshot_lora(model)。"
+        )
+    return weights
+
+
+def lora_snapshot_scale(weights: Mapping[str, torch.Tensor]) -> Tuple[float, float]:
+    """返回 `(lora_B 的绝对值之和, 全部 LoRA 权重的绝对值之和)`，用来体检快照。
+
+    `lora_B` 在注入时是**零初始化**的。如果它整片是 0，说明底座上等于没挂
+    LoRA —— 要么 SFT 权重没载入成功，要么快照取早了（在 `load_checkpoint`
+    之前）。这时"参考策略"其实等于原始底座，KL 会把你往预训练模型拉，而不是
+    往 SFT 策略拉，所以值得在启动日志里显式警告。
+    """
+    b_abs = sum(float(v.abs().sum()) for k, v in weights.items() if "lora_B" in k)
+    total_abs = sum(float(v.abs().sum()) for v in weights.values())
+    return b_abs, total_abs
+
+
+@contextmanager
+def use_lora_weights(
+    model: nn.Module, weights: Mapping[str, torch.Tensor]
+) -> Iterator[None]:
+    """临时把 LoRA 权重换成 `weights`，退出时原样恢复。
+
+    两个实现细节不是随便选的：
+
+    * **必须就地 `param.data.copy_()`**，不能把 `nn.Parameter` 换掉。AdamW 的
+      动量与二阶矩按**参数对象**索引，替换对象会让优化器状态错位（表现为
+      "KL 一开训练行为就变了"），而且这种错位不会报错。
+    * 退出时必须恢复：备份的是**进入时**的值。不恢复的话，跑完一步策略就
+      永久变成参考策略了。
+
+    键对不上（r / target_modules 变了，或模型被 DDP 包过）会直接报错，
+    不静默跳过 —— 静默跳过的结果是 KL 悄悄恒为 0。
+    """
+    current = {name: param for name, param in model.named_parameters() if name in weights}
+    missing = sorted(set(weights) - set(current))
+    if missing:
+        raise ValueError(
+            f"参考快照里有 {len(missing)} 个键在当前模型里找不到，例如 {missing[:2]}。\n"
+            "  多半是 LoRA 结构变了（r / target_modules 不同），或模型被 DDP 包过"
+            "（键名多了 module. 前缀）。"
+        )
+
+    backup = {name: param.detach().clone() for name, param in current.items()}
+    try:
+        with torch.no_grad():
+            for name, param in current.items():
+                param.data.copy_(weights[name])
+        yield
+    finally:
+        with torch.no_grad():
+            for name, param in current.items():
+                param.data.copy_(backup[name])
+
 
 def count_parameters(model: nn.Module) -> Tuple[int, int]:
     """返回 (总参数量, 可训练参数量)。

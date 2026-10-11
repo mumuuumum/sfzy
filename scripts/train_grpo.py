@@ -47,7 +47,11 @@ from sfzy.models.loader import (                          # noqa: E402
     move_model_to_device,
     resolve_device_index,
 )
-from sfzy.models.lora import inject_lora, mark_only_lora_trainable  # noqa: E402
+from sfzy.models.lora import (                            # noqa: E402
+    inject_lora,
+    mark_only_lora_trainable,
+    snapshot_lora,
+)
 from sfzy.rl.reward_spec import RewardSpec                     # noqa: E402
 from sfzy.rl.trainer import GRPOTrainer                   # noqa: E402
 from sfzy.sft.checkpoint import load_checkpoint           # noqa: E402
@@ -234,6 +238,22 @@ def main() -> None:
         ) from exc
     logger.info("已载入 SFT 权重作为策略起点: %s", adapter)
 
+    # ---------------- KL 的参考策略 = SFT 策略 ----------------
+    # 策略和 SFT 策略共用同一个冻结底座、只有 LoRA 不同，所以不必再加载一份
+    # 6B 模型：**在这里**（刚载入 SFT 权重之后、trainer.resume() 会覆盖它之前）
+    # 存一份 LoRA 副本就够了，≈118 MB。算 KL 时临时换进去前向一次再换回来。
+    #
+    # 位置是硬要求：放到 trainer 构造之后（或 resume 之后）拿到的就是 RL 的
+    # 中间权重，"往 SFT 拉"会变成"往自己拉"，KL 恒为 0 还不报错。
+    reference_lora = None
+    if float(rl_cfg.get("kl_coef", 0.0) or 0.0) > 0:
+        reference_lora = snapshot_lora(model)
+        logger.info(
+            "KL 参考策略：已快照 SFT 的 LoRA（%d 个张量，约 %.0f MB）",
+            len(reference_lora),
+            sum(t.numel() * t.element_size() for t in reference_lora.values()) / 1024**2,
+        )
+
     # ---------------- prompt 池 ----------------
     prompt_path = resolve(rl_cfg.get("prompt_file", "data/splits/rl_prompts.jsonl"))
     if not prompt_path.exists():
@@ -335,6 +355,7 @@ def main() -> None:
         model=model, tokenizer=tokenizer, cfg=cfg,
         output_dir=str(resolve(rl_cfg.get("output_dir", "outputs/grpo"))),
         tracker=tracker, is_main_process=is_main_process(), scorer=scorer,
+        reference_lora=reference_lora,
     )
     trainer.resume(resume_from)
     state = trainer.train(prompts)

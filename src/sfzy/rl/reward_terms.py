@@ -103,9 +103,8 @@ TERM_REGISTRY: Dict[str, TermSpec] = {
         name="fact_consistency",
         source="judge",
         signal="fact_consistency",
-        description="六要素事实一致性 Judge 加权分 ∈ [0,1]",
-        # 六要素的**内部权重**只能写在配置里，这里只声明键集合。
-        internal_weight_fields={"element_weights": FACT_ELEMENTS},
+        description="事实一致性整体分 ∈ [0,1]（裁判输出 has_factual_error + 0~4 整体分）",
+        # 新方案不再按六要素加权，没有内部权重。
     ),
     "element_coverage": TermSpec(
         name="element_coverage",

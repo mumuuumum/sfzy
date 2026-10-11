@@ -73,19 +73,12 @@ rl:
     # 设 1 = "任一要素得 0 分即出局"；设 0 关闭这条规则（其余门控项沿默认）。
     # 注意：这是全局硬门控，离线验证时人工摘要也会被同一条规则拦下。
     gate:
-      fact_consistency_min_raw: 0
+      fact_has_error: 0
     terms:
       rouge_l: {enabled: false, weight: 0.0}
       fact_consistency:
         enabled: false
         weight: 0.5
-        element_weights:
-          case_type:          0.05
-          plaintiff_claims:   0.20
-          defendant_defenses: 0.15
-          court_facts:        0.25
-          legal_basis:        0.15
-          judgment_result:    0.20
       element_coverage:
         enabled: false
         weight: 1

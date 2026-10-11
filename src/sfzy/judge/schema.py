@@ -207,13 +207,25 @@ class SixElements:
 
 @dataclass
 class JudgeResult:
-    """一条候选摘要的六要素判定结果。"""
+    """一条候选摘要的判定结果。
+
+    事实一致性改成"整体分 + 事实错误门控"（见 ``prompts.JUDGE_SYSTEM``）之后，
+    FC 的字段是 ``fact_score`` / ``has_factual_error`` / ``error_reason``；
+    ``raw_scores`` / ``scores`` 对 FC 只放一个键 ``fact_consistency``。
+    逐要素的 ``min_element_score`` / ``judgment_result_score`` 属于旧的六要素口径，
+    现在不再产出（保持 ``None``），保留字段是为了兼容旧的读取方。
+    """
 
     raw_scores: Dict[str, int] = field(default_factory=dict)         # 0-4
     scores: Dict[str, float] = field(default_factory=dict)           # 归一化 0-1
     weighted_reward: float = 0.0
-    min_element_score: float = 0.0
-    judgment_result_score: float = 0.0
+    # 旧的六要素口径字段（已弃用，恒为 None）；保留以免旧代码/日志读取报错
+    min_element_score: Optional[float] = None
+    judgment_result_score: Optional[float] = None
+    # ---- 事实一致性（新口径）----
+    fact_score: Optional[int] = None          # 整体分 0-4
+    has_factual_error: Optional[int] = None   # 0/1，事实硬门控信号
+    error_reason: str = ""
     # 每个分数是怎么来的：judge（真调了模型）/ empty_rule（空字段规则）
     sources: Dict[str, str] = field(default_factory=dict)
     # 调试用：裁判原始输出（受限解码下就是那一位数字）与 5 档概率
@@ -240,6 +252,9 @@ class JudgeResult:
             "signals": dict(self.signals),
             "min_element_score": self.min_element_score,
             "judgment_result_score": self.judgment_result_score,
+            "fact_score": self.fact_score,
+            "has_factual_error": self.has_factual_error,
+            "error_reason": self.error_reason,
             "coverage_raw": dict(self.coverage_raw),
             "ee_dims": dict(self.ee_dims),
         }
@@ -335,20 +350,33 @@ def aggregate_coverage(
 def summarize_scores(results: Sequence[JudgeResult]) -> Dict[str, float]:
     """训练日志要的那一组统计量。
 
-    除了均值，还统计 **0/1/2/3/4 各档的比例** —— 只看均值分不清
-    "大家都拿 3 分"和"一半 4 分一半 2 分"，而后者才说明判别力在起作用。
+    事实一致性现在是"整体 0~4 分 + 是否触发事实门控"，统计量为：
+
+      * ``mean_fact_reward``   加权分均值（= mean_fact_score，0~1）
+      * ``mean_fact_score``    整体分归一化到 0~1
+      * ``fact_error_rate``    裁判判定"存在明确事实错误"的比例
+      * ``ratio_score_{0..4}`` 整体分 0/1/2/3/4 各档占比
+
+    除了均值还要看各档占比 —— 只看均值分不清"大家都拿 3 分"和
+    "一半 4 分一半 0 分"，而后者才说明判别力在起作用。
     """
     if not results:
         return {}
     n = len(results)
     stats: Dict[str, float] = {
         "mean_fact_reward": sum(r.weighted_reward for r in results) / n,
-        "mean_min_element_score": sum(r.min_element_score for r in results) / n,
     }
-    for name in ELEMENTS:
-        stats[f"mean_{name}_score"] = sum(r.scores[name] for r in results) / n
-    # 各档比例：把六要素所有判定合在一起看整体分布
-    all_raw = [r.raw_scores[name] for r in results for name in ELEMENTS]
+    scored = [r for r in results if getattr(r, "fact_score", None) is not None]
+    if not scored:
+        return stats
+    scores = [int(r.fact_score) for r in scored]
+    stats["mean_fact_score"] = sum(scores) / len(scores) / float(MAX_SCORE)
+    errs = [int(r.has_factual_error) for r in scored
+            if getattr(r, "has_factual_error", None) is not None]
+    if errs:
+        stats["fact_error_rate"] = sum(errs) / len(errs)
+    stats["n_fact"] = float(len(scores))
     for level in range(MAX_SCORE + 1):
-        stats[f"ratio_score_{level}"] = sum(1 for v in all_raw if v == level) / len(all_raw)
+        stats[f"ratio_score_{level}"] = (
+            sum(1 for v in scores if v == level) / len(scores))
     return stats
