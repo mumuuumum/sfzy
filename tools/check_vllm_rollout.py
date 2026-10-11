@@ -39,6 +39,12 @@ from sfzy.utils.logging import get_logger                          # noqa: E402
 
 logger = get_logger("check_vllm")
 
+# 工具版本标记：这份脚本要在"开发机"和"GPU 机"之间来回拷，很容易跑成旧副本
+# （现象是 argparse 报 "unrecognized arguments"）。启动时把版本与支持的参数打出来，
+# 一眼就能确认自己跑的是不是最新的。
+TOOL_REVISION = 2
+TOOL_FLAGS = "--config / --prompt-file / --group-size / --max-new-tokens / --quantization"
+
 
 def resolve(path) -> Path:
     path = Path(path)
@@ -51,7 +57,15 @@ def main() -> None:
     parser.add_argument("--prompt-file", default=None, help="默认取 rl.prompt_file 的第一条")
     parser.add_argument("--group-size", type=int, default=None, help="默认取 rl.group_size")
     parser.add_argument("--max-new-tokens", type=int, default=48)
+    parser.add_argument(
+        "--quantization", default=None,
+        help="覆盖 rl.vllm.quantization。可选 bitsandbytes / awq / gptq / none。\n"
+             "★ 用 `--quantization bitsandbytes` 可以就地验证『bnb 4-bit 底座 + LoRA』这个\n"
+             "  官方未测试的组合到底能不能跑（vLLM 0.11.2 里它既没进支持清单、也没被禁止）；\n"
+             "  能跑的话底座显存从 12.4GB 降到约 3.5GB。跑不通就回到默认的 bf16。",
+    )
     args = parser.parse_args()
+    print(f"[check_vllm_rollout r{TOOL_REVISION}] 支持参数: {TOOL_FLAGS}")
 
     cfg = load_config(resolve(args.config))
     rl = cfg.get("rl", {})
@@ -85,12 +99,17 @@ def main() -> None:
 
     want_len = int(rl.get("max_length", 2048)) + int(rl.get("max_new_tokens", 512)) + 8
     seq_len = int(getattr(getattr(model, "config", None), "seq_length", 0) or 8192)
+    quantization = args.quantization if args.quantization is not None else (
+        vcfg.get("quantization") or None
+    )
+    if isinstance(quantization, str) and quantization.lower() in ("none", "", "null"):
+        quantization = None
     backend = VLLMRollout(
         base_model=model_cfg["model_name_or_path"], tokenizer=tokenizer,
         lora_alpha=int(lora_cfg.get("alpha", 16)), lora_rank=int(lora_cfg.get("r", 8)),
         export_root=resolve(rl.get("output_dir", "outputs/grpo")) / "vllm_adapters",
         dtype=str(vcfg.get("dtype", "bfloat16")),
-        quantization=vcfg.get("quantization") or None,
+        quantization=quantization,
         gpu_memory_utilization=float(vcfg.get("gpu_memory_utilization", 0.30)),
         max_model_len=int(vcfg.get("max_model_len") or min(want_len, seq_len)),
         max_loras=int(vcfg.get("max_loras", 1)),
@@ -141,6 +160,7 @@ def main() -> None:
     peak = torch.cuda.max_memory_allocated() / 1024**3 if torch.cuda.is_available() else 0.0
     print("\n================ vLLM rollout 冒烟结果 ================")
     print(f"  条数        : {len(texts)}（期望 {group}）")
+    print(f"  vLLM 量化   : {quantization or '（无，按 dtype 加载）'}")
     print(f"  策略同步    : {sync_s:.2f}s（导出 LoRA + 挂 LoRARequest）")
     print(f"  生成 {args.max_new_tokens:>3d} token: {gen_s:.2f}s（{group} 条合计）")
     print(f"  显存峰值    : {peak:.1f} GiB")

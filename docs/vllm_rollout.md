@@ -78,6 +78,26 @@ PY
 **注意**：AWQ 是另一套 4-bit 数值，与你 SFT 基线的 nf4 不是同一套 kernel；
 换过去等于换了底座精度，"精度与 SFT 一致"这条要重新表述。所以**优先 bf16**。
 
+### 3.1 顺便验证一下"bnb 4-bit 底座 + LoRA"（2 分钟，可能省 7GB）
+
+vLLM 0.11.2 的 LoRA 支持的底座类型是有源码清单的（`vllm/lora/layers/utils.py`）：
+未量化 Linear、compressed-tensors（`weight_packed`）、**GPTQ/AWQ**（`qweight`）、
+**Marlin**（`B`）、**HQQ marlin**（`W_q`）；其它一律 `raise ValueError("Unsupported
+base layer")`。**bitsandbytes 不在这个清单里**（0.5.5 里那句 "not tested with LoRA
+yet" 的警告在 0.11.2 已被删掉 —— 既没列入支持也没明确禁止；bnb 的权重是
+`Params4bit`，带 `.weight` 属性，所以它可能碰巧落进"未量化"那条分支而能用）。
+
+想把它从"未知"变成"数据"，就在同一次开机里多跑一条：
+
+```bash
+python tools/check_vllm_rollout.py --config configs/grpo_fact_coverage_vGPU48.yaml \
+    --quantization bitsandbytes
+```
+
+* 能跑 → 在配置里填 `rl.vllm.quantization: bitsandbytes`：底座显存从 ~12.4GB 降到 ~3.5GB，
+  48GB 同卡共存宽裕很多（代价：bnb 在 vLLM 里强制 eager、且这条组合没被上游测过）。
+* 跑不通（或结果明显乱） → 保持默认 bf16，必要时按上面的 AWQ 走。
+
 ## 4. 训练
 
 ```bash
