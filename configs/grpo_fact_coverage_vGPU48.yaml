@@ -79,6 +79,13 @@ rl:
   log_every_n_steps: 1
   resume_from: null
 
+  # ---- 显存不足时跳过该步，而不是让整次 run 崩掉 ----
+  # 一次 40+ 小时的 run 因某步长文书 OOM 全丢，代价远大于跳一步（这一步的
+  # rollout/裁判开销已经花掉，模型不更新）。但**跳太多说明显存预算根本不够**，
+  # 那时静默跳过等于把长样本从数据集里删掉 —— 所以超过上限就报错退出。
+  skip_on_oom: true
+  max_skipped_steps: null    # null = 自动取 max(3, 总步数的 1%%)
+
   # ---- rollout 后端 ----
   # hf  : 训练进程内的模型逐条生成（ChatGLM3 不支持批输入，最慢）
   # vllm: 交给 vLLM 连续批处理，每步把当前 LoRA 热交换过去（推荐）

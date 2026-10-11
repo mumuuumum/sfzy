@@ -77,6 +77,23 @@ def _sync() -> None:
         torch.cuda.synchronize()
 
 
+# 哪些异常算"显存类失败、可以跳过这一步"。
+# **刻意不捕获所有 RuntimeError**：本项目自己的 RuntimeError（"裁判返回条数对不上"、
+# "还没给 vLLM 同步策略"）是 bug，必须冒出来，不能被跳过逻辑吞掉。
+_OOM_HINTS = (
+    "out of memory", "no available memory", "kv cache", "engine core",
+    "died unexpectedly", "engine core initialization failed",
+)
+
+
+def _is_oom_like(exc: BaseException) -> bool:
+    """这个异常是不是显存类失败（训练进程 OOM，或 vLLM 引擎因子进程 OOM 死掉）？"""
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return any(hint in text for hint in _OOM_HINTS)
+
+
 @contextmanager
 def _timed(sink: Optional[Dict[str, float]], key: str) -> Iterator[None]:
     """把一段耗时累加进 `sink[key]`；`sink is None`（未开 profiling）时零开销。"""
@@ -122,6 +139,9 @@ class RLState:
     # 而你不会收到任何提示。
     best_eval_score: Optional[float] = None
     best_step: Optional[int] = None
+    # 因显存不足被跳过的步数（见 `GRPOTrainer.train` 的 skip_on_oom）。
+    # 存进 checkpoint 是为了让"这次 run 到底丢了多少步"在续训后仍然可见。
+    skipped_steps: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -130,6 +150,7 @@ class RLState:
             "tracker_run_id": self.tracker_run_id,
             "best_eval_score": self.best_eval_score,
             "best_step": self.best_step,
+            "skipped_steps": self.skipped_steps,
         }
 
 
@@ -218,6 +239,13 @@ class GRPOTrainer:
         self.log_every_n_steps = rl.get("log_every_n_steps", 1)
         self.reward_cfg = rl.get("reward", None)
         self.resume_from = rl.get("resume_from") or None
+        # ---- 显存不足时跳过该步（而不是让整次 run 崩掉）----
+        # 默认开：一次 40+ 小时的 run 因为某步长文书 OOM 而全丢，代价远大于跳一步。
+        # 但**必须有上限**：如果 OOM 是必然发生的（配置的显存预算不对），静默跳过
+        # 等于把长样本从数据集里悄悄删掉 —— 跑完你会以为全覆盖了。所以超过
+        # max_skipped_steps 就直接报错退出，并告诉你去调小 max_length/prompts_per_step。
+        self.skip_on_oom = bool(rl.get("skip_on_oom", True))
+        self.max_skipped_steps = int(rl.get("max_skipped_steps", 0) or 0)  # 0 = 自动
         # `SFZY_PROFILE=1` 时，step() 会把本步各阶段耗时写进这里（默认 None）
         self._prof: Optional[Dict[str, float]] = None
 
@@ -1022,7 +1050,42 @@ class GRPOTrainer:
                 )
         for step in range(self.state.step, n_steps):
             chunk = prompts[step * self.prompts_per_step:(step + 1) * self.prompts_per_step]
-            metrics = self.step(chunk)
+            try:
+                metrics = self.step(chunk)
+            except Exception as exc:  # noqa: BLE001 —— 下面立刻会判断能不能跳过
+                if not (self.skip_on_oom and _is_oom_like(exc)):
+                    raise
+                self.state.skipped_steps += 1
+                self.state.step = step + 1
+                limit = self.max_skipped_steps or max(3, n_steps // 100)
+                logger.error(
+                    "第 %d 步因显存不足被跳过（已跳过 %d/%d 步）：%s: %s\n"
+                    "  → 这一步的 rollout/裁判开销已经花掉了；模型没有更新。",
+                    step + 1, self.state.skipped_steps, limit,
+                    type(exc).__name__, str(exc).splitlines()[0][:200],
+                )
+                # 清干净：反传中途失败时 .grad 是半累积的，缓存里也可能留着碎片
+                self.optimizer.zero_grad(set_to_none=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                if self.rollout_backend is not None:
+                    # 若引擎子进程死在 OOM 上，重建它（下一次 generate 会重新初始化，
+                    # 约 35s）。宁可多花这 35s 也别让后续每一步都失败。
+                    try:
+                        self.rollout_backend.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if self.state.skipped_steps >= limit:
+                    raise RuntimeError(
+                        f"跳过的步数达到上限 {limit}（本 run 共 {n_steps} 步）。\n"
+                        "  这说明显存预算根本不够，而不是偶发碎片 —— 静默跳过等于把"
+                        "长样本从数据集里删掉。请调小这些参数后重跑：\n"
+                        "    rl.max_length（每减 1024 约省 3~6G）\n"
+                        "    rl.prompts_per_step 2→1（省约 13G）\n"
+                        "    rl.vllm.extra_llm_kwargs: {enforce_eager: true}（省约 1G）\n"
+                        "  详见上一轮给出的显存清单。"
+                    ) from exc
+                continue
             self.state.step = step + 1
 
             if self.is_main_process and self.monitor.eval_due(self.state.step):
@@ -1051,6 +1114,13 @@ class GRPOTrainer:
         # 收尾：vLLM 引擎的显存不回收会一直占着（下次同卡启动会 OOM）
         if self.rollout_backend is not None:
             self.rollout_backend.close()
+        if self.state.skipped_steps:
+            logger.warning(
+                "本次 run 有 %d 步因显存不足被跳过（占总步数的 %.2f%%）——"
+                "这些 prompt 没有参与训练，别当成全覆盖。",
+                self.state.skipped_steps,
+                100.0 * self.state.skipped_steps / max(n_steps, 1),
+            )
         return self.state
 
     # ------------------------------------------------------------------
