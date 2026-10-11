@@ -169,7 +169,10 @@ def test_prompt编码与截断必须和hf路径一致(tmp_path):
     backend.generate([messages], num_return_sequences=2, max_new_tokens=8, max_length=32)
     got = backend.engine.calls[-1]["prompts"][0]
     expected = encode_prompt(tok, messages, add_generation_prompt=True)[-32:]   # 保留尾部
-    assert got == expected
+    # ★ 必须是 dict 形态（PromptType），不能是裸的 token id 列表：
+    #   0.11 会对裸列表做 `"prompt_token_ids" in prompt` 然后 `.get()` →
+    #   AttributeError: 'list' object has no attribute 'get'（实测踩过）
+    assert got == {"prompt_token_ids": expected}
 
 
 def test_采样参数与条数顺序(tmp_path):

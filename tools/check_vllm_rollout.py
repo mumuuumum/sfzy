@@ -144,17 +144,27 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001 - 冒烟脚本的价值就在于把原因讲清楚
         import torch
         logger.error("vLLM rollout 冒烟失败：%s: %s", type(exc).__name__, exc)
+        # **完整栈也要打出来**：只打一行 message 会让"是 vLLM 内部还是我们的参数"
+        # 变成一个猜谜游戏（前两次故障排查就吃了这个亏）。栈里最后一个非 vllm 的
+        # 帧通常就是我们的调用点。
+        import traceback
+
+        print("\n---- 完整 traceback（最后几帧就是关键）----")
+        print("".join(traceback.format_exc().splitlines(keepends=True)[-14:]))
         print("\n最可能的三个原因（按概率排序）：")
-        print("  0) trust_remote_code：本地模型目录里带 configuration_chatglm.py，"
+        print("  0) 传 token id 的形态：vLLM 0.11 只认 str 或 dict"
+              "（{'prompt_token_ids': [...]}）；裸的 [[1,2,3]] 是 0.5.x 写法，"
+              "会报 \"'list' object has no attribute 'get'\"。")
+        print("  1) trust_remote_code：本地模型目录里带 configuration_chatglm.py，"
               "vLLM 读 config 时要放行。\n"
               "     配置里写 rl.vllm.trust_remote_code: true（默认就是 true）—— "
               "报错文本是 'contains custom code which must be executed'。")
-        print("  1) 版本不匹配：vLLM 0.11.2 要求 torch==2.9.0、transformers<5,>=4.56。")
+        print("  2) 版本不匹配：vLLM 0.11.2 要求 torch==2.9.0、transformers<5,>=4.56。")
         print("     看 `pip show vllm torch transformers | grep -E 'Name|Version'`，")
         print("     按 requirements-vllm.txt 重装（别手动指定别的 torch）。")
-        print("  2) 显存不够：vLLM 的 gpu_memory_utilization 默认 0.9；与训练同卡要压到 0.25~0.35，")
+        print("  3) 显存不够：vLLM 的 gpu_memory_utilization 默认 0.9；与训练同卡要压到 0.25~0.35，")
         print("     或将底座换成 AWQ（docs/vllm_rollout.md 第 3 节）。")
-        print("  3) 量化×LoRA 组合未测试：vLLM 的 LoRA 白名单只有 AWQ/GPTQ；")
+        print("  4) 量化×LoRA 组合未测试：vLLM 的 LoRA 白名单只有 AWQ/GPTQ；")
         print("     底座别用 bitsandbytes（rl.vllm.quantization 留空或填 awq）。")
         if torch.cuda.is_available():
             print(f"\n当前显存峰值：{torch.cuda.max_memory_allocated()/1024**3:.1f} GiB / "

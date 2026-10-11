@@ -198,12 +198,19 @@ class VLLMRollout:
 
         # prompt 的编码与截断规则必须和 HF 路径**逐条一致**：同一个 encode_prompt、
         # 同样的"保留尾部"。不一致不会报错，只会让两边生成的分布悄悄不同。
-        prompt_ids: List[List[int]] = []
+        #
+        # ★ 形态：vLLM 0.11 的 `generate(prompts=...)` 只认 `str` 或 dict 形态的
+        #   `PromptType`（`{"prompt_token_ids": [...]}` / `{"prompt": "..."}`）。
+        #   **裸的 token id 列表（`[[1, 2, 3]]`）是 0.5.x 的老写法**：0.11 会先做
+        #   `"prompt_token_ids" in prompt`（对 list 求成员、恒为 False），随后对它
+        #   调 `.get()` → `AttributeError: 'list' object has no attribute 'get'`。
+        #   踩过一次，别再改回裸列表。
+        prompt_ids: List[Dict[str, Any]] = []
         for messages in messages_list:
             ids = list(encode_prompt(self.tokenizer, messages, add_generation_prompt=True))
             if len(ids) > max_length:
                 ids = ids[-max_length:]
-            prompt_ids.append(ids)
+            prompt_ids.append({"prompt_token_ids": ids})
 
         sampling = factory(
             n=int(num_return_sequences),

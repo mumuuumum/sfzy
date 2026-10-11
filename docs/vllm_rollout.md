@@ -137,6 +137,17 @@ SFZY_PROFILE=1 python scripts/train_grpo.py --config configs/grpo_fact_coverage_
   ```
 
   放行的只是配置类；前向仍由 vLLM 自己的实现算（不会执行远程 modeling 代码）。
+- **prompt 必须是 `str` 或 dict**：vLLM 0.11 的 `generate(prompts=...)` 只认
+  `PromptType`（`{"prompt_token_ids": [...]}` / `{"prompt": "..."}`）。
+  **裸的 token id 列表（`[[1, 2, 3]]`）是 0.5.x 的老写法**：0.11 先对元素做
+  `"prompt_token_ids" in prompt`（对 list 求成员恒为 False），随后 `.get()` →
+
+  ```
+  AttributeError: 'list' object has no attribute 'get'
+  ```
+
+  `VLLMRollout.generate()` 已按 dict 形态传（并有测试钉住）；离线脚本
+  `generate_triples_vllm.py` 是给 0.5.5 写的，换成 0.11 时同样要注意这一处。
 - **采样不跟随 torch 全局种子**：HF 路径受 `set_seed` 影响，vLLM 有自己的采样器。
   训练仍然可复现到"分布"，但具体样本不同。
 - **LoRA × chunked prefill 互斥**（vLLM 源码里是硬报错）；不要手动去开 chunked prefill。
