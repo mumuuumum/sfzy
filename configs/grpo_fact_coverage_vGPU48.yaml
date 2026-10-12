@@ -48,7 +48,7 @@ rl:
   top_p: 0.95
 
   gradient_checkpointing: true
-  logprob_micro_batch: 2
+  logprob_micro_batch: 4
 
   clip_ratio: 0.2
   # μ：一次 rollout 做几次梯度更新（DeepSeekMath Algorithm 1 的内层循环）。
