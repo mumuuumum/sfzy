@@ -23,6 +23,14 @@
     （离线工具用，例如 `scripts/generate_triples_vllm.py`）；
   * `export_lora_from_model`：从**活着的模型**导出（GRPO 每步换策略时用，
     不需要先落一份 checkpoint）。
+
+反向也要能走：`convert_peft_to_checkpoint` 把 PEFT 目录（例如从云端拷回来的
+``adapter_model.safetensors``）转回项目自己的 ``.pt``，好让本地的
+`--adapter`（`load_checkpoint`）能直接吃。同样是"错了不报错"的地方：前缀没剥
+干净时每个键都会被算成"模型里没有"，`load_checkpoint` 会直接报"一个都没载入"。
+转回来时会把 ``adapter_config.json`` 的 alpha/target_modules 一并记进 payload，
+这样从这份 ``.pt`` 再导出回 PEFT 时不必靠人记得传 alpha（rank 能从形状反推，
+alpha 不能，而 alpha/r 直接决定 LoRA 强度）。
 """
 
 from __future__ import annotations
@@ -145,18 +153,35 @@ def convert_checkpoint_to_peft(
     adapter_path: Union[str, Path],
     out_dir: Union[str, Path],
     *,
-    alpha: int,
+    alpha: Optional[int] = None,
     dropout: float = 0.0,
     target_modules: Sequence[str] = CHATGLM3_TARGET_MODULES,
     base_model: str = "",
     rank: Optional[int] = None,
 ) -> Path:
-    """从磁盘上的 ``.pt``（``save_checkpoint`` 或 ``save_lora`` 格式）导出。"""
+    """从磁盘上的 ``.pt``（``save_checkpoint`` 或 ``save_lora`` 格式）导出。
+
+    ``alpha`` 省略时用 checkpoint 自带的 `convert_peft_to_checkpoint` 存下的
+    ``lora_config``。alpha 是唯一无法从权重形状反推的量（rank 可以），而缩放
+    系数 ``alpha/r`` 直接决定 LoRA 强度 —— 宁可在缺信息时报错，也不要默认一个值
+    悄悄改掉强度。
+    """
     import torch
 
     adapter_path = Path(adapter_path)
     payload = torch.load(adapter_path, map_location="cpu", weights_only=False)
     state = extract_lora_state(payload)
+    if alpha is None:
+        config = payload.get("lora_config") if isinstance(payload, Mapping) else None
+        if not isinstance(config, Mapping) or "lora_alpha" not in config:
+            raise ValueError(
+                f"{adapter_path} 里没有记录 lora_alpha（也不是在命令行里给的）——"
+                "alpha/r 配错会静默改变 LoRA 强度，所以这里不替你猜：请显式传 alpha="
+            )
+        alpha = int(config["lora_alpha"])
+        dropout = float(config.get("lora_dropout", dropout))
+        target_modules = list(config.get("target_modules", target_modules))
+        base_model = base_model or str(config.get("base_model_name_or_path", ""))
     try:
         return lora_state_to_peft(
             state, out_dir, alpha=alpha, dropout=dropout,
@@ -196,3 +221,106 @@ def export_lora_from_model(
         state, out_dir, alpha=alpha, dropout=dropout,
         target_modules=target_modules, base_model=base_model, rank=rank,
     )
+
+
+def peft_to_lora_state(tensors: Mapping[str, Any], *, dtype: Any = None) -> Dict[str, Any]:
+    """PEFT 命名 → 项目内部命名（`save_checkpoint` / `save_lora` 用的那一套）。
+
+    导出时补上的 ``base_model.model.`` 前缀这里必须原样剥掉。差一个前缀，
+    `load_state_dict` 会把每个键都当成"模型里没有的参数"，一个都不载入 ——
+    `load_checkpoint` 虽然会把这种情况报出来，但直接改键名的手工转换不会。
+    DDP 的 ``module.`` 前缀在 PEFT 目录里不该出现，顺手一起容忍。
+    """
+    stripped_prefixes = ("base_model.model.", "module.")
+    converted: Dict[str, Any] = {}
+    for key, value in tensors.items():
+        if "lora_A" not in key and "lora_B" not in key:
+            continue
+        name = str(key)
+        while name.startswith(stripped_prefixes):
+            name = name[len(next(p for p in stripped_prefixes if name.startswith(p))):]
+        value = value.detach() if hasattr(value, "detach") else value
+        value = value.to("cpu")
+        if dtype is not None:
+            value = value.to(dtype)
+        converted[name] = value.contiguous()
+
+    if not converted:
+        raise ValueError(
+            "这组权重里没有任何 lora_A/lora_B —— 转出来会是空 adapter，"
+            "而载入时未必报错，只会安静地按零 LoRA 推理。"
+        )
+    ranks = {
+        int(t.shape[0]) for name, t in converted.items() if name.endswith("lora_A.weight")
+    }
+    if len(ranks) != 1:
+        raise ValueError(f"LoRA rank 不一致：{sorted(ranks)}")
+    return converted
+
+
+def convert_peft_to_checkpoint(
+    adapter_path: Union[str, Path],
+    out_path: Union[str, Path],
+    *,
+    dtype: Any = None,
+) -> Path:
+    """PEFT adapter（目录或 ``adapter_model.safetensors``）→ 项目自己的 ``.pt``。
+
+    刻意存成 ``{"model": {...}}`` 而不是裸的 ``{键: 张量}``：项目里读 adapter
+    的地方走的都是 `load_checkpoint`，它只在 payload 里找 ``"model"`` 这一层，
+    裸字典会被**静默跳过**（一个参数都不载入、还没有报错）。
+
+    adapter 目录里有 ``adapter_config.json`` 时，顺便把它记进 payload 的
+    ``lora_config``：rank 能从 ``lora_A`` 的形状反推，**alpha 不能**，而它决定
+    缩放系数 alpha/r —— 不记下来的话，这条路走回 PEFT 时只能靠人记得传对。
+    """
+    import torch
+    from safetensors.torch import load_file
+
+    adapter_path = Path(adapter_path)
+    source = (
+        adapter_path / "adapter_model.safetensors" if adapter_path.is_dir() else adapter_path
+    )
+    if not source.exists():
+        raise FileNotFoundError(f"找不到 adapter 权重：{source}")
+
+    state = peft_to_lora_state(load_file(str(source)), dtype=dtype)
+    config = _read_adapter_config(adapter_path)
+    payload: Dict[str, Any] = {"model": state, "only_trainable": True}
+    if config:
+        claimed = config.get("r")
+        actual = next(
+            int(t.shape[0]) for name, t in state.items() if name.endswith("lora_A.weight")
+        )
+        if claimed is not None and int(claimed) != actual:
+            logger.warning(
+                "adapter_config.json 声称 r=%s，实际 rank=%d —— 以实际形状为准",
+                claimed, actual,
+            )
+        payload["lora_config"] = config
+        logger.info(
+            "已记下 lora_config：r=%d alpha=%s（导回 PEFT 时会直接用它）",
+            actual, config.get("lora_alpha"),
+        )
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, out_path)
+    logger.info("PEFT adapter 已转成 %s（%d 个张量）", out_path, len(state))
+    return out_path
+
+
+def _read_adapter_config(adapter_path: Path) -> Dict[str, Any]:
+    """读 PEFT 的 ``adapter_config.json``；读不到（或坏了）就返回空字典。
+
+    这里刻意不抛异常：没有配置文件照样能转（rank 从形状推），只是丢掉了 alpha
+    这一项，调用方按"缺 alpha"处理即可。
+    """
+    path = adapter_path / "adapter_config.json" if adapter_path.is_dir() else None
+    if path is None or not path.exists():
+        return {}
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:  # noqa: BLE001 —— 坏配置不该让转换失败
+        logger.warning("adapter_config.json 读不了（%s），按无配置处理", exc)
+        return {}
+    return config if isinstance(config, dict) else {}

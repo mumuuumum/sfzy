@@ -59,6 +59,7 @@ from sfzy.rl.reward import RESULT_MARKERS
 from sfzy.rl.reward_spec import RewardSpec
 from sfzy.sft.checkpoint import load_checkpoint, prune_checkpoints, save_checkpoint
 from sfzy.sft.infer import generate_batch
+from sfzy.sft.lr_scheduler import get_lr
 from sfzy.eval.rouge import score_corpus
 from sfzy.utils.logging import get_logger
 from sfzy.utils.tracking import group_metrics
@@ -248,6 +249,9 @@ class GRPOTrainer:
         self.max_skipped_steps = int(rl.get("max_skipped_steps", 0) or 0)  # 0 = 自动
         # `SFZY_PROFILE=1` 时，step() 会把本步各阶段耗时写进这里（默认 None）
         self._prof: Optional[Dict[str, float]] = None
+        # 下一个存档点（`>=` 语义，见 `_save_if_due`）。train() 开头按
+        # `state.step` 算出，续训时不会重存已经存过的那一步。
+        self._next_save_step: int = 0
 
         # ---- SFT 基线锚：防止策略整体退化，见 grpo.group_mask ----
         anchor = rl.get("anchor") or {}
@@ -322,10 +326,67 @@ class GRPOTrainer:
                     "  要么换裁判，要么把对应的 reward term 关掉。"
                 )
 
+        # ---- 学习率：默认恒定，可切成 SFT 那套 warmup + cosine ----
+        #
+        # 之前 GRPO 全程只有一个 lr（AdamW 建好之后再没被改过）。这和 SFT 阶段
+        # 不一致，而两处不一致会带来一个很实际的麻烦：RL 是在 SFT 的 LoRA 上
+        # 继续走，SFT 结尾的学习率已经被余弦衰减得很小，GRPO 却直接从峰值起步。
+        #
+        # 这里复用 **同一个** `sfzy.sft.lr_scheduler.get_lr`（纯函数、已有测试），
+        # 不引入 torch.optim.lr_scheduler —— 它是无状态的，续训不需要额外存档。
+        self.base_lr = _as_learning_rate(rl.get("learning_rate", 1e-5))
+        raw_warmup = rl.get("warmup_ratio", None)
+        raw_min_lr = rl.get("min_lr_ratio", None)
+        # `lr_schedule` 没写时**不默认成 cosine**：老配置必须保持"恒定 lr"这个
+        # 行为（一堆实验脚本和冒烟测试都建在它上面）。但只要给了 warmup_ratio /
+        # min_lr_ratio，就当调用方是要开调度 —— 否则那两个键会被静默忽略，
+        # 而"以为在 warmup，实际一直满速"正是最难从日志里看出来的那种错。
+        # 两个拼法都收：GRPO 这边的规范名是 `lr_schedule`，而 SFT 的配置里写的是
+        # `lr_scheduler`（`configs/sft.yaml`）—— 从 SFT 抄参数的人多半会照抄那个
+        # 拼法，而"键名差一个字母 ⇒ 静默按恒定 lr 跑"正是这里最不想发生的事。
+        raw_schedule = rl.get("lr_schedule", None)
+        alias = rl.get("lr_scheduler", None)
+        if raw_schedule is not None and alias is not None and (
+            str(raw_schedule).lower() != str(alias).lower()
+        ):
+            raise ValueError(
+                f"rl.lr_schedule={raw_schedule!r} 与 rl.lr_scheduler={alias!r} "
+                "同时存在且不一致 —— 留一个就好。"
+            )
+        if raw_schedule is None:
+            raw_schedule = alias
+        if raw_schedule is None:
+            self.lr_schedule = (
+                "cosine"
+                if ((raw_warmup or 0) > 0 or (raw_min_lr or 0) > 0)
+                else "constant"
+            )
+            if self.lr_schedule == "cosine":
+                logger.info(
+                    "没写 rl.lr_schedule，但给了 warmup_ratio/min_lr_ratio "
+                    "→ 按 cosine 调度（想恒定就写 lr_schedule: constant）"
+                )
+        else:
+            self.lr_schedule = str(raw_schedule).lower()
+        if self.lr_schedule not in ("constant", "cosine"):
+            raise ValueError(
+                f"rl.lr_schedule 只支持 constant / cosine，收到 {raw_schedule!r}"
+            )
+        # cosine 下 warmup 的默认值取 0.03（与 SFT 的配置、`get_lr` 的默认一致）；
+        # min_lr_ratio 默认 0.0（衰减到 0）。显式写了就用显式值。
+        default_warmup = 0.03 if self.lr_schedule == "cosine" else 0.0
+        self.warmup_ratio = float(raw_warmup if raw_warmup is not None else default_warmup)
+        self.min_lr_ratio = float(raw_min_lr if raw_min_lr is not None else 0.0)
+        for name, value in (("warmup_ratio", self.warmup_ratio),
+                            ("min_lr_ratio", self.min_lr_ratio)):
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"rl.{name} 必须落在 [0, 1]，收到 {value}")
+        # 调度的**分母**（总优化器更新次数）。只有 train() 知道总步数，直接调
+        # step()（测试、调试）时保持 None ⇒ 退化成恒定 lr，不猜一个总步数。
+        self._total_updates: Optional[int] = None
+
         trainable = [p for p in model.parameters() if p.requires_grad]
-        self.optimizer = torch.optim.AdamW(
-            trainable, lr=_as_learning_rate(rl.get("learning_rate", 1e-5))
-        )
+        self.optimizer = torch.optim.AdamW(trainable, lr=self.base_lr)
         self.device = next(model.parameters()).device
         self.state = RLState()
 
@@ -511,6 +572,62 @@ class GRPOTrainer:
         return None
 
     # ------------------------------------------------------------------
+    def _updates_done(self) -> int:
+        """本步开始时已经做完多少次**优化器更新**（按 μ 折算）。
+
+        用"更新次数"而不是"训练步数"做调度的坐标，理由有两个：
+
+        1. 这才和 SFT 等价 —— SFT 里 1 步 = 1 次更新，warmup_ratio 的语义是
+           "前百分之几的**优化步**"；μ=2 时一次训练步含 2 次更新，若按步数算，
+           warmup 覆盖的真实更新数会翻倍。
+        2. 跳过的（OOM）步没有更新，必须减掉 —— 否则跳过 20% 的步就等于把
+           调度刻度凭空往前推 20%，而曲线看上去一切正常。
+
+        中途失败的那一步最多差 μ-1 次更新（第 1 次更新做完、第 2 次 OOM），
+        量级可忽略。续训时 `state.step` / `state.skipped_steps` 都会恢复，
+        且总步数由 prompt 池重新算出，所以**不需要额外的 scheduler 状态**。
+        """
+        steps_done = max(0, int(self.state.step) - int(self.state.skipped_steps))
+        return steps_done * self.inner_iterations
+
+    def _lr_for_update(self, update_index: int) -> float:
+        """第 `update_index` 次优化器更新（0 起）应当使用的学习率。
+
+        constant 模式下也返回 `base_lr`（而不是"什么都不动"）：这样"学习率来自
+        配置"这一条在两个模式下都成立 —— 续训时如果改了 `rl.learning_rate`，
+        生效的是新值，而不是从 checkpoint 的 param_groups 里复活旧值
+        （那会让你改了配置、重启，却发现学习率没变，且日志上看不出原因）。
+        """
+        if self.lr_schedule == "constant" or self._total_updates is None:
+            return self.base_lr
+        return get_lr(
+            update_index, self._total_updates, self.base_lr,
+            self.warmup_ratio, self.min_lr_ratio,
+        )
+
+    def _log_lr_plan(self, n_steps: int) -> None:
+        """把"这次学习率到底怎么走"在开跑前写清楚。"""
+        total = max(1, n_steps) * self.inner_iterations
+        if self.lr_schedule == "constant":
+            logger.info(
+                "学习率：恒定 %.3e（未开调度；要 warmup+cosine 就写 "
+                "rl.lr_schedule: cosine）", self.base_lr,
+            )
+            return
+        warmup_updates = int(total * self.warmup_ratio)
+        logger.info(
+            "学习率：cosine —— 前 %d 次更新从 0 线性升到峰值 %.3e，之后余弦衰减到 %.3e；"
+            "共 %d 次更新（%d 步 × μ%d）",
+            warmup_updates, self.base_lr, self.base_lr * self.min_lr_ratio,
+            total, n_steps, self.inner_iterations,
+        )
+        if self.warmup_ratio > 0 and warmup_updates == 0:
+            logger.warning(
+                "rl.warmup_ratio=%.3f 在 %d 次更新上被 int() 截成 0 —— warmup 形同"
+                "虚设（短 run 常见）。要么加大总步数，要么用 warmup_ratio: 0 明确关掉。",
+                self.warmup_ratio, total,
+            )
+
     def _inner_update(
         self,
         batch: Dict[str, Any],
@@ -519,6 +636,7 @@ class GRPOTrainer:
         ref_logprobs: Optional[torch.Tensor],
         want_entropy: bool = False,
         prof: Optional[Dict[str, float]] = None,
+        lr: Optional[float] = None,
     ) -> Dict[str, Any]:
         """μ 循环的循环体：策略 logprob → GRPO loss(+KL) → 反传 → 裁剪 → 更新一步。
 
@@ -578,6 +696,11 @@ class GRPOTrainer:
             grad_norm_preclip = float(torch.nn.utils.clip_grad_norm_(
                 [p for p in self.model.parameters() if p.requires_grad], self.max_grad_norm
             ))
+            # 学习率在这里写进 param_group：AdamW 只在 step() 读它，而一次
+            # _inner_update 恰好是一次优化器更新 —— 调度的最小刻度就是这个函数。
+            if lr is not None:
+                for group in self.optimizer.param_groups:
+                    group["lr"] = lr
             self.optimizer.step()
 
         return {
@@ -845,10 +968,15 @@ class GRPOTrainer:
             lora_before = snapshot or None
 
         # ---- μ 次内层更新（μ=1 时与改动前逐步等价）----
+        #
+        # 学习率按**优化器更新次数**走：μ 次内层更新各取一个调度刻度，所以
+        # μ=2 时一次训练步会跨 2 个刻度（步内 lr 微调一点，量级很小但口径清楚）。
+        updates_done = self._updates_done()
+        lrs = [self._lr_for_update(updates_done + it) for it in range(self.inner_iterations)]
         iters = [
             self._inner_update(
                 batch, old_logprobs, advantages, ref_logprobs,
-                want_entropy=want_entropy and it == 0, prof=prof,
+                want_entropy=want_entropy and it == 0, prof=prof, lr=lrs[it],
             )
             for it in range(self.inner_iterations)
         ]
@@ -911,6 +1039,9 @@ class GRPOTrainer:
             "judge_missing": judge_missing,
             "gating_rate": gate_stats.get("gated", 0) / max(gate_stats.get("total", 1), 1),
             "output_len_mean": float(lengths.mean()),
+            # 本步**第一次**更新用的 lr（μ=1 时就是全部；μ>1 时步内会微调一点点）。
+            # 上报给监控的也是它，所以 `train/learning_rate` 曲线上的台阶就是调度。
+            "learning_rate": float(lrs[0]),
         }
         # reward_std 是整个 batch 的标准差，只有在 prompts_per_step=1 时才等于
         # 组内标准差。GRPO 真正要的是**组内**方差（组间差异会被归一化消掉），
@@ -979,7 +1110,9 @@ class GRPOTrainer:
             grad_norm_preclip=grad_norm_preclip,
             grad_norm_postclip=grad_norm_postclip,
             clip_applied=clip_applied,
-            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+            # 本步起点（第一次更新）的 lr —— 与 metrics 里的 `learning_rate` 取同一个值，
+            # 免得日志与面板上出现两个"学习率"却没写清是步内哪一次。
+            learning_rate=float(lrs[0]),
             clip_ratio=float(self.clip_ratio),
             fact_gate_enabled=self.reward_spec.fact_error_gate_enabled,
             upper_length_ratio=upper_ratio,
@@ -1006,11 +1139,18 @@ class GRPOTrainer:
             self.prepare_baseline(prompts)
         n_steps = len(prompts) // self.prompts_per_step
         self.monitor.set_total_steps(max(1, n_steps))
+        # 学习率调度的分母：**更新次数**（μ 折算）。开跑前就打清楚，这样"这一轮
+        # 到底有没有 warmup、峰值是多少、什么时候衰减到 0"在日志开头就能看见。
+        # 注意它是由 **prompt 池** 重算出来的：续训时必须用同一份 prompt 池，
+        # 否则刻度会整体平移（曲线会在接续处跳一下，而日志里看不出原因）。
+        self._total_updates = max(1, n_steps) * self.inner_iterations
         logger.info(
             "GRPO 开始: %d 个 prompt，每步 %d 个，共 %d 步，G=%d，μ=%d（共 %d 次梯度更新）",
             len(prompts), self.prompts_per_step, n_steps, self.group_size,
             self.inner_iterations, n_steps * self.inner_iterations,
         )
+        if self.is_main_process:
+            self._log_lr_plan(n_steps)
         # 验证集调度：x 个分位点 = "把 n 步等分成 x 段"，最后一点落在最后一步，
         # 保证训练结束时的模型一定会被评到（也一定有机会成为 best.pt）。
         if self.monitor.cfg.eval_enabled and self.monitor.cfg.eval_data_file:
@@ -1048,72 +1188,45 @@ class GRPOTrainer:
                     self.monitor.cfg.eval_every_n_steps,
                     key or "（save_best=false，不存 best）",
                 )
-        for step in range(self.state.step, n_steps):
-            chunk = prompts[step * self.prompts_per_step:(step + 1) * self.prompts_per_step]
-            try:
-                metrics = self.step(chunk)
-            except Exception as exc:  # noqa: BLE001 —— 下面立刻会判断能不能跳过
-                if not (self.skip_on_oom and _is_oom_like(exc)):
-                    raise
-                self.state.skipped_steps += 1
-                self.state.step = step + 1
-                limit = self.max_skipped_steps or max(3, n_steps // 100)
+        # 存档计划：开跑前就写清楚"下次第几步存、留几个"，省得事后靠翻目录猜。
+        self._next_save_step = self._next_save_point(self.state.step)
+        logger.info(
+            "存档：每 %s 步一次（跳过的步也会照常存，见 _save_if_due），保留最近 %d 个%s",
+            self.save_every_n_steps or "（关闭周期性存档，只在结束时存）",
+            self.keep_last_n,
+            f"；下一次第 {self._next_save_step} 步（续训时不重存已存过的那一步）"
+            if self._next_save_step else "",
+        )
+        try:
+            for step in range(self.state.step, n_steps):
+                self._run_one_step(step, prompts, n_steps)
+                # 存档检查放在**两条路的汇合处**（正常运行与 OOM 跳过之后都走这里）：
+                # 以前它在 `continue` 之后，跳过的步会把存档点吃掉。
+                self._save_if_due()
+        except BaseException as exc:  # 含 KeyboardInterrupt / SystemExit，后面原样抛出
+            # 崩了也要留一份应急快照 —— 否则最后一次定期存档之后的全部进度归零。
+            # 真实事故：500/1000 两个存档点被 OOM 跳过，1300 步崩掉，10 小时零产物。
+            if self.is_main_process:
                 logger.error(
-                    "第 %d 步因显存不足被跳过（已跳过 %d/%d 步）：%s: %s\n"
-                    "  → 这一步的 rollout/裁判开销已经花掉了；模型没有更新。",
-                    step + 1, self.state.skipped_steps, limit,
+                    "训练异常中断（%s: %s），落一份应急存档…",
                     type(exc).__name__, str(exc).splitlines()[0][:200],
                 )
-                # 清干净：反传中途失败时 .grad 是半累积的，缓存里也可能留着碎片
-                self.optimizer.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                if self.rollout_backend is not None:
-                    # 若引擎子进程死在 OOM 上，重建它（下一次 generate 会重新初始化，
-                    # 约 35s）。宁可多花这 35s 也别让后续每一步都失败。
-                    try:
-                        self.rollout_backend.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if self.state.skipped_steps >= limit:
-                    raise RuntimeError(
-                        f"跳过的步数达到上限 {limit}（本 run 共 {n_steps} 步）。\n"
-                        "  这说明显存预算根本不够，而不是偶发碎片 —— 静默跳过等于把"
-                        "长样本从数据集里删掉。请调小这些参数后重跑：\n"
-                        "    rl.max_length（每减 1024 约省 3~6G）\n"
-                        "    rl.prompts_per_step 2→1（省约 13G）\n"
-                        "    rl.vllm.extra_llm_kwargs: {enforce_eager: true}（省约 1G）\n"
-                        "  详见上一轮给出的显存清单。"
-                    ) from exc
-                continue
-            self.state.step = step + 1
-
-            if self.is_main_process and self.monitor.eval_due(self.state.step):
-                eval_result = self._run_eval(self.state.step)
-                if eval_result:
-                    # 先决定要不要更新 best.pt，再并入上报指标（顺序无关，但这里
-                    # 写在前面，日志里"刷新最好成绩"会紧跟在那行验证日志之后）。
-                    self._maybe_save_best(eval_result, self.state.step)
-                    self._last_monitor_metrics.update(eval_result)
-
-            if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
-                self.state.history.append({"step": self.state.step, **metrics})
-                self._log_step(self.state.step, n_steps, metrics)
-                if self.tracker is not None:
-                    # 只上报监控层产出的**完整分组指标**（`模块/指标`），
-                    # 避免与 history 里的扁平键重复成两条曲线。
-                    self.tracker.log(
-                        group_metrics(dict(self._last_monitor_metrics)), self.state.step
+                try:
+                    path = self.save()
+                    logger.error(
+                        "应急存档已写出：%s。用 rl.resume_from 指到它就能接着跑。", path,
                     )
-
-            if self.is_main_process and self.state.step % self.save_every_n_steps == 0:
+                except Exception as save_exc:  # noqa: BLE001 —— 别让存档失败盖住原异常
+                    logger.error("应急存档也失败了（%s）", save_exc)
+            raise
+        else:
+            if self.is_main_process:
                 self.save()
-
-        if self.is_main_process:
-            self.save()
-        # 收尾：vLLM 引擎的显存不回收会一直占着（下次同卡启动会 OOM）
-        if self.rollout_backend is not None:
-            self.rollout_backend.close()
+        finally:
+            # 收尾：vLLM 引擎的显存不回收会一直占着（下次同卡启动会 OOM）。
+            # 放在 finally —— 崩掉时同样要收，否则下一次跑会在同一张卡上撞 OOM。
+            if self.rollout_backend is not None:
+                self.rollout_backend.close()
         if self.state.skipped_steps:
             logger.warning(
                 "本次 run 有 %d 步因显存不足被跳过（占总步数的 %.2f%%）——"
@@ -1122,6 +1235,75 @@ class GRPOTrainer:
                 100.0 * self.state.skipped_steps / max(n_steps, 1),
             )
         return self.state
+
+    # ------------------------------------------------------------------
+    def _run_one_step(
+        self, step: int, prompts: List[Dict[str, Any]], n_steps: int
+    ) -> Optional[Dict[str, float]]:
+        """跑一步并做逐步的监控/验证；返回该步指标，被跳过时返回 None。
+
+        从 `train()` 里拆出来只有一个原因：**让"跳过"这条路不再 `continue`**，
+        而是和正常路径汇合，从而共享后面的存档检查（见 `_save_if_due`）。
+        """
+        chunk = prompts[step * self.prompts_per_step:(step + 1) * self.prompts_per_step]
+        try:
+            metrics: Optional[Dict[str, float]] = self.step(chunk)
+        except Exception as exc:  # noqa: BLE001 —— 下面立刻会判断能不能跳过
+            if not (self.skip_on_oom and _is_oom_like(exc)):
+                raise
+            self.state.skipped_steps += 1
+            # 跳过的步也算"走过"（与改动前一致）：续训时不会重跑它，
+            # 否则同一篇长文书会再次 OOM，一步都推不动。
+            self.state.step = step + 1
+            limit = self.max_skipped_steps or max(3, n_steps // 100)
+            logger.error(
+                "第 %d 步因显存不足被跳过（已跳过 %d/%d 步）：%s: %s\n"
+                "  → 这一步的 rollout/裁判开销已经花掉了；模型没有更新。",
+                step + 1, self.state.skipped_steps, limit,
+                type(exc).__name__, str(exc).splitlines()[0][:200],
+            )
+            # 清干净：反传中途失败时 .grad 是半累积的，缓存里也可能留着碎片
+            self.optimizer.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if self.rollout_backend is not None:
+                # 若引擎子进程死在 OOM 上，重建它（下一次 generate 会重新初始化，
+                # 约 35s）。宁可多花这 35s 也别让后续每一步都失败。
+                try:
+                    self.rollout_backend.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.state.skipped_steps >= limit:
+                raise RuntimeError(
+                    f"跳过的步数达到上限 {limit}（本 run 共 {n_steps} 步）。\n"
+                    "  这说明显存预算根本不够，而不是偶发碎片 —— 静默跳过等于把"
+                    "长样本从数据集里删掉。请调小这些参数后重跑：\n"
+                    "    rl.max_length（每减 1024 约省 3~6G）\n"
+                    "    rl.prompts_per_step 2→1（省约 13G）\n"
+                    "    rl.vllm.extra_llm_kwargs: {enforce_eager: true}（省约 1G）\n"
+                    "  详见上一轮给出的显存清单。"
+                ) from exc
+            return None
+        self.state.step = step + 1
+
+        if self.is_main_process and self.monitor.eval_due(self.state.step):
+            eval_result = self._run_eval(self.state.step)
+            if eval_result:
+                # 先决定要不要更新 best.pt，再并入上报指标（顺序无关，但这里
+                # 写在前面，日志里"刷新最好成绩"会紧跟在那行验证日志之后）。
+                self._maybe_save_best(eval_result, self.state.step)
+                self._last_monitor_metrics.update(eval_result)
+
+        if self.is_main_process and (step + 1) % self.log_every_n_steps == 0:
+            self.state.history.append({"step": self.state.step, **metrics})
+            self._log_step(self.state.step, n_steps, metrics)
+            if self.tracker is not None:
+                # 只上报监控层产出的**完整分组指标**（`模块/指标`），
+                # 避免与 history 里的扁平键重复成两条曲线。
+                self.tracker.log(
+                    group_metrics(dict(self._last_monitor_metrics)), self.state.step
+                )
+        return metrics
 
     # ------------------------------------------------------------------
     def _log_profile(
@@ -1237,6 +1419,9 @@ class GRPOTrainer:
             f"|g| {m['grad_norm']:.2f}",
             f"len {m['output_len_mean']:.0f}",
         ]
+        if self.lr_schedule != "constant" and "learning_rate" in m:
+            # 开了调度才打这一列：恒定时它是个常数，白占地方。
+            parts.append(f"lr {m['learning_rate']:.2e}")
         mu = int(m.get("inner_iterations", 1))
         if mu > 1:
             # 内层漂移的读数：clip 从第 1 次迭代（ρ≡1，必然 0%）到第 μ 次的变化。
@@ -1362,6 +1547,40 @@ class GRPOTrainer:
         return metrics
 
     # ------------------------------------------------------------------
+    def _next_save_point(self, current_step: int) -> int:
+        """从 `current_step` 往后数，下一个存档点的步号（`save_every_n_steps` ≤ 0 时返回 0）。
+
+        续训时传入 checkpoint 里的 `state.step`，于是"已经存过的那一步"不会被重存
+        （例如从 step_000500.pt 续训 → 下一个点是 1000，而不是 500）。
+        """
+        every = int(self.save_every_n_steps or 0)
+        if every <= 0:
+            return 0
+        return (int(current_step) // every + 1) * every
+
+    def _save_if_due(self) -> bool:
+        """到存档点就存一份，返回是否真的存了。
+
+        **判定用 `>=` 而不是 `步号 % N == 0`。** 后者有一个会静默丢数据的坑：
+        跳过（OOM）的步号如果正好是 N 的倍数，等号判定就再也命中不了那个点，
+        「第 500 步的存档」永久消失 —— 而日志里只会看到一条"因显存不足被跳过"，
+        看起来和"存档没生效"是两回事。真实事故：一次 run 的 500、1000 两个存档点
+        恰好都被 OOM 跳过，于是 10 小时的训练一个 checkpoint 都没留下。
+        改成 `>=` 之后，跳过的步只会让存档**晚**一点落盘，不会让存档点消失。
+
+        刻度是**训练步数**（不是 μ 折算的优化器更新次数，那是学习率调度用的）：
+        存档的目的是"崩了能回到最近的快照"，跳过的步也算走过的时间，所以它和
+        学习率调度故意用不同的坐标。
+        """
+        if not self.is_main_process:
+            return False
+        point = self._next_save_step
+        if not point or self.state.step < point:
+            return False
+        self.save()
+        self._next_save_step = self._next_save_point(self.state.step)
+        return True
+
     def save(self, tag: str = "last") -> Path:
         if not self.is_main_process:
             return Path()
@@ -1373,7 +1592,19 @@ class GRPOTrainer:
         )
         save_checkpoint(path=path, model=self.model, optimizer=self.optimizer,
                         state=self.state, only_trainable=True)
-        prune_checkpoints(ckpt_dir=self.output_dir, keep_last_n=self.keep_last_n)
+        removed = prune_checkpoints(ckpt_dir=self.output_dir, keep_last_n=self.keep_last_n)
+        # 存档必须留痕：这个函数以前一行日志都没有，于是"到底存没存"只能靠翻目录，
+        # 而目录里还混着 vLLM 热交换的 adapter 槽位（每步都在变），很容易看错。
+        try:
+            size_mib = path.stat().st_size / 2 ** 20
+            size_text = f"{size_mib:.1f} MiB"
+        except OSError:
+            size_text = "大小未知"
+        logger.info(
+            "已存档 %s（%s%s）",
+            path, size_text,
+            f"，清理旧存档 {removed} 个（保留最近 {self.keep_last_n} 个）" if removed else "",
+        )
         return path
 
     def resume(self, path: Optional[str] = None) -> RLState:

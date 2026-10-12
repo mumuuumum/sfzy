@@ -117,7 +117,7 @@
 |---|---|
 | `train/loss` | 实际反向的总损失（含 KL） |
 | `train/policy_loss` | GRPO 策略损失（`grpo_loss` 返回，未加 KL） |
-| `train/learning_rate` | `optimizer.param_groups[0]["lr"]` |
+| `train/learning_rate` | 本步**第一次**优化器更新用的 lr（`optimizer.param_groups[0]["lr"]`）。`rl.lr_schedule=cosine` 时它就是调度曲线上的台阶；μ>1 时步内还会有 μ−1 次更小的变化，面板上不体现（见 `docs/rl_pipeline.md` 的学习率调度一节） |
 | `train/grad_norm_preclip` | `clip_grad_norm_` 返回的裁剪前总范数 |
 | `train/grad_norm_postclip` | `min(preclip, max_grad_norm)` |
 | `train/gradient_clip_applied_rate` | 本步是否触发裁剪（1/0） |

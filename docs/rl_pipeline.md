@@ -158,3 +158,44 @@ python scripts/train_grpo.py --config configs/grpo_fact_judge.yaml \
 这时 `reward.total = 0.3·ROUGE-L + 0.7·fact_judge`，`fact_judge` 是
 `sfzy/judge/` 那套 Judge 的加权分（∈ [0,1]），规则事实提取完全不跑。
 数据流、日志字段、失败降级见 `docs/fact_judge.md` 第 6 节。
+
+### 学习率调度（warmup + cosine，与 SFT 同一套）
+
+**默认是恒定学习率**（老配置的行为不变）。要用 SFT 那套 warmup + 余弦衰减，
+在 `rl:` 下加三行即可（`configs/grpo_fact_coverage_vGPU48.yaml` 已开）：
+
+```yaml
+  learning_rate: 1e-6      # 峰值
+  lr_schedule: cosine      # constant（默认）| cosine
+  warmup_ratio: 0.03       # 前 3% 次更新从 0 线性升到峰值
+  min_lr_ratio: 0.0        # 衰减下限 = learning_rate × 这个比例（0.1 = 末期留 10%）
+```
+
+实现复用 `sft/lr_scheduler.py` 的同一个纯函数 `get_lr`，所以两阶段的曲线形状、
+边界连续性（warmup 末点正好等于峰值）完全一致。三个要点：
+
+1. **刻度是"优化器更新次数"，不是训练步数。** SFT 里 1 步 = 1 次更新；
+   GRPO 有 μ（`rl.inner_iterations`），一次训练步含 μ 次更新，所以
+   `warmup_ratio` 覆盖的是**更新次数**的前百分之几（vGPU48：n≈10738 步 × μ2
+   = 21476 次更新 → warmup 约 644 次 ≈ 322 步）。
+2. **OOM 被跳过的步不推进刻度**（它没有更新），续训按 `state.step −
+   state.skipped_steps` 接着走。
+3. **调度是无状态纯函数**，不用往 checkpoint 里塞 scheduler 状态；但
+   `total_steps` 由 prompt 池算出，**续训必须用同一份 prompt 池**，否则刻度会平移。
+
+开跑时日志会把计划打出来（`学习率：cosine —— 前 N 次更新…`），步日志里多一列
+`lr`，面板上看 `train/learning_rate`（本步第一次更新用的 lr）。
+
+**为什么 RL 也要衰减**：GRPO 是在 SFT 的 LoRA 上继续走，而 SFT 结尾的 lr 已被
+余弦衰减得很低；若 RL 从峰值恒速跑到底，等于在接近最优点的地方又满速推一次。
+另外 `warmup` 对 RL 还有一层意义：最初几步 advantage 的尺度、裁判的噪声都还没
+被摸清，小步试探比满速更稳。
+
+只给了 `warmup_ratio` 却没写 `lr_schedule` 时，>0 的那个键会**自动**开启
+cosine（否则键被静默忽略，正是最难从日志里看出来的错）。显式写
+`lr_schedule: cosine` 时，`warmup_ratio` 默认取 0.03。
+
+`lr_scheduler`（SFT 配置里的拼法）也认，两个同时写且不一致会直接报错。
+顺带一提：`configs/sft.yaml` 里那行 `lr_scheduler: cosine` **其实没人读**
+—— SFT 训练器每一步都无条件调用 `get_lr`，所以 SFT 侧一直是 warmup + cosine，
+没有"恒定"这个选项；RL 侧才需要有开关，因为它的默认行为（恒定）已经跑了很多轮。

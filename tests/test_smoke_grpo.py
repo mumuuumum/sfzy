@@ -415,3 +415,108 @@ def test_基线锚_训练时不误伤(tmp_path):
     state = trainer.train(make_prompts(2, with_sft=True))
     assert state.step == 1
     assert trainer.state.history[0]["total_groups"] == 2
+
+
+# ---------------------------------------------------------------- 学习率调度
+
+def _lrs(trainer) -> list:
+    return [h["learning_rate"] for h in trainer.state.history]
+
+
+def test_默认学习率恒定_老配置行为不变(tmp_path):
+    """没写 lr_schedule / warmup_ratio 时必须是恒定 lr —— 一堆实验建在这个行为上。"""
+    trainer = make_trainer(tmp_path, learning_rate=1e-3)
+    assert trainer.lr_schedule == "constant"
+    trainer.train(make_prompts(6))
+    assert _lrs(trainer) == [pytest.approx(1e-3)] * 3
+
+
+def test_cosine调度按优化器更新次数推进(tmp_path):
+    """μ=2、3 步 ⇒ 6 个调度刻度；每步上报的是**该步第一次更新**用的 lr。"""
+    from sfzy.sft.lr_scheduler import get_lr
+
+    base, min_ratio, mu = 1e-3, 0.5, 2
+    trainer = make_trainer(
+        tmp_path, learning_rate=base, inner_iterations=mu,
+        lr_schedule="cosine", warmup_ratio=0.0, min_lr_ratio=min_ratio,
+    )
+    trainer.train(make_prompts(6))
+    total = 3 * mu
+    assert trainer._total_updates == total
+    expect = [get_lr(k * mu, total, base, 0.0, min_ratio) for k in range(3)]
+    assert _lrs(trainer) == [pytest.approx(x) for x in expect]
+    assert expect[-1] < base, "cosine 应该真的在衰减"
+
+
+def test_warmup阶段从零线性升到峰值(tmp_path):
+    from sfzy.sft.lr_scheduler import get_lr
+
+    base = 1e-3
+    trainer = make_trainer(
+        tmp_path, learning_rate=base, lr_schedule="cosine",
+        warmup_ratio=0.5, min_lr_ratio=0.0,
+    )
+    trainer._total_updates = 6            # warmup = 3 次更新
+    assert trainer._lr_for_update(0) < trainer._lr_for_update(1) < trainer._lr_for_update(2)
+    assert trainer._lr_for_update(2) == pytest.approx(base)      # warmup 末点 = 峰值
+    assert trainer._lr_for_update(1) == pytest.approx(get_lr(1, 6, base, 0.5, 0.0))
+
+
+def test_只给warmup_ratio也会自动开cosine(tmp_path):
+    """键给了却被静默忽略是最坏的结果：给了 warmup 就必须真的在 warmup。"""
+    trainer = make_trainer(tmp_path, warmup_ratio=0.3)
+    assert trainer.lr_schedule == "cosine"
+    assert trainer.warmup_ratio == 0.3
+
+
+def test_cosine下warmup默认3个百分点(tmp_path):
+    trainer = make_trainer(tmp_path, lr_schedule="cosine")
+    assert trainer.warmup_ratio == pytest.approx(0.03)   # 与 SFT 配置一致
+    assert trainer.min_lr_ratio == 0.0
+
+
+def test_直接调step时不猜总步数_退化成恒定(tmp_path):
+    """没走 train()（测试/调试）时总步数未知 —— 宁可恒定，也不要按错的分母调度。"""
+    trainer = make_trainer(tmp_path, learning_rate=1e-3, lr_schedule="cosine",
+                           warmup_ratio=0.5)
+    metrics = trainer.step(make_prompts())
+    assert metrics["learning_rate"] == pytest.approx(1e-3)
+    assert trainer.optimizer.param_groups[0]["lr"] == pytest.approx(1e-3)
+
+
+def test_跳过oom的步不推进调度刻度(tmp_path):
+    """跳过的步没有更新：刻度要跟着"做过多少次更新"走，否则会凭空提前衰减。"""
+    trainer = make_trainer(tmp_path, inner_iterations=2, lr_schedule="cosine")
+    trainer._total_updates = 20
+    trainer.state.step, trainer.state.skipped_steps = 5, 2
+    assert trainer._updates_done() == 6          # (5-2)×2，而不是 5×2
+
+
+def test_学习率只依赖已做更新数_续训不需要额外存档(tmp_path):
+    """调度是无状态纯函数：同一刻度上，无论跑过几轮，lr 都一样。"""
+    a = make_trainer(tmp_path, lr_schedule="cosine", warmup_ratio=0.1, min_lr_ratio=0.2)
+    b = make_trainer(tmp_path, lr_schedule="cosine", warmup_ratio=0.1, min_lr_ratio=0.2)
+    a._total_updates = b._total_updates = 100
+    a.state.step = 7                               # 模拟"续训到第 7 步"
+    assert a._lr_for_update(7) == pytest.approx(b._lr_for_update(7))
+
+
+def test_非法lr_schedule直接报错(tmp_path):
+    with pytest.raises(ValueError, match="lr_schedule 只支持"):
+        make_trainer(tmp_path, lr_schedule="linear")
+
+
+def test_从SFT抄来的lr_scheduler键名也认(tmp_path):
+    """`configs/sft.yaml` 里写的是 lr_scheduler —— 差一个字母就静默失效最要命。"""
+    trainer = make_trainer(tmp_path, lr_scheduler="cosine", warmup_ratio=0.1)
+    assert trainer.lr_schedule == "cosine"
+
+
+def test_两种拼法冲突时报错(tmp_path):
+    with pytest.raises(ValueError, match="同时存在且不一致"):
+        make_trainer(tmp_path, lr_schedule="cosine", lr_scheduler="constant")
+
+
+def test_非法warmup_ratio直接报错(tmp_path):
+    with pytest.raises(ValueError, match="warmup_ratio 必须落在"):
+        make_trainer(tmp_path, lr_schedule="cosine", warmup_ratio=1.5)

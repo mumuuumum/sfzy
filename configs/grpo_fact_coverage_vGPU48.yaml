@@ -34,22 +34,14 @@ lora:
 rl:
   output_dir: outputs/grpo_fact_coverage_ee_vGPU48
   prompt_style: structured
-  prompt_file: data/splits/rl_prompts_full.jsonl
+  prompt_file: data/splits/rl_prompts_full_le3072.jsonl
   sft_adapter: /root/autodl-tmp/models/sft/step_000336.pt   # 换成你机器上的路径
   limit_prompts: null
 
   quantize: false            # ★ 必须与 model.load_in_4bit 一致（都为 false = bf16 训练）
 
-  group_size: 4
-  prompts_per_step: 2
-  # ★ 3072：把训练序列宽度封顶在 3072+496≈3568。训练侧峰值 ∝ L（权重固定 +
-  #   检查点激活 + 反传要保留的 fp32 logits）：
-  #     L=3568 → 训练≈26.4G，加 vLLM 13.3G ≈ 41G ✔
-  #     L=4592（max_length 4096）→ ≈45G ✘   L=5496（5000）→ ≈49G ✘
-  #   你上一轮 max_length 设 5000，遇到 p90 以上的长文书就会 OOM。
-  #   代价：>3072 token 的 prompt 会截掉开头（约 7%）。想**零截断**就用
-  #   `tools/select_rl_prompts.py --max-prompt-tokens 3072` 生成过滤后的池子，
-  #   再把 prompt_file 指过去（那样只丢掉那 7%，其余一条不截）。
+  group_size: 8
+  prompts_per_step: 4
   max_length: 3072
   max_new_tokens: 496
   temperature: 0.9
@@ -68,10 +60,17 @@ rl:
   #   代价：内层更新越多，策略离采样点越远、方差越大。日志里 μ>1 会多一列
   #     `μ4 clip 0%→44%`：第 1 次必然 0%，最后一轮才是漂移的真实读数
   #     （最后一轮就几十个百分点 ⇒ μ 开大了）。
-  inner_iterations: 2
-  kl_coef: 0.03
-  length_norm: sqrt
-  learning_rate: 1e-6
+  inner_iterations: 1
+  kl_coef: 0
+  length_norm: none
+  learning_rate: 3e-6
+  # ---- 学习率调度：与 SFT 同一套（warmup + cosine），纯函数 `sft/lr_scheduler.get_lr` ----
+  # 为什么 RL 也要衰减：GRPO 是在 SFT 的 LoRA 上继续走，而 SFT 结尾的 lr 已经被
+  # 余弦衰减到很低；若 RL 从峰值恒速跑到底，等于在接近最优点的地方又满速推一次。
+  lr_schedule: cosine
+  warmup_ratio: 0.03        # 前 3% 次更新从 0 线性升到 learning_rate
+  min_lr_ratio: 0.0         # 衰减下限 = learning_rate × 这个比例（0.0 = 一路衰减到 0）
+                            # 想给后段留一点可塑性就写 0.1：末期 lr = 1e-7
   max_grad_norm: 1.0
 
   save_every_n_steps: 500
@@ -84,7 +83,7 @@ rl:
   # rollout/裁判开销已经花掉，模型不更新）。但**跳太多说明显存预算根本不够**，
   # 那时静默跳过等于把长样本从数据集里删掉 —— 所以超过上限就报错退出。
   skip_on_oom: true
-  max_skipped_steps: null    # null = 自动取 max(3, 总步数的 1%%)
+  max_skipped_steps: 10000    # null = 自动取 max(3, 总步数的 1%%)
 
   # ---- rollout 后端 ----
   # hf  : 训练进程内的模型逐条生成（ChatGLM3 不支持批输入，最慢）
@@ -112,7 +111,9 @@ rl:
     max_loras: 1               # 每步换一个 int_id，旧的按 LRU 淘汰
     # max_model_len: null      # 默认 = rl.max_length + rl.max_new_tokens + 8，且不超模型 seq_length
     # extra_llm_kwargs: {}     # 透传给 vllm.LLM（如 enforce_eager: true 省显存、换更稳的启动）
-
+    extra_llm_kwargs: {
+      enforce_eager: true
+    }
   # ---- 固定验证集：按分位点验证 + 用综合 ROUGE 选最好模型 ----
   # 每次验证：贪心解码（可复现）跑 val 的前 max_samples 条 → 算 ROUGE-1/2/L 与
   # 综合分，以及各裁判信号；`best.pt` 只在综合分刷新时被覆盖。
