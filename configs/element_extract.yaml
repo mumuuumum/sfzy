@@ -1,0 +1,111 @@
+# ============================================================================
+# 用大模型 API 抽三要素 + 逐要素 ROUGE（人工摘要 vs GRPO 候选摘要）
+#
+# 密钥：环境变量 SFZY_ELEMENT_EXTRACT（写在 ~/.bashrc 里也行——本工具会自己去
+#       环境变量文件里补读，因为非交互 shell 不会 source ~/.bashrc）。
+#
+# 跑法：
+#   # 0) 先探活（只发一次最小请求，验证 base_url / 模型名 / 鉴权）
+#   python tools/element_rouge.py --config configs/element_extract.yaml --ping
+#
+#   # 1) 抽几条看看 prompt 效果（不落盘）
+#   python tools/element_rouge.py --config configs/element_extract.yaml \
+#       --ref data/splits/val.jsonl --cand grpo=data/triples/grpo_val_v48.jsonl \
+#       --limit 3 --show
+#
+#   # 2) 全量：人工摘要离线抽一次进缓存，候选摘要现算
+#   python tools/element_rouge.py --config configs/element_extract.yaml \
+#       --ref data/splits/val.jsonl \
+#       --cand grpo=data/triples/grpo_val_v48.jsonl \
+#       --out outputs/element_rouge/val_grpo_v48
+#
+# 注意：抽取结果会被缓存（键含正文 + 模型 + prompt 指纹），改了 prompt 会自动失效。
+# ============================================================================
+
+element_rouge:
+  # ---- 抽取模型：用裁判那套（qwen3.7-flash），与 reward 侧同一个端点/密钥 ----
+  # 同一段摘要、同一个 prompt 的实测（串行、不重试）：
+  #   qwen3.7-flash   4 条 1.0~2.3s 全部解析成功；15 次抽样：中位 1.3s、最慢 1.5s、204 次/分钟
+  #   teleai/xing4.0  3.8/4.5/60s 超时/3.1s，3/4 成功；15 次抽样：中位 7.7s、最慢 36.4s、11 次/分钟
+  # 也就是快约 18 倍，且没有长尾（长尾决定全量跑会不会卡住）。
+  #
+  # 要切回 $SFZY_ELEMENT_EXTRACT（teleai）就把下面那块的注释去掉、把这块注释掉。
+  api:
+    base_url: https://maas.qianwenaiapi.com/compatible-mode/v1
+    model: qwen3.7-flash
+    api_key_env: SFZY_JUDGE_API_KEY
+    timeout_s: 60
+    max_retries: 3
+    concurrency: 16                 # API 是 I/O 密集，并发可以开大点
+    temperature: 0.0                # 抽取要稳定，不要采样
+    max_tokens: 1024                # 它不产思维链：观测 completion 80~220 tokens，1024 足够
+    response_format_json: true      # 供应商支持 json_object 就开着
+    parse_retries: 1                # 回复解析失败时重发一次
+    # Qwen3 系默认**开启思考模式**：不关的话会先产出一大段 reasoning 再给 JSON，
+    # 单次判定慢好几倍，还会把 max_tokens 吃光导致 JSON 被截断。
+    # Model Studio 兼容模式用这个字段关（直接进请求体顶层）。
+    extra_body:
+      enable_thinking: false
+  # api:                            # ← 备选：$SFZY_ELEMENT_EXTRACT（teleai/xing4.0）
+  #   base_url: https://api.tokenplus.cn/v1
+  #   model: teleai/xing4.0-29b-a4b
+  #   api_key_env: SFZY_ELEMENT_EXTRACT
+  #   timeout_s: 180                  # 推理模型单条 20~60s，且有长尾
+  #   max_retries: 3
+  #   concurrency: 16
+  #   temperature: 0.0
+  #   max_tokens: 4096
+  #   response_format_json: true
+  #   parse_retries: 1
+  #   extra_body:
+  #     reasoning_effort: none        # 这个供应商只认 reasoning_effort / thinking
+
+  # --------------------------------------------------------------------------
+  # 抽取 prompt：**这一段由你来写**。
+  #
+  # 契约（两件事必须满足，否则程序会直接报错）：
+  #   1) user 模板里必须有 {summary} 占位符（摘要正文插在这里）；
+  #   2) 要求模型只输出 JSON，键名固定为
+  #      plaintiff_claims / defendant_defenses / court_facts，值为字符串。
+  #
+  # 建议明确"逐字复制"（含标点）：下游拿两边抽出来的要素按字面算 ROUGE，
+  # 模型一旦改写、总结、或顺手去掉标点，量到的就不只是"两份摘要像不像"。
+  #
+  # 如果用的是**推理模型**（如 teleai/xing4.0）：思维链不占 content，但会占预算，
+  # 所以要留足 max_tokens，并建议在 prompt 里写一句"思考完成后必须输出 JSON"。
+  # --------------------------------------------------------------------------
+  prompt:
+    system: |
+      你是裁判文书摘要的三要素切分器。你的输出会被程序直接解析并按字面比对，所以只允许输出 JSON，不要解释。
+    user: |
+      从下面的摘要里抽出三个要素，逐字复制原文（连标点、数字、当事人代称都照抄；不要改写、不要总结、不要补全、不要调整顺序）：
+
+      - plaintiff_claims：原告诉讼请求。案件背景/案由（"原被告系××纠纷"）不算诉请；诉请从原告提出请求处开始，到被告开始答辩前结束。没有诉请内容时输出空字符串。
+      - defendant_defenses：被告辩称。包含"被告辩称…""被告未答辩""被告承认/同意…"这类被告方陈述；要保留全部被告的答辩（多个被告连续答辩算一段），一直到法院开始叙述（"经审理查明""本院认为"等）为止。没有则输出空字符串。
+      - court_facts：法院认定的事实、事实认定与裁判说理。从法院叙述开始，到法律依据与裁判结果（"依照《…》…判决/裁定/驳回""判决如下"）之前结束。没有则输出空字符串。
+
+      只输出 JSON，键名固定，值为字符串（示例里的内容全部是空串）：
+      {"plaintiff_claims": "", "defendant_defenses": "", "court_facts": ""}
+
+      摘要：
+      {summary}
+
+  # --------------------------------------------------------------------------
+  # ROUGE 口径：三项权重**必须写全**（代码里不存默认值）。
+  # mode: jieba = 训练/奖励侧口径（RewardSpec.rouge_mode 默认），char = 官方评测脚本口径。
+  # --------------------------------------------------------------------------
+  rouge:
+    mode: jieba
+    weights:                        # 官方口径：0.2 / 0.4 / 0.4
+      rouge1: 0.2
+      rouge2: 0.4
+      rougel: 0.4
+    element_weights:                # 三要素合成"总分"的权重（可省略，省略用默认）
+      plaintiff_claims: 0.30
+      defendant_defenses: 0.20
+      court_facts: 0.50
+    one_side_empty_score: 0.0       # 只有一侧有内容时的得分
+    both_empty: exclude             # 两侧都空：exclude=不计入平均
+
+  cache_path: data/element_cache/val_extract.jsonl
+  output_dir: outputs/element_rouge

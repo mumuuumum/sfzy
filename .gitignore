@@ -31,6 +31,12 @@ data/old_res/
 # 用通配是为了覆盖 processed_2000 / processed_full 这类实验用的变体目录
 data/processed*/
 data/index*/
+# 三要素切分缓存：由 tools/segment_report.py --cache-out / --segments-out 生成，
+# 随时可重建（见 docs/segmenter.md）
+data/segment_cache/
+# 三要素 LLM 抽取缓存：由 tools/element_rouge.py 生成（花过 API 钱的产物，
+# 不入库但别删——人工摘要那一半下次直接命中，见 docs/element_rouge.md）
+data/element_cache/
 
 # 说明：data/raw/laws/ 下的法条语料（约 25MB、1385 个 .md）是 RAG 知识库，
 #       属于项目资产，保留在版本库中。
